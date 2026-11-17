@@ -1,0 +1,1 @@
+{"critical":{"identity":{"docker-reference":"ghcr.io/projectbluefin/bluefin-lts"},"image":{"docker-manifest-digest":"sha256:3b2729bdfb03518e2b5740b52399a79ba58f4f5883580f7eb65509ad5d89fa57"},"type":"cosign container image signature"},"optional":null}
