@@ -1,0 +1,26 @@
+[package]
+name = "droidc-verify"
+description = "Offline cosign signature verification against a droidc trust policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+base64 = "0.23.1"
+hex = "0.4.3"
+p256 = { version = "0.14.0", features = ["ecdsa", "pem"] }
+p384 = { version = "0.14.0", features = ["ecdsa", "pem"] }
+regex = { version = "1.13.1", default-features = false, features = ["std", "unicode-perl"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde_json_canonicalizer = "0.4.1"
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+x509-cert = { version = "0.3.0", features = ["pem"] }
+
+[dev-dependencies]
+base64 = "0.23.1"
+hex = "0.4.3"
+serde_json = "1.0.154"
+sha2 = "0.11.1"

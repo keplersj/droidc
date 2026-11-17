@@ -1,0 +1,122 @@
+name: ci
+on:
+  push:
+  pull_request:
+env:
+  CARGO_TERM_COLOR: always
+  DROIDC_NET_TESTS: "1"
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+        # includes tests/net.rs: real keyless verification of ghcr.io/projectbluefin/bluefin-lts
+        # from manifests + .sig only (no layers)
+
+  build:
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-latest, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, arch: aarch64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch }}-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl-${{ matrix.arch }}
+      # zig cc is the C compiler for ring/zstd-sys: no musl-gcc package, same recipe on both archs.
+      - run: pip install --break-system-packages ziglang==0.13.0 cargo-zigbuild
+      - run: cargo zigbuild --release --target ${{ matrix.arch }}-unknown-linux-musl -p droidc
+      - name: Check the binary is static
+        run: |
+          f=target/${{ matrix.arch }}-unknown-linux-musl/release/droidc
+          file "$f"
+          file "$f" | grep -q 'statically linked'
+          "$f" --version
+          mkdir -p dist && cp "$f" dist/droidc-${{ matrix.arch }}-linux-musl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: droidc-${{ matrix.arch }}-linux-musl
+          path: dist/droidc-${{ matrix.arch }}-linux-musl
+
+  # Host-side Android build (bionic, NDK r27c, API 26): shipped by Selkie as libdroidc.so.
+  # The musl build above is the guest-side binary (libdroidc-guest.so).
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+      - run: cargo install cargo-ndk --locked
+      - name: Build both ABIs
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: cargo ndk -t arm64-v8a -t x86_64 --platform 26 build --release -p droidc
+      - name: Check binaries
+        run: |
+          NM=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm
+          mkdir -p dist
+          for t in aarch64 x86_64; do
+            f=target/$t-linux-android/release/droidc
+            file "$f"; file "$f" | grep -q 'linker64'
+            # only bionic libc wrappers: no raw syscalls through rustix
+            ! $NM -D --undefined-only "$f" | grep -qw 'syscall@LIBC' || echo "note: imports syscall()"
+            cp "$f" dist/droidc-$t-linux-android
+          done
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: droidc-aarch64-linux-android
+          path: dist/droidc-aarch64-linux-android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: droidc-x86_64-linux-android
+          path: dist/droidc-x86_64-linux-android
+
+  integration:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, arch: aarch64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: droidc-${{ matrix.arch }}-linux-musl
+          path: bin
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
+          df -h /
+      - run: sudo apt-get update && sudo apt-get install -y proot jq
+      - run: chmod +x bin/droidc-${{ matrix.arch }}-linux-musl
+      - name: switch / run / second switch / rollback / gc against real registries
+        run: tests/ci-integration.sh bin/droidc-${{ matrix.arch }}-linux-musl "$RUNNER_TEMP/r"
+      - name: Disk usage
+        if: always()
+        run: du -sh "$RUNNER_TEMP/r"/* || true
