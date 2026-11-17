@@ -17,6 +17,7 @@ run_in() {
   echo "(proot failed, using chroot fallback)" >&2
   USE_CHROOT=1
   local rf; rf=$(readlink -f "$ROOT/current/rootfs")
+  sudo mkdir -p "$rf/var/home"   # bootc images have /home -> var/home (dangling until var is bound)
   sudo mkdir -p "$rf$ROOT_REAL"
   sudo mount --bind "$ROOT_REAL" "$rf$ROOT_REAL"
   local rc=0; sudo chroot "$rf" "$@" || rc=$?
