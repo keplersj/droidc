@@ -39,7 +39,8 @@ impl Root {
         self.path.join("blobs/tmp")
     }
     pub fn blob(&self, digest: &str) -> PathBuf {
-        self.blobs().join(digest.strip_prefix("sha256:").unwrap_or(digest))
+        self.blobs()
+            .join(digest.strip_prefix("sha256:").unwrap_or(digest))
     }
     pub fn deployments(&self) -> PathBuf {
         self.path.join("deployments")
@@ -71,7 +72,14 @@ impl Root {
 
     /// Create the directory skeleton (idempotent).
     pub fn init(&self) -> Result<()> {
-        for d in [self.blobs(), self.blob_tmp(), self.deployments(), self.staging(), self.var(), self.home().join("root")] {
+        for d in [
+            self.blobs(),
+            self.blob_tmp(),
+            self.deployments(),
+            self.staging(),
+            self.var(),
+            self.home().join("root"),
+        ] {
             fs::create_dir_all(&d).context(d.display())?;
         }
         use std::os::unix::fs::PermissionsExt;
@@ -109,7 +117,12 @@ impl Root {
             Ok(b) => match serde_json::from_slice(&b) {
                 Ok(p) => Ok(Some(p)),
                 // A torn PENDING write: treat as "an operation was interrupted before commit".
-                Err(_) => Ok(Some(Pending { op: "unknown".into(), id: String::new(), prev: None, started: now_rfc3339() })),
+                Err(_) => Ok(Some(Pending {
+                    op: "unknown".into(),
+                    id: String::new(),
+                    prev: None,
+                    started: now_rfc3339(),
+                })),
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
@@ -177,9 +190,10 @@ impl RootLock {
             .context("open lock file")?;
         match rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => Ok(RootLock { _file: f }),
-            Err(e) if e == rustix::io::Errno::WOULDBLOCK => {
-                Err(Error::new(ErrorKind::Locked, "another droidc command holds the root lock"))
-            }
+            Err(e) if e == rustix::io::Errno::WOULDBLOCK => Err(Error::new(
+                ErrorKind::Locked,
+                "another droidc command holds the root lock",
+            )),
             Err(e) => Err(Error::internal(format!("flock: {e}"))),
         }
     }
@@ -207,7 +221,10 @@ mod tests {
         r.init().unwrap();
         r.set_link("current", "aaaa").unwrap();
         r.set_link("current", "bbbb").unwrap();
-        assert_eq!(fs::read_link(r.current_link()).unwrap(), PathBuf::from("deployments/bbbb"));
+        assert_eq!(
+            fs::read_link(r.current_link()).unwrap(),
+            PathBuf::from("deployments/bbbb")
+        );
         assert_eq!(r.current_id().as_deref(), Some("bbbb"));
     }
 
@@ -217,7 +234,12 @@ mod tests {
         let r = Root::new(d.path());
         r.init().unwrap();
         assert!(r.read_pending().unwrap().is_none());
-        let p = Pending { op: "switch".into(), id: "x".into(), prev: Some("y".into()), started: "t".into() };
+        let p = Pending {
+            op: "switch".into(),
+            id: "x".into(),
+            prev: Some("y".into()),
+            started: "t".into(),
+        };
         r.write_pending(&p).unwrap();
         assert_eq!(r.read_pending().unwrap().unwrap(), p);
         r.clear_pending().unwrap();

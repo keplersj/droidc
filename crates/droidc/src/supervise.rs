@@ -7,17 +7,19 @@
 
 use crate::error::{Context, Error, Result};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
-    std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
+    std::env::split_paths(&path)
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
 }
 
 fn runtime_dir() -> Result<PathBuf> {
@@ -50,7 +52,10 @@ fn start_dbus(dir: &std::path::Path, bin: &std::path::Path) -> Result<String> {
         .output()
         .context("dbus-daemon")?;
     if !out.status.success() {
-        return Err(Error::internal(format!("dbus-daemon exited with {}", out.status)));
+        return Err(Error::internal(format!(
+            "dbus-daemon exited with {}",
+            out.status
+        )));
     }
     let addr = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if addr.is_empty() {
@@ -62,7 +67,11 @@ fn start_dbus(dir: &std::path::Path, bin: &std::path::Path) -> Result<String> {
 /// Socket-activate `dbus-broker-launch --scope user` by hand (systemd --user cannot run under
 /// proot): bind+listen `<dir>/bus`, pass it as fd 3 with `LISTEN_FDS=1`, `LISTEN_PID=<child pid>`.
 /// Returns the bus address and the running broker.
-fn start_broker(dir: &std::path::Path, bin: &std::path::Path, args: &[&str]) -> Result<(String, Child)> {
+fn start_broker(
+    dir: &std::path::Path,
+    bin: &std::path::Path,
+    args: &[&str],
+) -> Result<(String, Child)> {
     let path = dir.join("bus");
     let _ = fs::remove_file(&path);
     let listener = UnixListener::bind(&path).context(path.display())?;
@@ -100,7 +109,10 @@ fn start_broker(dir: &std::path::Path, bin: &std::path::Path, args: &[&str]) -> 
     std::thread::sleep(Duration::from_millis(250));
     if let Some(st) = child.try_wait()? {
         let _ = fs::remove_file(&path);
-        return Err(Error::internal(format!("{} exited with {st}", bin.display())));
+        return Err(Error::internal(format!(
+            "{} exited with {st}",
+            bin.display()
+        )));
     }
     Ok((format!("unix:path={}", path.display()), child))
 }
@@ -130,7 +142,11 @@ pub fn supervise(cmd: &[String]) -> Result<i32> {
     }
     let dir = runtime_dir()?;
     std::env::set_var("XDG_RUNTIME_DIR", &dir);
-    let broker = if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() { start_session_bus(&dir) } else { None };
+    let broker = if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+        start_session_bus(&dir)
+    } else {
+        None
+    };
     let child = Command::new(&cmd[0]).args(&cmd[1..]).spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             Error::not_found(format!("{}: command not found", cmd[0]))
@@ -144,9 +160,15 @@ pub fn supervise(cmd: &[String]) -> Result<i32> {
             Ok(Some((p, st))) => {
                 if p.as_raw_nonzero().get() == pid {
                     if let Some(b) = &broker {
-                        let _ = rustix::process::kill_process(rustix::process::Pid::from_raw(b.id() as i32).unwrap(), rustix::process::Signal::TERM);
+                        let _ = rustix::process::kill_process(
+                            rustix::process::Pid::from_raw(b.id() as i32).unwrap(),
+                            rustix::process::Signal::TERM,
+                        );
                     }
-                    return Ok(st.exit_status().map(|c| c as i32).or_else(|| st.terminating_signal().map(|s| 128 + s as i32)).unwrap_or(1));
+                    return Ok(st
+                        .exit_status()
+                        .or_else(|| st.terminating_signal().map(|s| 128 + s))
+                        .unwrap_or(1));
                 }
             }
             Ok(None) => {}
@@ -196,8 +218,24 @@ mod tests {
     fn exit_status_is_propagated() {
         std::env::set_var("XDG_RUNTIME_DIR", tempfile::tempdir().unwrap().keep());
         std::env::set_var("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent"); // skip dbus
-        assert_eq!(supervise(&["sh".into(), "-c".into(), "exit 7".into()]).unwrap(), 7);
-        assert_eq!(supervise(&["sh".into(), "-c".into(), "test -n \"$XDG_RUNTIME_DIR\"".into()]).unwrap(), 0);
-        assert_eq!(supervise(&["definitely-not-a-command".into()]).unwrap_err().kind, crate::error::ErrorKind::NotFound);
+        assert_eq!(
+            supervise(&["sh".into(), "-c".into(), "exit 7".into()]).unwrap(),
+            7
+        );
+        assert_eq!(
+            supervise(&[
+                "sh".into(),
+                "-c".into(),
+                "test -n \"$XDG_RUNTIME_DIR\"".into()
+            ])
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            supervise(&["definitely-not-a-command".into()])
+                .unwrap_err()
+                .kind,
+            crate::error::ErrorKind::NotFound
+        );
     }
 }

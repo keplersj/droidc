@@ -56,7 +56,8 @@ fn open_root(path: &Path) -> Result<(Root, RootLock)> {
     root.init()?;
     if !root.policy().exists() {
         // First run: write the default trust policy.
-        fs::write(root.policy(), Policy::default_policy().to_json()).context("write policy.json")?;
+        fs::write(root.policy(), Policy::default_policy().to_json())
+            .context("write policy.json")?;
     }
     Ok((root, lock))
 }
@@ -64,9 +65,16 @@ fn open_root(path: &Path) -> Result<(Root, RootLock)> {
 // ------------------------------------------------------------------ recovery
 
 pub fn recover(root: &Root, em: &Emitter) -> Result<()> {
-    let Some(p) = root.read_pending()? else { return Ok(()) };
-    em.warn(&format!("recovering interrupted operation '{}' ({})", p.op, p.id));
-    let committed = matches!(p.op.as_str(), "switch" | "rollback") && !p.id.is_empty() && root.deployment(&p.id).join("deployment.json").is_file();
+    let Some(p) = root.read_pending()? else {
+        return Ok(());
+    };
+    em.warn(&format!(
+        "recovering interrupted operation '{}' ({})",
+        p.op, p.id
+    ));
+    let committed = matches!(p.op.as_str(), "switch" | "rollback")
+        && !p.id.is_empty()
+        && root.deployment(&p.id).join("deployment.json").is_file();
     if committed {
         // The deployment was complete and renamed into place: finish the symlink swaps.
         finish_switch(root, &p)?;
@@ -132,25 +140,48 @@ pub fn install(root: &Root, em: &Emitter, input: InstallInput<'_>) -> Result<Dep
     let mut rec = input.record;
     let id = rec.id.clone();
     let prev = root.current_id();
-    root.write_pending(&Pending { op: "switch".into(), id: id.clone(), prev: prev.clone(), started: now_rfc3339() })?;
+    root.write_pending(&Pending {
+        op: "switch".into(),
+        id: id.clone(),
+        prev: prev.clone(),
+        started: now_rfc3339(),
+    })?;
 
     let stage = root.staging().join(&id);
     fsutil::rmtree(&stage)?;
     let rootfs = stage.join("rootfs");
     fs::create_dir_all(&rootfs).context(rootfs.display())?;
 
-    let seed = fs::read_dir(root.var()).map(|mut r| r.next().is_none()).unwrap_or(true);
+    let seed = fs::read_dir(root.var())
+        .map(|mut r| r.next().is_none())
+        .unwrap_or(true);
     let final_rootfs = root.deployment(&id).join("rootfs");
     let map = PathMap {
         phys_root: rootfs.clone(),
         final_root: final_rootfs,
-        var: if seed { Some((rootfs.join("var"), root.var())) } else { None },
+        var: if seed {
+            Some((rootfs.join("var"), root.var()))
+        } else {
+            None
+        },
     };
     let started = Instant::now();
-    let mut u = Unpacker::new(rootfs.clone(), map, make_strategy(input.links, input.l2s_prefix), !seed, em);
+    let mut u = Unpacker::new(
+        rootfs.clone(),
+        map,
+        make_strategy(input.links, input.l2s_prefix),
+        !seed,
+        em,
+    );
     let n = input.layers.len() as u64;
     for (i, l) in input.layers.iter().enumerate() {
-        em.progress("unpack", i as u64, n, "layers", &format!("layer {}/{}", i + 1, n));
+        em.progress(
+            "unpack",
+            i as u64,
+            n,
+            "layers",
+            &format!("layer {}/{}", i + 1, n),
+        );
         let r = open_layer(l)?;
         u.apply_layer(r).context(format!("layer {}", i + 1))?;
     }
@@ -161,9 +192,30 @@ pub fn install(root: &Root, em: &Emitter, input: InstallInput<'_>) -> Result<Dep
     em.progress("etc-merge", 0, 1, "files", "merging /etc");
     let cur_rootfs = root.current_link().join("rootfs");
     let have_cur = prev.is_some() && cur_rootfs.join("etc").is_dir();
-    let (op, ol) = if have_cur { (Some(cur_rootfs.join("usr/etc")), Some(cur_rootfs.join("etc"))) } else { (None, None) };
-    let ms = etcmerge::merge(op.as_deref(), ol.as_deref(), &rootfs.join("usr/etc"), &rootfs.join("etc"))?;
-    em.progress("etc-merge", 1, 1, "files", &format!("/etc: {} taken from image, {} local changes kept, {} local deletions kept", ms.taken_new, ms.kept_local, ms.kept_deleted));
+    let (op, ol) = if have_cur {
+        (
+            Some(cur_rootfs.join("usr/etc")),
+            Some(cur_rootfs.join("etc")),
+        )
+    } else {
+        (None, None)
+    };
+    let ms = etcmerge::merge(
+        op.as_deref(),
+        ol.as_deref(),
+        &rootfs.join("usr/etc"),
+        &rootfs.join("etc"),
+    )?;
+    em.progress(
+        "etc-merge",
+        1,
+        1,
+        "files",
+        &format!(
+            "/etc: {} taken from image, {} local changes kept, {} local deletions kept",
+            ms.taken_new, ms.kept_local, ms.kept_deleted
+        ),
+    );
     fs::create_dir_all(rootfs.join("var"))?;
 
     write_metadata(&stage.join("metadata.jsonl.zst"), &meta)?;
@@ -213,7 +265,12 @@ pub fn load_policy(root: &Root) -> Result<Policy> {
 }
 
 /// Look for cosign signatures on the platform manifest digest, then the index digest.
-pub fn verify_image(reg: &Registry, policy: &Policy, res: &Resolved, em: &Emitter) -> Result<SignatureInfo> {
+pub fn verify_image(
+    reg: &Registry,
+    policy: &Policy,
+    res: &Resolved,
+    em: &Emitter,
+) -> Result<SignatureInfo> {
     let mut candidates = vec![res.manifest_digest.clone()];
     if let Some(i) = &res.index_digest {
         candidates.push(i.clone());
@@ -227,12 +284,23 @@ pub fn verify_image(reg: &Registry, policy: &Policy, res: &Resolved, em: &Emitte
         }
         match verify_glue::verify(policy, &res.image.full_name(), &d, &sigs, SystemTime::now()) {
             Ok(v) => {
-                return Ok(SignatureInfo { verified: true, mode: v.mode, subject: v.subject, issuer: v.issuer, policy_match: Some(v.policy_match) });
+                return Ok(SignatureInfo {
+                    verified: true,
+                    mode: v.mode,
+                    subject: v.subject,
+                    issuer: v.issuer,
+                    policy_match: Some(v.policy_match),
+                });
             }
             Err(e) => last = Some(e.into()),
         }
     }
-    Err(last.unwrap_or_else(|| Error::signature(format!("no cosign signature found for {} (use --insecure-allow-unsigned to override)", res.image.original))))
+    Err(last.unwrap_or_else(|| {
+        Error::signature(format!(
+            "no cosign signature found for {} (use --insecure-allow-unsigned to override)",
+            res.image.original
+        ))
+    }))
 }
 
 // ------------------------------------------------------------------ switch / upgrade
@@ -243,7 +311,9 @@ fn store_bytes(root: &Root, digest: &str, bytes: &[u8]) -> Result<()> {
         return Ok(());
     }
     fs::create_dir_all(root.blobs())?;
-    let tmp = root.blob_tmp().join(format!("{}.meta", digest.trim_start_matches("sha256:")));
+    let tmp = root
+        .blob_tmp()
+        .join(format!("{}.meta", digest.trim_start_matches("sha256:")));
     fs::create_dir_all(root.blob_tmp())?;
     fs::write(&tmp, bytes).context(tmp.display())?;
     fs::rename(&tmp, &p).context(p.display())?;
@@ -252,7 +322,11 @@ fn store_bytes(root: &Root, digest: &str, bytes: &[u8]) -> Result<()> {
 
 fn check_space(root: &Root, layers: &[Descriptor]) -> Result<()> {
     let total: u64 = layers.iter().map(|l| l.size).sum();
-    let uncached: u64 = layers.iter().filter(|l| !root.blob(&l.digest).is_file()).map(|l| l.size).sum();
+    let uncached: u64 = layers
+        .iter()
+        .filter(|l| !root.blob(&l.digest).is_file())
+        .map(|l| l.size)
+        .sum();
     let need = total / 2 * 5 + uncached; // 2.5x compressed, plus the download if not cached
     let free = fsutil::free_space(&root.path)?;
     if free < need {
@@ -292,7 +366,13 @@ fn download_layers(root: &Root, em: &Emitter, reg: &Registry, res: &Resolved) ->
                 let d = &layers[i];
                 let on = |n: u64| {
                     let cur = done.fetch_add(n, Ordering::Relaxed) + n;
-                    em.progress_throttled("download", cur.min(total), total, "bytes", &format!("layer {}/{}", layers_done.load(Ordering::Relaxed) + 1, nl));
+                    em.progress_throttled(
+                        "download",
+                        cur.min(total),
+                        total,
+                        "bytes",
+                        &format!("layer {}/{}", layers_done.load(Ordering::Relaxed) + 1, nl),
+                    );
                 };
                 match reg.fetch_blob(&res.image, d, &root.blob(&d.digest), &root.blob_tmp(), &on) {
                     Ok(got) => {
@@ -314,11 +394,23 @@ fn download_layers(root: &Root, em: &Emitter, reg: &Registry, res: &Resolved) ->
     if let Some(e) = err.into_inner().unwrap() {
         return Err(e);
     }
-    em.progress("download", total, total, "bytes", &format!("layer {nl}/{nl}"));
+    em.progress(
+        "download",
+        total,
+        total,
+        "bytes",
+        &format!("layer {nl}/{nl}"),
+    );
     Ok(net.load(Ordering::Relaxed))
 }
 
-fn build_record(res: &Resolved, id: &str, sig: SignatureInfo, insecure: bool, image_ref: &str) -> Deployment {
+fn build_record(
+    res: &Resolved,
+    id: &str,
+    sig: SignatureInfo,
+    insecure: bool,
+    image_ref: &str,
+) -> Deployment {
     let labels = res.config.config.labels.clone().unwrap_or_default();
     Deployment {
         id: id.into(),
@@ -350,10 +442,27 @@ pub fn switch_locked(root: &Root, em: &Emitter, opts: &SwitchOpts) -> Result<Val
         None => Platform::detect()?,
     };
     let image = ImageRef::parse(&opts.reference)?;
-    em.progress("resolve", 0, 1, "layers", &format!("resolving {}", opts.reference));
+    em.progress(
+        "resolve",
+        0,
+        1,
+        "layers",
+        &format!("resolving {}", opts.reference),
+    );
     let res = reg.resolve(&image, &plat)?;
     let id = deployment_id(&res.manifest_digest);
-    em.progress("resolve", 1, 1, "layers", &format!("{} -> {} ({} layers)", opts.reference, res.manifest_digest, res.manifest.layers.len()));
+    em.progress(
+        "resolve",
+        1,
+        1,
+        "layers",
+        &format!(
+            "{} -> {} ({} layers)",
+            opts.reference,
+            res.manifest_digest,
+            res.manifest.layers.len()
+        ),
+    );
 
     let sig = if opts.insecure {
         em.warn("signature verification skipped (--insecure-allow-unsigned)");
@@ -366,13 +475,17 @@ pub fn switch_locked(root: &Root, em: &Emitter, opts: &SwitchOpts) -> Result<Val
         s
     };
     if opts.verify_only {
-        return Ok(json!({"changed": false, "verify_only": true, "id": id, "manifest_digest": res.manifest_digest,
-                         "index_digest": res.index_digest, "platform": res.platform.to_string(), "signature": sig}));
+        return Ok(
+            json!({"changed": false, "verify_only": true, "id": id, "manifest_digest": res.manifest_digest,
+                         "index_digest": res.index_digest, "platform": res.platform.to_string(), "signature": sig}),
+        );
     }
 
     if root.current_id().as_deref() == Some(id.as_str()) {
         let rec = root.read_record(&id).ok();
-        return Ok(json!({"changed": false, "id": id, "manifest_digest": res.manifest_digest, "deployment": rec}));
+        return Ok(
+            json!({"changed": false, "id": id, "manifest_digest": res.manifest_digest, "deployment": rec}),
+        );
     }
 
     store_bytes(root, &res.manifest_digest, &res.manifest_bytes)?;
@@ -385,7 +498,12 @@ pub fn switch_locked(root: &Root, em: &Emitter, opts: &SwitchOpts) -> Result<Val
     let rec = if root.deployment(&id).join("deployment.json").is_file() {
         // Already deployed (it is `previous`): just activate it.
         em.info(&format!("deployment {id} already present, activating"));
-        root.write_pending(&Pending { op: "switch".into(), id: id.clone(), prev: prev.clone(), started: now_rfc3339() })?;
+        root.write_pending(&Pending {
+            op: "switch".into(),
+            id: id.clone(),
+            prev: prev.clone(),
+            started: now_rfc3339(),
+        })?;
         let p = root.read_pending()?.unwrap();
         finish_switch(root, &p)?;
         let mut rec = root.read_record(&id)?;
@@ -399,17 +517,38 @@ pub fn switch_locked(root: &Root, em: &Emitter, opts: &SwitchOpts) -> Result<Val
         let dl = download_layers(root, em, &reg, &res)?;
         let mut rec = build_record(&res, &id, sig, opts.insecure, &opts.reference);
         rec.stats.download_bytes = dl;
-        let layer_paths: Vec<PathBuf> = res.manifest.layers.iter().map(|l| root.blob(&l.digest)).collect();
-        install(root, em, InstallInput { record: rec, layers: &layer_paths, links: opts.links, l2s_prefix: &opts.l2s_prefix })?
+        let layer_paths: Vec<PathBuf> = res
+            .manifest
+            .layers
+            .iter()
+            .map(|l| root.blob(&l.digest))
+            .collect();
+        install(
+            root,
+            em,
+            InstallInput {
+                record: rec,
+                layers: &layer_paths,
+                links: opts.links,
+                l2s_prefix: &opts.l2s_prefix,
+            },
+        )?
     };
     let g = gc_locked(root, em)?;
     Ok(json!({"changed": true, "id": id, "previous": prev, "deployment": rec, "gc": g}))
 }
 
-pub fn upgrade(root_path: &Path, em: &Emitter, http: HttpConfig, l2s_prefix: &str) -> Result<Value> {
+pub fn upgrade(
+    root_path: &Path,
+    em: &Emitter,
+    http: HttpConfig,
+    l2s_prefix: &str,
+) -> Result<Value> {
     let (root, _lock) = open_root(root_path)?;
     recover(&root, em)?;
-    let cur = root.current_id().ok_or_else(|| Error::not_found("no current deployment to upgrade"))?;
+    let cur = root
+        .current_id()
+        .ok_or_else(|| Error::not_found("no current deployment to upgrade"))?;
     let rec = root.read_record(&cur)?;
     let opts = SwitchOpts {
         reference: rec.image_ref.clone(),
@@ -428,12 +567,23 @@ pub fn upgrade(root_path: &Path, em: &Emitter, http: HttpConfig, l2s_prefix: &st
 pub fn rollback(root_path: &Path, em: &Emitter) -> Result<Value> {
     let (root, _lock) = open_root(root_path)?;
     recover(&root, em)?;
-    let cur = root.current_id().ok_or_else(|| Error::not_found("no current deployment"))?;
-    let prev = root.previous_id().ok_or_else(|| Error::not_found("no previous deployment to roll back to"))?;
+    let cur = root
+        .current_id()
+        .ok_or_else(|| Error::not_found("no current deployment"))?;
+    let prev = root
+        .previous_id()
+        .ok_or_else(|| Error::not_found("no previous deployment to roll back to"))?;
     if !root.deployment(&prev).join("deployment.json").is_file() {
-        return Err(Error::not_found(format!("previous deployment {prev} is missing")));
+        return Err(Error::not_found(format!(
+            "previous deployment {prev} is missing"
+        )));
     }
-    let p = Pending { op: "rollback".into(), id: prev.clone(), prev: Some(cur.clone()), started: now_rfc3339() };
+    let p = Pending {
+        op: "rollback".into(),
+        id: prev.clone(),
+        prev: Some(cur.clone()),
+        started: now_rfc3339(),
+    };
     root.write_pending(&p)?;
     finish_switch(&root, &p)?;
     Ok(json!({"changed": true, "current": prev, "previous": cur}))
@@ -507,8 +657,20 @@ pub fn gc_locked(root: &Root, em: &Emitter) -> Result<Value> {
         }
         None => em.warn("could not read manifests of kept deployments; blob GC skipped"),
     }
-    em.progress("gc", 1, 1, "files", &format!("removed {} deployments, {} blobs", removed.len(), blobs_removed));
-    Ok(json!({"deployments_removed": removed, "blobs_removed": blobs_removed, "bytes_freed": freed}))
+    em.progress(
+        "gc",
+        1,
+        1,
+        "files",
+        &format!(
+            "removed {} deployments, {} blobs",
+            removed.len(),
+            blobs_removed
+        ),
+    );
+    Ok(
+        json!({"deployments_removed": removed, "blobs_removed": blobs_removed, "bytes_freed": freed}),
+    )
 }
 
 // ------------------------------------------------------------------ tests
@@ -545,7 +707,10 @@ mod tests {
             .enumerate()
             .map(|(i, l)| {
                 let p = dir.join(format!("{name}-{i}.tar.gz"));
-                let mut e = flate2::write::GzEncoder::new(fs::File::create(&p).unwrap(), flate2::Compression::fast());
+                let mut e = flate2::write::GzEncoder::new(
+                    fs::File::create(&p).unwrap(),
+                    flate2::Compression::fast(),
+                );
                 e.write_all(&l).unwrap();
                 e.finish().unwrap();
                 p
@@ -567,7 +732,9 @@ mod tests {
                 .dir("var/lib/", 0o755)
                 .file("var/lib/seed", 0o644, b"seed")
                 .bytes(),
-            Layer::new().file("etc/motd", 0o644, extra.as_bytes()).bytes(),
+            Layer::new()
+                .file("etc/motd", 0o644, extra.as_bytes())
+                .bytes(),
         ]
     }
 
@@ -581,17 +748,39 @@ mod tests {
         (d, root, ld)
     }
 
-    fn do_install(root: &Root, ld: &Path, id: &str, layers: Vec<Vec<u8>>, kind: LinkKind) -> Deployment {
+    fn do_install(
+        root: &Root,
+        ld: &Path,
+        id: &str,
+        layers: Vec<Vec<u8>>,
+        kind: LinkKind,
+    ) -> Deployment {
         let (em, _) = capture();
         let paths = write_layers(ld, id, layers);
-        install(root, &em, InstallInput { record: rec(id), layers: &paths, links: kind, l2s_prefix: ".l2s." }).unwrap()
+        install(
+            root,
+            &em,
+            InstallInput {
+                record: rec(id),
+                layers: &paths,
+                links: kind,
+                l2s_prefix: ".l2s.",
+            },
+        )
+        .unwrap()
     }
 
     #[test]
     fn install_switch_rollback_gc_cycle() {
         let (_d, root, ld) = setup();
         let (em, _) = capture();
-        let a = do_install(&root, &ld, "aaaa", image("A", "motd-A"), LinkKind::Link2Symlink);
+        let a = do_install(
+            &root,
+            &ld,
+            "aaaa",
+            image("A", "motd-A"),
+            LinkKind::Link2Symlink,
+        );
         assert_eq!(root.current_id().as_deref(), Some("aaaa"));
         assert!(root.previous_id().is_none());
         assert_eq!(a.stats.hardlinks, 1);
@@ -606,10 +795,16 @@ mod tests {
         assert!(!rfs.join("var/lib").exists());
         assert!(root.deployment("aaaa").join("metadata.jsonl.zst").is_file());
         // relative symlinks
-        assert_eq!(fs::read_link(root.current_link()).unwrap(), PathBuf::from("deployments/aaaa"));
+        assert_eq!(
+            fs::read_link(root.current_link()).unwrap(),
+            PathBuf::from("deployments/aaaa")
+        );
         // l2s chain points at the final (deployments/) location
         let t = fs::read_link(rfs.join("usr/bin/tool2")).unwrap();
-        assert!(t.starts_with(root.deployment("aaaa").join("rootfs/usr/bin")), "{t:?}");
+        assert!(
+            t.starts_with(root.deployment("aaaa").join("rootfs/usr/bin")),
+            "{t:?}"
+        );
 
         // user edits live /etc and var, then deploy B
         fs::write(rfs.join("etc/motd"), "my motd").unwrap();
@@ -651,7 +846,7 @@ mod tests {
         let (em, _) = capture();
         do_install(&root, &ld, "aaaa", image("A", "x"), LinkKind::Copy);
         // a manifest blob for the kept deployment referencing layer L1
-        let l1 = format!("{}", "1".repeat(64));
+        let l1 = "1".repeat(64);
         let man = json!({"config": {"digest": format!("sha256:{}", "c".repeat(64)), "size": 1},
                          "layers": [{"digest": format!("sha256:{l1}"), "size": 1}]});
         let mdig = rec("aaaa").manifest_digest;
@@ -670,7 +865,13 @@ mod tests {
         let (em, buf) = capture();
         do_install(&root, &ld, "aaaa", image("A", "x"), LinkKind::Copy);
         // interrupted mid-unpack: PENDING + half-built staging, nothing renamed
-        root.write_pending(&Pending { op: "switch".into(), id: "bbbb".into(), prev: Some("aaaa".into()), started: now_rfc3339() }).unwrap();
+        root.write_pending(&Pending {
+            op: "switch".into(),
+            id: "bbbb".into(),
+            prev: Some("aaaa".into()),
+            started: now_rfc3339(),
+        })
+        .unwrap();
         fs::create_dir_all(root.staging().join("bbbb/rootfs/usr")).unwrap();
         fs::write(root.staging().join("bbbb/rootfs/usr/half"), b"x").unwrap();
         recover(&root, &em).unwrap();
@@ -691,7 +892,13 @@ mod tests {
         do_install(&root, &ld, "bbbb", image("B", "x"), LinkKind::Copy);
         root.set_link("current", "aaaa").unwrap();
         fs::remove_file(root.previous_link()).unwrap();
-        root.write_pending(&Pending { op: "switch".into(), id: "bbbb".into(), prev: Some("aaaa".into()), started: now_rfc3339() }).unwrap();
+        root.write_pending(&Pending {
+            op: "switch".into(),
+            id: "bbbb".into(),
+            prev: Some("aaaa".into()),
+            started: now_rfc3339(),
+        })
+        .unwrap();
         recover(&root, &em).unwrap();
         assert_eq!(root.current_id().as_deref(), Some("bbbb"));
         assert_eq!(root.previous_id().as_deref(), Some("aaaa"));
@@ -699,9 +906,18 @@ mod tests {
         // and a crash between the two symlink swaps (previous already set) is also fine
         root.set_link("current", "aaaa").unwrap();
         root.set_link("previous", "aaaa").unwrap();
-        root.write_pending(&Pending { op: "switch".into(), id: "bbbb".into(), prev: Some("aaaa".into()), started: now_rfc3339() }).unwrap();
+        root.write_pending(&Pending {
+            op: "switch".into(),
+            id: "bbbb".into(),
+            prev: Some("aaaa".into()),
+            started: now_rfc3339(),
+        })
+        .unwrap();
         recover(&root, &em).unwrap();
-        assert_eq!((root.current_id().as_deref(), root.previous_id().as_deref()), (Some("bbbb"), Some("aaaa")));
+        assert_eq!(
+            (root.current_id().as_deref(), root.previous_id().as_deref()),
+            (Some("bbbb"), Some("aaaa"))
+        );
     }
 
     #[test]
@@ -710,10 +926,19 @@ mod tests {
         let (em, _) = capture();
         do_install(&root, &ld, "aaaa", image("A", "x"), LinkKind::Copy);
         do_install(&root, &ld, "bbbb", image("B", "x"), LinkKind::Copy);
-        root.write_pending(&Pending { op: "rollback".into(), id: "aaaa".into(), prev: Some("bbbb".into()), started: now_rfc3339() }).unwrap();
+        root.write_pending(&Pending {
+            op: "rollback".into(),
+            id: "aaaa".into(),
+            prev: Some("bbbb".into()),
+            started: now_rfc3339(),
+        })
+        .unwrap();
         root.set_link("previous", "bbbb").unwrap(); // first half done... (already was)
         recover(&root, &em).unwrap();
-        assert_eq!((root.current_id().as_deref(), root.previous_id().as_deref()), (Some("aaaa"), Some("bbbb")));
+        assert_eq!(
+            (root.current_id().as_deref(), root.previous_id().as_deref()),
+            (Some("aaaa"), Some("bbbb"))
+        );
     }
 
     #[test]
@@ -728,7 +953,10 @@ mod tests {
         assert_eq!(sp["session_label"], "gnome");
         assert_eq!(sp["cwd"], "/root");
         assert_eq!(sp["binds"][2]["guest"], "/run/droidc/root");
-        assert!(sp["rootfs"].as_str().unwrap().ends_with("/root/current/rootfs"));
+        assert!(sp["rootfs"]
+            .as_str()
+            .unwrap()
+            .ends_with("/root/current/rootfs"));
         // reading through a different absolute path (as the guest does) works
         let alias = _d.path().join("alias");
         std::os::unix::fs::symlink(&root.path, &alias).unwrap();
@@ -739,7 +967,13 @@ mod tests {
     #[test]
     fn insufficient_space_is_storage_error() {
         let (_d, root, _ld) = setup();
-        let big = Descriptor { media_type: String::new(), digest: "sha256:ff".into(), size: u64::MAX / 4, annotations: Default::default(), platform: None };
+        let big = Descriptor {
+            media_type: String::new(),
+            digest: "sha256:ff".into(),
+            size: u64::MAX / 4,
+            annotations: Default::default(),
+            platform: None,
+        };
         let e = check_space(&root, &[big]).unwrap_err();
         assert_eq!(e.kind, crate::error::ErrorKind::Storage);
     }

@@ -48,7 +48,11 @@ pub struct PathMap {
 
 impl PathMap {
     pub fn identity(root: &Path) -> PathMap {
-        PathMap { phys_root: root.to_path_buf(), final_root: root.to_path_buf(), var: None }
+        PathMap {
+            phys_root: root.to_path_buf(),
+            final_root: root.to_path_buf(),
+            var: None,
+        }
     }
 
     pub fn final_path(&self, phys: &Path) -> PathBuf {
@@ -189,11 +193,16 @@ fn os_err(code: i32) -> io::Error {
 
 impl Link2Symlink {
     pub fn new(prefix: &str) -> Self {
-        Link2Symlink { prefix: prefix.to_string() }
+        Link2Symlink {
+            prefix: prefix.to_string(),
+        }
     }
 
     fn is_chain_content(&self, content: &Path) -> bool {
-        content.file_name().map(|n| n.as_bytes().starts_with(self.prefix.as_bytes())).unwrap_or(false)
+        content
+            .file_name()
+            .map(|n| n.as_bytes().starts_with(self.prefix.as_bytes()))
+            .unwrap_or(false)
     }
 
     fn first_link(&self, target: &Path, link: &Path, map: &PathMap) -> io::Result<()> {
@@ -320,7 +329,9 @@ impl LinkStrategy for Link2Symlink {
             Err(_) => return Ok(()), // broken chain: nothing to maintain
         };
         let p_f = map.phys_path(&c_f);
-        let Some((base, count)) = split_count(&p_f) else { return Ok(()) };
+        let Some((base, count)) = split_count(&p_f) else {
+            return Ok(());
+        };
         if count > 1 {
             let new_f = with_count(&base, count - 1);
             fs::rename(&p_f, &new_f)?;
@@ -344,7 +355,12 @@ pub struct AutoLink {
 
 impl AutoLink {
     pub fn new(prefix: &str) -> Self {
-        AutoLink { l2s: Link2Symlink::new(prefix), fell_back: false, used_hard: false, used_l2s: false }
+        AutoLink {
+            l2s: Link2Symlink::new(prefix),
+            fell_back: false,
+            used_hard: false,
+            used_l2s: false,
+        }
     }
 }
 
@@ -403,7 +419,8 @@ mod tests {
         let r = &map.phys_root;
         fs::write(r.join("bin/foo"), b"DATA").unwrap();
         let mut s = Link2Symlink::new(DEFAULT_L2S_PREFIX);
-        s.link(&r.join("bin/foo"), &r.join("lib/bar"), &map).unwrap();
+        s.link(&r.join("bin/foo"), &r.join("lib/bar"), &map)
+            .unwrap();
 
         let fin = r.join("bin/.l2s.foo0001.0002");
         let inter = r.join("bin/.l2s.foo0001");
@@ -415,14 +432,16 @@ mod tests {
         assert_eq!(fs::read(r.join("lib/bar")).unwrap(), b"DATA");
 
         // a third link bumps the count and re-points the intermediate
-        s.link(&r.join("bin/foo"), &r.join("lib/baz"), &map).unwrap();
+        s.link(&r.join("bin/foo"), &r.join("lib/baz"), &map)
+            .unwrap();
         let fin3 = r.join("bin/.l2s.foo0001.0003");
         assert!(fs::symlink_metadata(&fin).is_err());
         assert_eq!(fs::read(&fin3).unwrap(), b"DATA");
         assert_eq!(fs::read_link(&inter).unwrap(), fin3);
         assert_eq!(fs::read_link(r.join("lib/baz")).unwrap(), inter);
         // linking via another name of the chain works too
-        s.link(&r.join("lib/bar"), &r.join("lib/qux"), &map).unwrap();
+        s.link(&r.join("lib/bar"), &r.join("lib/qux"), &map)
+            .unwrap();
         assert!(fs::symlink_metadata(r.join("bin/.l2s.foo0001.0004")).is_ok());
     }
 
@@ -433,7 +452,8 @@ mod tests {
         fs::write(r.join("bin/foo"), b"1").unwrap();
         fs::write(r.join("bin/.l2s.foo0001.0002"), b"stale").unwrap();
         let mut s = Link2Symlink::new(DEFAULT_L2S_PREFIX);
-        s.link(&r.join("bin/foo"), &r.join("lib/bar"), &map).unwrap();
+        s.link(&r.join("bin/foo"), &r.join("lib/bar"), &map)
+            .unwrap();
         assert_eq!(fs::read(r.join("bin/.l2s.foo0002.0002")).unwrap(), b"1");
     }
 
@@ -443,9 +463,11 @@ mod tests {
         let r = &map.phys_root;
         fs::write(r.join("bin/foo"), b"OLD").unwrap();
         let mut s = Link2Symlink::new(DEFAULT_L2S_PREFIX);
-        s.link(&r.join("bin/foo"), &r.join("lib/bar"), &map).unwrap();
-        s.link(&r.join("bin/foo"), &r.join("lib/baz"), &map).unwrap(); // count 3
-        // a later layer replaces bin/foo
+        s.link(&r.join("bin/foo"), &r.join("lib/bar"), &map)
+            .unwrap();
+        s.link(&r.join("bin/foo"), &r.join("lib/baz"), &map)
+            .unwrap(); // count 3
+                       // a later layer replaces bin/foo
         s.before_remove(&r.join("bin/foo"), &map).unwrap();
         fs::remove_file(r.join("bin/foo")).unwrap();
         fs::write(r.join("bin/foo"), b"NEW").unwrap();
@@ -470,16 +492,32 @@ mod tests {
         let fin = root.join("deployments/x/rootfs");
         fs::create_dir_all(phys.join("etc")).unwrap();
         fs::create_dir_all(phys.join("usr/bin")).unwrap();
-        let map = PathMap { phys_root: phys.clone(), final_root: fin.clone(), var: None };
+        let map = PathMap {
+            phys_root: phys.clone(),
+            final_root: fin.clone(),
+            var: None,
+        };
         fs::write(phys.join("etc/a.conf"), b"x").unwrap();
         let mut s = Link2Symlink::new(DEFAULT_L2S_PREFIX);
-        s.link(&phys.join("etc/a.conf"), &phys.join("usr/bin/b.conf"), &map).unwrap();
+        s.link(&phys.join("etc/a.conf"), &phys.join("usr/bin/b.conf"), &map)
+            .unwrap();
         // contents point at the post-rename location, with etc -> usr/etc
-        assert_eq!(fs::read_link(phys.join("usr/bin/b.conf")).unwrap(), fin.join("usr/etc/.l2s.a.conf0001"));
-        assert_eq!(fs::read_link(phys.join("etc/a.conf")).unwrap(), fin.join("usr/etc/.l2s.a.conf0001"));
+        assert_eq!(
+            fs::read_link(phys.join("usr/bin/b.conf")).unwrap(),
+            fin.join("usr/etc/.l2s.a.conf0001")
+        );
+        assert_eq!(
+            fs::read_link(phys.join("etc/a.conf")).unwrap(),
+            fin.join("usr/etc/.l2s.a.conf0001")
+        );
         assert_eq!(map.phys_path(&fin.join("usr/etc/x")), phys.join("etc/x"));
         // a chain can still be extended and unlinked before the move
-        s.link(&phys.join("usr/bin/b.conf"), &phys.join("usr/bin/c.conf"), &map).unwrap();
+        s.link(
+            &phys.join("usr/bin/b.conf"),
+            &phys.join("usr/bin/c.conf"),
+            &map,
+        )
+        .unwrap();
         s.before_remove(&phys.join("usr/bin/c.conf"), &map).unwrap();
         assert!(fs::symlink_metadata(phys.join("etc/.l2s.a.conf0001.0002")).is_ok());
     }
@@ -489,9 +527,13 @@ mod tests {
         let (_d, map) = setup();
         let r = &map.phys_root;
         fs::write(r.join("bin/foo"), b"D").unwrap();
-        HardLink.link(&r.join("bin/foo"), &r.join("lib/h"), &map).unwrap();
+        HardLink
+            .link(&r.join("bin/foo"), &r.join("lib/h"), &map)
+            .unwrap();
         assert_eq!(fs::metadata(r.join("lib/h")).unwrap().nlink(), 2);
-        CopyLink.link(&r.join("bin/foo"), &r.join("lib/c"), &map).unwrap();
+        CopyLink
+            .link(&r.join("bin/foo"), &r.join("lib/c"), &map)
+            .unwrap();
         assert_eq!(fs::metadata(r.join("lib/c")).unwrap().nlink(), 1);
         assert_eq!(fs::read(r.join("lib/c")).unwrap(), b"D");
     }
@@ -526,6 +568,9 @@ mod tests {
         let (b, c) = split_count(&p).unwrap();
         assert_eq!(c, 9);
         assert_eq!(with_count(&b, 10), PathBuf::from("/x/.l2s.foo0001.0010"));
-        assert_eq!(with_count(&b, 10000), PathBuf::from("/x/.l2s.foo0001.10000"));
+        assert_eq!(
+            with_count(&b, 10000),
+            PathBuf::from("/x/.l2s.foo0001.10000")
+        );
     }
 }

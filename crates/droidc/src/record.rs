@@ -15,7 +15,13 @@ pub struct SignatureInfo {
 
 impl SignatureInfo {
     pub fn none() -> Self {
-        SignatureInfo { verified: false, mode: "none".into(), subject: None, issuer: None, policy_match: None }
+        SignatureInfo {
+            verified: false,
+            mode: "none".into(),
+            subject: None,
+            issuer: None,
+            policy_match: None,
+        }
     }
 }
 
@@ -53,7 +59,9 @@ pub struct Deployment {
 
 /// First 16 hex chars of the manifest digest.
 pub fn deployment_id(manifest_digest: &str) -> String {
-    let hexpart = manifest_digest.strip_prefix("sha256:").unwrap_or(manifest_digest);
+    let hexpart = manifest_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(manifest_digest);
     hexpart.chars().take(16).collect()
 }
 
@@ -63,7 +71,10 @@ pub fn now_rfc3339() -> String {
 }
 
 pub fn rfc3339(t: std::time::SystemTime) -> String {
-    let secs = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
     let days = secs.div_euclid(86400);
     let rem = secs.rem_euclid(86400);
     // civil-from-days (Howard Hinnant's algorithm)
@@ -77,7 +88,15 @@ pub fn rfc3339(t: std::time::SystemTime) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60)
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m,
+        d,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
 }
 
 #[cfg(test)]
@@ -87,13 +106,24 @@ mod tests {
 
     #[test]
     fn id_is_16_hex() {
-        assert_eq!(deployment_id("sha256:d2a12ef344f80bb0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "d2a12ef344f80bb0");
+        assert_eq!(
+            deployment_id(
+                "sha256:d2a12ef344f80bb0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            "d2a12ef344f80bb0"
+        );
     }
 
     #[test]
     fn rfc3339_known() {
         assert_eq!(rfc3339(UNIX_EPOCH), "1970-01-01T00:00:00Z");
-        assert_eq!(rfc3339(UNIX_EPOCH + Duration::from_secs(1_700_000_000)), "2023-11-14T22:13:20Z");
-        assert_eq!(rfc3339(UNIX_EPOCH + Duration::from_secs(1_709_164_800)), "2024-02-29T00:00:00Z");
+        assert_eq!(
+            rfc3339(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            "2023-11-14T22:13:20Z"
+        );
+        assert_eq!(
+            rfc3339(UNIX_EPOCH + Duration::from_secs(1_709_164_800)),
+            "2024-02-29T00:00:00Z"
+        );
     }
 }

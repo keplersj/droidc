@@ -22,7 +22,11 @@ impl Emitter {
     }
 
     pub fn with_writer(json: bool, w: Box<dyn Write + Send>) -> Self {
-        Emitter { json, out: Mutex::new(w), last: Mutex::new(HashMap::new()) }
+        Emitter {
+            json,
+            out: Mutex::new(w),
+            last: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn is_json(&self) -> bool {
@@ -44,7 +48,14 @@ impl Emitter {
     }
 
     /// Like `progress`, but at most every 200 ms per phase (the final `current == total` always goes).
-    pub fn progress_throttled(&self, phase: &str, current: u64, total: u64, unit: &str, message: &str) {
+    pub fn progress_throttled(
+        &self,
+        phase: &str,
+        current: u64,
+        total: u64,
+        unit: &str,
+        message: &str,
+    ) {
         {
             let mut last = self.last.lock().unwrap();
             let now = Instant::now();
@@ -135,10 +146,19 @@ mod tests {
         em.warn("careful");
         em.result_ok(&json!({"changed":true}));
         let l = buf.lines();
-        assert_eq!(l[0], json!({"event":"progress","phase":"download","current":1,"total":10,"unit":"bytes","message":"layer 1/2"}));
-        assert_eq!(l[1], json!({"event":"log","level":"info","message":"hello"}));
+        assert_eq!(
+            l[0],
+            json!({"event":"progress","phase":"download","current":1,"total":10,"unit":"bytes","message":"layer 1/2"})
+        );
+        assert_eq!(
+            l[1],
+            json!({"event":"log","level":"info","message":"hello"})
+        );
         assert_eq!(l[2]["level"], "warn");
-        assert_eq!(l[3], json!({"event":"result","ok":true,"data":{"changed":true}}));
+        assert_eq!(
+            l[3],
+            json!({"event":"result","ok":true,"data":{"changed":true}})
+        );
     }
 
     #[test]
@@ -146,7 +166,10 @@ mod tests {
         let (em, buf) = capture();
         em.result_err(&Error::not_found("no such tag"));
         let l = buf.lines();
-        assert_eq!(l[0], json!({"event":"result","ok":false,"error":{"kind":"not-found","message":"no such tag"}}));
+        assert_eq!(
+            l[0],
+            json!({"event":"result","ok":false,"error":{"kind":"not-found","message":"no such tag"}})
+        );
     }
 
     #[test]

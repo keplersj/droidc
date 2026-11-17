@@ -14,6 +14,8 @@ of droidc. Read `droiddeck-runtime-internals.md` first for background.
     musl, so networking uses **rustls + webpki-roots** and a resolver that takes nameservers from
     `--dns`/`DROIDC_DNS` (comma-separated IPs; Selkie passes Android's current DNS servers),
     falling back to `/etc/resolv.conf`, then `1.1.1.1,8.8.8.8`.
+- Extra CA bundle for development/proxies: `DROIDC_EXTRA_CA_FILE` (then `SSL_CERT_FILE`) adds PEM
+  certificates on top of webpki-roots. `HTTPS_PROXY`/`NO_PROXY` are honored.
 - proot is built separately with the NDK (bionic), GPL-2, see Selkie `third_party/proot/`.
 
 ## Platform
@@ -50,6 +52,14 @@ remove `PENDING`. Any command that finds `PENDING` first recovers: deletes `stag
 `deployments/<id>` exists but `current` doesn't point at it, leaves it for GC. GC removes
 deployments other than current/previous and blobs not referenced by them.
 
+**Deviation (implemented):** recovery is *roll-forward* once the deployment is complete. `PENDING`
+is `{op: switch|rollback, id, prev, started}` where `id` becomes `current` and `prev` (the old
+`current`) becomes `previous`. If `deployments/<id>/deployment.json` exists (the staging directory was
+already renamed in), recovery finishes the swaps (idempotent: seed `var/`, `previous` := `prev`,
+`current` := `id`). Only when the deployment is not yet in place does it discard `staging/*`. This
+avoids ending up with `previous == current` after a crash between the two symlink renames and makes
+`rollback` restartable. A successful `switch`/`upgrade` runs GC at the end (phase `gc`).
+
 ## Unpacking
 
 - Layers are applied in order (gzip, zstd, uncompressed tar). OCI whiteouts: `.wh.<name>` deletes,
@@ -58,10 +68,41 @@ deployments other than current/previous and blobs not referenced by them.
   files (`vmlinuz*`, `initramfs*`, `*.efi` under `/usr/lib/systemd/boot` and `/boot`).
 - No chown. Mode bits that are safe (rwx) are applied; uid/gid/setuid/xattrs go to
   `metadata.jsonl.zst`. Directories are made owner-writable so the tree can be updated and deleted.
+  Judgment call: regular files additionally get owner read+write (`mode | 0o600`) because the app uid
+  must be able to read/replace everything (e.g. a `000` `/etc/shadow`); the true mode is in the
+  metadata. Mtimes of regular files are kept; special files (devices, fifos) are skipped.
+- `metadata.jsonl.zst`: one JSON object per final path (sorted), `{"p","t","u","g","m","x","l"}`:
+  type `f|d|l|h`, uid, gid, full mode incl. setuid/setgid/sticky, xattrs (name -> base64 value, from
+  PAX `SCHILY.xattr.*`), symlink/hard-link target. Paths are as in the final rootfs (image `etc/`
+  appears as `usr/etc/`). The directories `/boot`, `/usr/lib/modules`, ... are kept but empty.
 - `/etc` from the image is moved to `usr/etc` after the last layer.
 - Hard links go through `trait LinkStrategy`: `hardlink`, `link2symlink` (proot-compatible layout,
   so `proot --link2symlink` sees real hard links), `copy`, and `auto` (try `link(2)`, on
   EPERM/EACCES/EXDEV fall back to link2symlink). Selkie passes `--links link2symlink` on Android.
+  - `link2symlink` creates exactly the structure proot's extension creates (format below), with
+    absolute host paths that point at the **final** location (`<root>/deployments/<id>/rootfs/...`,
+    `etc/` mapped to `usr/etc/`, seeded `var/` mapped to `<root>/var/`). `<root>` is canonicalized
+    when droidc opens it, so Selkie must run proot on that same canonical path and must not move or
+    rename the root afterwards (existing chains would dangle). Prefix: `.l2s.` (Termux proot,
+    default); upstream proot-me uses `.proot.l2s.` - set `DROIDC_L2S_PREFIX` to match the proot in use.
+  - Hard links whose target is later replaced or whited out in a later layer keep working (the
+    unpacker never writes through an existing inode and maintains l2s link counts on removal).
+
+### link2symlink on-disk format
+
+For a regular file `D/name` that gets a second name `E/other`:
+
+```
+D/.l2s.name0001.0002   regular file, the real data ("final"); suffix = link count, >= 4 digits
+D/.l2s.name0001        symlink -> <abs path of D/.l2s.name0001.0002>               ("intermediate")
+D/name                 symlink -> <abs path of D/.l2s.name0001>
+E/other                symlink -> <abs path of D/.l2s.name0001>
+```
+
+`0001` is the first free 4-digit suffix (1..9999) for that name in `D`. Another link renames the
+final file to `...0003` and re-creates the intermediate; removing a name reverses this and deletes
+intermediate and final at zero. Names too long for the suffixes (ENAMETOOLONG) or full chains
+(EMLINK) fall back to a copy. See `crates/droidc/src/link.rs`.
 - Recorded in `deployment.json`: hard-link count, strategy used, file count, bytes on disk, unpack
   seconds, download bytes.
 - Before unpacking, check free space (`statvfs`) against an estimate (2.5x compressed size, plus
@@ -140,7 +181,15 @@ The last line is always a `result`. Exit status is 0 iff `ok`.
  "stats":{"download_bytes":0,"files":0,"bytes_on_disk":0,"hardlinks":0,"link_strategy":"link2symlink","unpack_seconds":0.0}}
 ```
 
-`status` data: `{"root":..., "platform":{...}, "current":<record>|null, "previous":<record>|null}`.
+`status` data: `{"root":..., "platform":{...}, "current":<record>|null, "previous":<record>|null,
+"staged":<PENDING>|null}` (`staged` is non-null only while an operation runs or was interrupted).
+
+`switch`/`upgrade` result data: `{"changed":true,"id","previous","deployment":<record>,"gc":{...}}`, or
+`{"changed":false,"id","manifest_digest","deployment"}` when the digest is already current.
+`switch --verify-only` resolves and verifies the signature (manifests and cosign `.sig` only, no
+layers) and returns `{"changed":false,"verify_only":true,"id","manifest_digest","signature",...}`.
+`rollback`: `{"changed":true,"current","previous"}`. `gc`: `{"deployments_removed":[...],
+"blobs_removed":n,"bytes_freed":n}`. `stats` additionally has `link_strategy_used`.
 
 ### `shell-spec` data
 
@@ -158,3 +207,15 @@ Selkie adds Android binds (`/dev`, `/proc`, `/sys`, fake proc files, `/usr/bin/d
 `containers.droidc.session` from the image config labels (`gamescope`, `plasma`, `gnome`), recorded
 as `session_label`; `null` when absent (Bluefin LTS doesn't set it yet, so Selkie defaults GNOME
 images by name only for display).
+
+## `supervise` (seed of the session supervisor)
+
+`droidc supervise -- cmd...` runs inside the guest: creates `XDG_RUNTIME_DIR` (0700) if needed, starts
+a session bus and exports `DBUS_SESSION_BUS_ADDRESS`, runs `cmd` as a child, reaps all children and
+exits with the command's status (the command always runs, even if no bus could be started).
+CentOS/Bluefin images ship only `dbus-broker` and `systemd --user` cannot run under proot, so droidc
+does the socket activation itself: bind+listen `$XDG_RUNTIME_DIR/bus`, spawn
+`dbus-broker-launch --scope user` with that socket as fd 3 and `LISTEN_FDS=1`,
+`LISTEN_FDNAMES=dbus.socket`, `LISTEN_PID=<broker pid>` (set by a tiny `sh -c ... exec` wrapper so the
+pid matches). Falls back to `dbus-daemon --session --fork --print-address` when present. Untested
+against a real broker inside proot (the plumbing has a unit test with a fake broker).

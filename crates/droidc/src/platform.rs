@@ -14,13 +14,18 @@ pub fn arch_from_machine(machine: &str) -> Result<&'static str> {
     match machine {
         "aarch64" | "arm64" | "aarch64_be" => Ok("arm64"),
         "x86_64" | "amd64" => Ok("amd64"),
-        other => Err(Error::invalid(format!("unsupported machine architecture '{other}'"))),
+        other => Err(Error::invalid(format!(
+            "unsupported machine architecture '{other}'"
+        ))),
     }
 }
 
 impl Platform {
     pub fn from_machine(machine: &str) -> Result<Platform> {
-        Ok(Platform { os: "linux".into(), arch: arch_from_machine(machine)?.into() })
+        Ok(Platform {
+            os: "linux".into(),
+            arch: arch_from_machine(machine)?.into(),
+        })
     }
 
     pub fn detect() -> Result<Platform> {
@@ -35,9 +40,14 @@ impl Platform {
             .split_once('/')
             .ok_or_else(|| Error::invalid(format!("platform '{s}' must look like os/arch")))?;
         if os != "linux" {
-            return Err(Error::invalid(format!("unsupported os '{os}' (only linux)")));
+            return Err(Error::invalid(format!(
+                "unsupported os '{os}' (only linux)"
+            )));
         }
-        Ok(Platform { os: os.into(), arch: arch_from_machine(arch)?.into() })
+        Ok(Platform {
+            os: os.into(),
+            arch: arch_from_machine(arch)?.into(),
+        })
     }
 }
 
@@ -53,8 +63,14 @@ mod tests {
 
     #[test]
     fn machine_mapping() {
-        assert_eq!(Platform::from_machine("aarch64").unwrap().to_string(), "linux/arm64");
-        assert_eq!(Platform::from_machine("x86_64").unwrap().to_string(), "linux/amd64");
+        assert_eq!(
+            Platform::from_machine("aarch64").unwrap().to_string(),
+            "linux/arm64"
+        );
+        assert_eq!(
+            Platform::from_machine("x86_64").unwrap().to_string(),
+            "linux/amd64"
+        );
         assert!(Platform::from_machine("riscv64").is_err());
         assert!(Platform::from_machine("armv7l").is_err());
     }

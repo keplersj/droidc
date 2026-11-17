@@ -8,13 +8,21 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 fn rec(root: &Root, id: Option<String>) -> Value {
-    id.and_then(|i| root.read_record(&i).ok()).map(|r| serde_json::to_value(r).unwrap()).unwrap_or(Value::Null)
+    id.and_then(|i| root.read_record(&i).ok())
+        .map(|r| serde_json::to_value(r).unwrap())
+        .unwrap_or(Value::Null)
 }
 
 pub fn status(root_path: &Path) -> Result<Value> {
     let root = Root::new(root_path);
-    let platform = Platform::detect().ok().map(|p| serde_json::to_value(p).unwrap()).unwrap_or(Value::Null);
-    let pending = root.read_pending()?.map(|p| serde_json::to_value(p).unwrap()).unwrap_or(Value::Null);
+    let platform = Platform::detect()
+        .ok()
+        .map(|p| serde_json::to_value(p).unwrap())
+        .unwrap_or(Value::Null);
+    let pending = root
+        .read_pending()?
+        .map(|p| serde_json::to_value(p).unwrap())
+        .unwrap_or(Value::Null);
     Ok(json!({
         "root": root_path.display().to_string(),
         "platform": platform,
@@ -29,7 +37,9 @@ pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bi
 
 pub fn shell_spec(root_path: &Path) -> Result<Value> {
     let root = Root::new(root_path);
-    let cur = root.current_id().ok_or_else(|| Error::not_found("no current deployment"))?;
+    let cur = root
+        .current_id()
+        .ok_or_else(|| Error::not_found("no current deployment"))?;
     let record = root.read_record(&cur)?;
     let abs = std::path::absolute(root_path).unwrap_or_else(|_| root_path.to_path_buf());
     let r = abs.display().to_string();

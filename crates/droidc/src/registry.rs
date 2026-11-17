@@ -49,24 +49,38 @@ impl ImageRef {
             None => (s, None),
         };
         if let Some(d) = &digest {
-            let ok = d.strip_prefix("sha256:").map(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit())).unwrap_or(false);
+            let ok = d
+                .strip_prefix("sha256:")
+                .map(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
+                .unwrap_or(false);
             if !ok {
                 return Err(Error::invalid(format!("bad digest in reference '{s}'")));
             }
         }
         let last_slash = name.rfind('/').map(|i| i + 1).unwrap_or(0);
         let (path, tag) = match name[last_slash..].rfind(':') {
-            Some(i) => (&name[..last_slash + i], Some(name[last_slash + i + 1..].to_string())),
+            Some(i) => (
+                &name[..last_slash + i],
+                Some(name[last_slash + i + 1..].to_string()),
+            ),
             None => (name, None),
         };
         if path.is_empty() {
             return Err(Error::invalid(format!("empty image reference '{s}'")));
         }
         let (registry, repository) = match path.split_once('/') {
-            Some((first, rest)) if first.contains('.') || first.contains(':') || first == "localhost" => (first.to_string(), rest.to_string()),
+            Some((first, rest))
+                if first.contains('.') || first.contains(':') || first == "localhost" =>
+            {
+                (first.to_string(), rest.to_string())
+            }
             _ => ("docker.io".to_string(), path.to_string()),
         };
-        let repository = if registry == "docker.io" && !repository.contains('/') { format!("library/{repository}") } else { repository };
+        let repository = if registry == "docker.io" && !repository.contains('/') {
+            format!("library/{repository}")
+        } else {
+            repository
+        };
         if repository.is_empty() {
             return Err(Error::invalid(format!("bad image reference '{s}'")));
         }
@@ -75,7 +89,12 @@ impl ImageRef {
             (None, Some(t)) => Reference::Tag(t),
             (None, None) => Reference::Tag("latest".into()),
         };
-        Ok(ImageRef { registry, repository, reference, original })
+        Ok(ImageRef {
+            registry,
+            repository,
+            reference,
+            original,
+        })
     }
 
     pub fn reference_str(&self) -> &str {
@@ -195,7 +214,10 @@ pub fn parse_dns_list(s: &str) -> Result<Vec<IpAddr>> {
     s.split(',')
         .map(str::trim)
         .filter(|x| !x.is_empty())
-        .map(|x| x.parse::<IpAddr>().map_err(|_| Error::invalid(format!("bad DNS server address '{x}'"))))
+        .map(|x| {
+            x.parse::<IpAddr>()
+                .map_err(|_| Error::invalid(format!("bad DNS server address '{x}'")))
+        })
         .collect()
 }
 
@@ -204,7 +226,7 @@ pub fn parse_resolv_conf(s: &str) -> Vec<IpAddr> {
         .filter_map(|l| {
             let l = l.trim();
             let rest = l.strip_prefix("nameserver")?;
-            let tok = rest.trim().split_whitespace().next()?;
+            let tok = rest.split_whitespace().next()?;
             let tok = tok.split('%').next()?; // drop zone ids
             tok.parse::<IpAddr>().ok()
         })
@@ -251,13 +273,20 @@ impl reqwest::dns::Resolve for HickoryDns {
             .resolver
             .0
             .get_or_init(|| {
-                let cfg = ResolverConfig::from_parts(None, vec![], NameServerConfigGroup::from_ips_clear(&servers, 53, true));
+                let cfg = ResolverConfig::from_parts(
+                    None,
+                    vec![],
+                    NameServerConfigGroup::from_ips_clear(&servers, 53, true),
+                );
                 TokioResolver::builder_with_config(cfg, TokioConnectionProvider::default()).build()
             })
             .clone();
         Box::pin(async move {
             let lookup = resolver.lookup_ip(name.as_str()).await?;
-            let addrs: Vec<std::net::SocketAddr> = lookup.iter().map(|ip| std::net::SocketAddr::new(ip, 0)).collect();
+            let addrs: Vec<std::net::SocketAddr> = lookup
+                .iter()
+                .map(|ip| std::net::SocketAddr::new(ip, 0))
+                .collect();
             let it: reqwest::dns::Addrs = Box::new(addrs.into_iter());
             Ok(it)
         })
@@ -271,14 +300,20 @@ pub fn build_http_client(cfg: &HttpConfig, total_timeout: Duration) -> Result<Cl
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     if let Some(p) = &cfg.extra_ca {
         let mut n = 0;
-        for cert in CertificateDer::pem_file_iter(p).map_err(|e| Error::invalid(format!("extra CA file {}: {e}", p.display())))? {
-            let cert = cert.map_err(|e| Error::invalid(format!("extra CA file {}: {e}", p.display())))?;
+        for cert in CertificateDer::pem_file_iter(p)
+            .map_err(|e| Error::invalid(format!("extra CA file {}: {e}", p.display())))?
+        {
+            let cert =
+                cert.map_err(|e| Error::invalid(format!("extra CA file {}: {e}", p.display())))?;
             if roots.add(cert).is_ok() {
                 n += 1;
             }
         }
         if n == 0 {
-            return Err(Error::invalid(format!("extra CA file {} holds no usable certificates", p.display())));
+            return Err(Error::invalid(format!(
+                "extra CA file {} holds no usable certificates",
+                p.display()
+            )));
         }
     }
     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
@@ -291,7 +326,10 @@ pub fn build_http_client(cfg: &HttpConfig, total_timeout: Duration) -> Result<Cl
     let servers = nameservers(cfg.dns.as_deref())?;
     let mut b = Client::builder()
         .use_preconfigured_tls(tls)
-        .dns_resolver(Arc::new(HickoryDns { servers, resolver: Default::default() }))
+        .dns_resolver(Arc::new(HickoryDns {
+            servers,
+            resolver: Default::default(),
+        }))
         .connect_timeout(Duration::from_secs(20))
         .timeout(total_timeout)
         .user_agent(concat!("droidc/", env!("CARGO_PKG_VERSION")))
@@ -300,7 +338,9 @@ pub fn build_http_client(cfg: &HttpConfig, total_timeout: Duration) -> Result<Cl
     for var in ["HTTPS_PROXY", "https_proxy"] {
         if let Ok(u) = std::env::var(var) {
             if !u.is_empty() {
-                let p = reqwest::Proxy::https(&u).map_err(|e| Error::invalid(format!("{var}: {e}")))?.no_proxy(no_proxy.clone());
+                let p = reqwest::Proxy::https(&u)
+                    .map_err(|e| Error::invalid(format!("{var}: {e}")))?
+                    .no_proxy(no_proxy.clone());
                 b = b.proxy(p);
                 break;
             }
@@ -309,13 +349,16 @@ pub fn build_http_client(cfg: &HttpConfig, total_timeout: Duration) -> Result<Cl
     for var in ["HTTP_PROXY", "http_proxy"] {
         if let Ok(u) = std::env::var(var) {
             if !u.is_empty() {
-                let p = reqwest::Proxy::http(&u).map_err(|e| Error::invalid(format!("{var}: {e}")))?.no_proxy(no_proxy.clone());
+                let p = reqwest::Proxy::http(&u)
+                    .map_err(|e| Error::invalid(format!("{var}: {e}")))?
+                    .no_proxy(no_proxy.clone());
                 b = b.proxy(p);
                 break;
             }
         }
     }
-    b.build().map_err(|e| Error::internal(format!("http client: {e}")))
+    b.build()
+        .map_err(|e| Error::internal(format!("http client: {e}")))
 }
 
 // ---------------------------------------------------------------- registry client
@@ -329,7 +372,7 @@ pub struct Registry {
 }
 
 fn net(e: reqwest::Error) -> Error {
-    Error::network(format!("{}", describe(&e)))
+    Error::network(describe(&e))
 }
 
 fn describe(e: &reqwest::Error) -> String {
@@ -344,11 +387,17 @@ fn describe(e: &reqwest::Error) -> String {
 }
 
 fn parse_challenge(h: &str) -> Option<HashMap<String, String>> {
-    let rest = h.trim().strip_prefix("Bearer").or_else(|| h.trim().strip_prefix("bearer"))?;
+    let rest = h
+        .trim()
+        .strip_prefix("Bearer")
+        .or_else(|| h.trim().strip_prefix("bearer"))?;
     let mut out = HashMap::new();
     for part in rest.trim().split(',') {
         if let Some((k, v)) = part.split_once('=') {
-            out.insert(k.trim().to_ascii_lowercase(), v.trim().trim_matches('"').to_string());
+            out.insert(
+                k.trim().to_ascii_lowercase(),
+                v.trim().trim_matches('"').to_string(),
+            );
         }
     }
     Some(out)
@@ -356,7 +405,11 @@ fn parse_challenge(h: &str) -> Option<HashMap<String, String>> {
 
 impl Registry {
     pub fn new(cfg: &HttpConfig) -> Result<Registry> {
-        Ok(Registry { http: build_http_client(cfg, Duration::from_secs(60))?, bulk: build_http_client(cfg, Duration::from_secs(3600))?, tokens: Mutex::new(HashMap::new()) })
+        Ok(Registry {
+            http: build_http_client(cfg, Duration::from_secs(60))?,
+            bulk: build_http_client(cfg, Duration::from_secs(3600))?,
+            tokens: Mutex::new(HashMap::new()),
+        })
     }
 
     fn token_key(r: &ImageRef) -> String {
@@ -364,34 +417,70 @@ impl Registry {
     }
 
     fn fetch_token(&self, r: &ImageRef, challenge: &str) -> Result<()> {
-        let ch = parse_challenge(challenge).ok_or_else(|| Error::network(format!("unsupported auth challenge from {}: {challenge}", r.registry)))?;
-        let realm = ch.get("realm").ok_or_else(|| Error::network("auth challenge without realm"))?;
-        let mut url = reqwest::Url::parse(realm).map_err(|e| Error::network(format!("bad auth realm: {e}")))?;
+        let ch = parse_challenge(challenge).ok_or_else(|| {
+            Error::network(format!(
+                "unsupported auth challenge from {}: {challenge}",
+                r.registry
+            ))
+        })?;
+        let realm = ch
+            .get("realm")
+            .ok_or_else(|| Error::network("auth challenge without realm"))?;
+        let mut url = reqwest::Url::parse(realm)
+            .map_err(|e| Error::network(format!("bad auth realm: {e}")))?;
         {
             let mut q = url.query_pairs_mut();
             if let Some(s) = ch.get("service") {
                 q.append_pair("service", s);
             }
-            let scope = ch.get("scope").cloned().unwrap_or_else(|| format!("repository:{}:pull", r.repository));
+            let scope = ch
+                .get("scope")
+                .cloned()
+                .unwrap_or_else(|| format!("repository:{}:pull", r.repository));
             q.append_pair("scope", &scope);
         }
         let resp = self.http.get(url).send().map_err(net)?;
         if !resp.status().is_success() {
-            return Err(Error::not_found(format!("token request for {} failed: HTTP {}", r.full_name(), resp.status())));
+            return Err(Error::not_found(format!(
+                "token request for {} failed: HTTP {}",
+                r.full_name(),
+                resp.status()
+            )));
         }
-        let v: serde_json::Value = serde_json::from_slice(&resp.bytes().map_err(net)?).map_err(|e| Error::network(format!("bad token response: {e}")))?;
-        let tok = v.get("token").or_else(|| v.get("access_token")).and_then(|t| t.as_str()).ok_or_else(|| Error::network("token response without token"))?;
-        self.tokens.lock().unwrap().insert(Self::token_key(r), tok.to_string());
+        let v: serde_json::Value = serde_json::from_slice(&resp.bytes().map_err(net)?)
+            .map_err(|e| Error::network(format!("bad token response: {e}")))?;
+        let tok = v
+            .get("token")
+            .or_else(|| v.get("access_token"))
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| Error::network("token response without token"))?;
+        self.tokens
+            .lock()
+            .unwrap()
+            .insert(Self::token_key(r), tok.to_string());
         Ok(())
     }
 
     /// GET with auth handling and retries on transient failures. Returns the response for any
     /// status other than 401-after-auth and retryable ones.
-    fn get(&self, r: &ImageRef, url: &str, accept: Option<&str>, range_from: Option<u64>) -> Result<Response> {
+    fn get(
+        &self,
+        r: &ImageRef,
+        url: &str,
+        accept: Option<&str>,
+        range_from: Option<u64>,
+    ) -> Result<Response> {
         self.get_with(&self.http, r, url, accept, range_from)
     }
 
-    fn get_with(&self, client: &Client, r: &ImageRef, url: &str, accept: Option<&str>, range_from: Option<u64>) -> Result<Response> {
+    fn get_with(
+        &self,
+        client: &Client,
+        r: &ImageRef,
+        url: &str,
+        accept: Option<&str>,
+        range_from: Option<u64>,
+    ) -> Result<Response> {
         let mut authed_once = false;
         let mut attempt = 0;
         loop {
@@ -417,7 +506,12 @@ impl Registry {
                     let st = resp.status();
                     if st.as_u16() == 401 && !authed_once {
                         authed_once = true;
-                        let ch = resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                        let ch = resp
+                            .headers()
+                            .get("www-authenticate")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
                         self.fetch_token(r, &ch)?;
                         continue;
                     }
@@ -433,18 +527,30 @@ impl Registry {
     }
 
     fn manifest_url(r: &ImageRef, reference: &str) -> String {
-        format!("{}/v2/{}/manifests/{}", r.base_url(), r.repository, reference)
+        format!(
+            "{}/v2/{}/manifests/{}",
+            r.base_url(),
+            r.repository,
+            reference
+        )
     }
 
     /// Fetch raw manifest bytes (digest-verified when `reference` is a digest). Returns None on 404.
-    fn get_manifest_bytes(&self, r: &ImageRef, reference: &str) -> Result<Option<(Vec<u8>, String)>> {
+    fn get_manifest_bytes(
+        &self,
+        r: &ImageRef,
+        reference: &str,
+    ) -> Result<Option<(Vec<u8>, String)>> {
         let resp = self.get(r, &Self::manifest_url(r, reference), Some(ACCEPT), None)?;
         let st = resp.status();
         if st.as_u16() == 404 {
             return Ok(None);
         }
         if st.as_u16() == 401 || st.as_u16() == 403 {
-            return Err(Error::not_found(format!("{} not found or not accessible anonymously (HTTP {st})", r.original)));
+            return Err(Error::not_found(format!(
+                "{} not found or not accessible anonymously (HTTP {st})",
+                r.original
+            )));
         }
         if !st.is_success() {
             return Err(Error::network(format!("manifest {reference}: HTTP {st}")));
@@ -452,7 +558,9 @@ impl Registry {
         let bytes = resp.bytes().map_err(net)?.to_vec();
         let digest = format!("sha256:{}", sha256_hex(&bytes));
         if reference.starts_with("sha256:") && reference != digest {
-            return Err(Error::network(format!("manifest digest mismatch: wanted {reference}, got {digest}")));
+            return Err(Error::network(format!(
+                "manifest digest mismatch: wanted {reference}, got {digest}"
+            )));
         }
         Ok(Some((bytes, digest)))
     }
@@ -462,29 +570,41 @@ impl Registry {
         let (bytes, digest) = self
             .get_manifest_bytes(r, r.reference_str())?
             .ok_or_else(|| Error::not_found(format!("manifest unknown: {}", r.original)))?;
-        let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| Error::network(format!("bad manifest json: {e}")))?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::network(format!("bad manifest json: {e}")))?;
         let (index_digest, index_bytes, m_digest, m_bytes) = if v.get("manifests").is_some() {
-            let idx: Index = serde_json::from_value(v).map_err(|e| Error::network(format!("bad index: {e}")))?;
+            let idx: Index =
+                serde_json::from_value(v).map_err(|e| Error::network(format!("bad index: {e}")))?;
             let want = &plat.arch;
             let pick = idx
                 .manifests
                 .iter()
                 .find(|d| {
                     d.platform.as_ref().map(|p| {
-                        p.os == plat.os && p.architecture == *want && (want != "arm64" || matches!(p.variant.as_deref(), None | Some("") | Some("v8")))
+                        p.os == plat.os
+                            && p.architecture == *want
+                            && (want != "arm64"
+                                || matches!(p.variant.as_deref(), None | Some("") | Some("v8")))
                     }) == Some(true)
                 })
-                .ok_or_else(|| Error::not_found(format!("{} has no manifest for platform {plat}", r.original)))?;
-            let (mb, md) = self
-                .get_manifest_bytes(r, &pick.digest)?
-                .ok_or_else(|| Error::not_found(format!("platform manifest {} missing", pick.digest)))?;
+                .ok_or_else(|| {
+                    Error::not_found(format!(
+                        "{} has no manifest for platform {plat}",
+                        r.original
+                    ))
+                })?;
+            let (mb, md) = self.get_manifest_bytes(r, &pick.digest)?.ok_or_else(|| {
+                Error::not_found(format!("platform manifest {} missing", pick.digest))
+            })?;
             (Some(digest), Some(bytes), md, mb)
         } else {
             (None, None, digest, bytes)
         };
-        let manifest: Manifest = serde_json::from_slice(&m_bytes).map_err(|e| Error::network(format!("bad image manifest: {e}")))?;
+        let manifest: Manifest = serde_json::from_slice(&m_bytes)
+            .map_err(|e| Error::network(format!("bad image manifest: {e}")))?;
         let config_bytes = self.get_blob_bytes(r, &manifest.config.digest, 8 << 20)?;
-        let config: ImageConfig = serde_json::from_slice(&config_bytes).map_err(|e| Error::network(format!("bad image config: {e}")))?;
+        let config: ImageConfig = serde_json::from_slice(&config_bytes)
+            .map_err(|e| Error::network(format!("bad image config: {e}")))?;
         Ok(Resolved {
             image: r.clone(),
             platform: plat.clone(),
@@ -506,16 +626,25 @@ impl Registry {
     pub fn get_blob_bytes(&self, r: &ImageRef, digest: &str, max: u64) -> Result<Vec<u8>> {
         let resp = self.get(r, &Self::blob_url(r, digest), None, None)?;
         if !resp.status().is_success() {
-            return Err(Error::network(format!("blob {digest}: HTTP {}", resp.status())));
+            return Err(Error::network(format!(
+                "blob {digest}: HTTP {}",
+                resp.status()
+            )));
         }
         let mut buf = Vec::new();
-        resp.take(max + 1).read_to_end(&mut buf).map_err(|e| Error::network(format!("blob {digest}: {e}")))?;
+        resp.take(max + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| Error::network(format!("blob {digest}: {e}")))?;
         if buf.len() as u64 > max {
-            return Err(Error::network(format!("blob {digest} larger than {max} bytes")));
+            return Err(Error::network(format!(
+                "blob {digest} larger than {max} bytes"
+            )));
         }
         let got = format!("sha256:{}", sha256_hex(&buf));
         if got != digest {
-            return Err(Error::network(format!("blob digest mismatch: wanted {digest}, got {got}")));
+            return Err(Error::network(format!(
+                "blob digest mismatch: wanted {digest}, got {got}"
+            )));
         }
         Ok(buf)
     }
@@ -524,7 +653,14 @@ impl Registry {
     /// blob is already present with the right size. Resumes a partial download from `tmp_dir`.
     /// `on_bytes` is called with the number of bytes transferred by each chunk. Returns bytes
     /// downloaded over the network (0 when cached).
-    pub fn fetch_blob(&self, r: &ImageRef, desc: &Descriptor, blob_path: &Path, tmp_dir: &Path, on_bytes: &dyn Fn(u64)) -> Result<u64> {
+    pub fn fetch_blob(
+        &self,
+        r: &ImageRef,
+        desc: &Descriptor,
+        blob_path: &Path,
+        tmp_dir: &Path,
+        on_bytes: &dyn Fn(u64),
+    ) -> Result<u64> {
         if let Ok(md) = fs::metadata(blob_path) {
             if desc.size == 0 || md.len() == desc.size {
                 return Ok(0);
@@ -532,7 +668,10 @@ impl Registry {
             let _ = fs::remove_file(blob_path);
         }
         fs::create_dir_all(tmp_dir).context(tmp_dir.display())?;
-        let hexpart = desc.digest.strip_prefix("sha256:").ok_or_else(|| Error::invalid(format!("unsupported digest {}", desc.digest)))?;
+        let hexpart = desc
+            .digest
+            .strip_prefix("sha256:")
+            .ok_or_else(|| Error::invalid(format!("unsupported digest {}", desc.digest)))?;
         let part = tmp_dir.join(format!("{hexpart}.part"));
         let mut hasher = Sha256::new();
         let mut have = 0u64;
@@ -548,13 +687,23 @@ impl Registry {
             }
         }
         let url = Self::blob_url(r, &desc.digest);
-        let mut out = fs::OpenOptions::new().create(true).append(true).open(&part).context(part.display())?;
+        let mut out = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&part)
+            .context(part.display())?;
         let mut buf = vec![0u8; 256 * 1024];
         let mut got = 0u64;
         let mut failures = 0;
         on_bytes(have);
         'attempt: loop {
-            let mut resp = self.get_with(&self.bulk, r, &url, None, if have > 0 { Some(have) } else { None })?;
+            let mut resp = self.get_with(
+                &self.bulk,
+                r,
+                &url,
+                None,
+                if have > 0 { Some(have) } else { None },
+            )?;
             let st = resp.status();
             if have > 0 && st.as_u16() != 206 && st.is_success() {
                 // Server ignored the range: start over from zero.
@@ -579,7 +728,10 @@ impl Registry {
                     Ok(0) => {
                         failures += 1;
                         if failures > 6 {
-                            return Err(Error::network(format!("blob {}: connection closed early at {have}/{} bytes", desc.digest, desc.size)));
+                            return Err(Error::network(format!(
+                                "blob {}: connection closed early at {have}/{} bytes",
+                                desc.digest, desc.size
+                            )));
                         }
                         continue 'attempt;
                     }
@@ -606,7 +758,10 @@ impl Registry {
         let digest = hex::encode(hasher.finalize());
         if digest != hexpart || (desc.size != 0 && have != desc.size) {
             let _ = fs::remove_file(&part);
-            return Err(Error::network(format!("blob {} failed verification (got sha256:{digest}, {} bytes)", desc.digest, have)));
+            return Err(Error::network(format!(
+                "blob {} failed verification (got sha256:{digest}, {} bytes)",
+                desc.digest, have
+            )));
         }
         if let Some(p) = blob_path.parent() {
             fs::create_dir_all(p)?;
@@ -621,16 +776,24 @@ impl Registry {
         let tag = format!("sha256-{hexpart}.sig");
         let Some((bytes, _)) = self.get_manifest_bytes(r, &tag).or_else(|e| {
             // anonymous access to a missing signature tag may be reported as 401/403 on some registries
-            if e.kind == crate::error::ErrorKind::NotFound { Ok(None) } else { Err(e) }
+            if e.kind == crate::error::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(e)
+            }
         })?
         else {
             return Ok(vec![]);
         };
-        let m: Manifest = serde_json::from_slice(&bytes).map_err(|e| Error::network(format!("bad signature manifest: {e}")))?;
+        let m: Manifest = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::network(format!("bad signature manifest: {e}")))?;
         let mut out = Vec::new();
         for l in &m.layers {
             let payload = self.get_blob_bytes(r, &l.digest, 1 << 20)?;
-            out.push(SignatureBlob { payload, annotations: l.annotations.clone() });
+            out.push(SignatureBlob {
+                payload,
+                annotations: l.annotations.clone(),
+            });
         }
         Ok(out)
     }
@@ -647,16 +810,25 @@ mod tests {
         assert_eq!(r.repository, "centos-bootc/centos-bootc");
         assert_eq!(r.reference, Reference::Tag("stream10".into()));
         assert_eq!(r.full_name(), "quay.io/centos-bootc/centos-bootc");
-        let d = format!("ghcr.io/projectbluefin/bluefin-lts@sha256:{}", "a".repeat(64));
+        let d = format!(
+            "ghcr.io/projectbluefin/bluefin-lts@sha256:{}",
+            "a".repeat(64)
+        );
         let r = ImageRef::parse(&d).unwrap();
-        assert_eq!(r.reference, Reference::Digest(format!("sha256:{}", "a".repeat(64))));
+        assert_eq!(
+            r.reference,
+            Reference::Digest(format!("sha256:{}", "a".repeat(64)))
+        );
         let r = ImageRef::parse("ghcr.io/x/y").unwrap();
         assert_eq!(r.reference, Reference::Tag("latest".into()));
         let r = ImageRef::parse("localhost:5000/foo:1").unwrap();
         assert_eq!(r.registry, "localhost:5000");
         assert_eq!(r.base_url(), "http://localhost:5000");
         let r = ImageRef::parse("fedora:40").unwrap();
-        assert_eq!((r.registry.as_str(), r.repository.as_str()), ("docker.io", "library/fedora"));
+        assert_eq!(
+            (r.registry.as_str(), r.repository.as_str()),
+            ("docker.io", "library/fedora")
+        );
         assert!(ImageRef::parse("ghcr.io/x/y@sha256:zz").is_err());
     }
 
@@ -664,15 +836,22 @@ mod tests {
     fn dns_parsing_and_fallback_order() {
         assert_eq!(parse_dns_list("1.1.1.1, 2606:4700::1111").unwrap().len(), 2);
         assert!(parse_dns_list("nope").is_err());
-        let rc = "# c\nnameserver 192.168.1.1\nnameserver fe80::1%eth0\nsearch lan\nnameserver bogus\n";
+        let rc =
+            "# c\nnameserver 192.168.1.1\nnameserver fe80::1%eth0\nsearch lan\nnameserver bogus\n";
         assert_eq!(parse_resolv_conf(rc).len(), 2);
-        assert_eq!(nameservers(Some("9.9.9.9")).unwrap(), vec!["9.9.9.9".parse::<IpAddr>().unwrap()]);
+        assert_eq!(
+            nameservers(Some("9.9.9.9")).unwrap(),
+            vec!["9.9.9.9".parse::<IpAddr>().unwrap()]
+        );
         assert!(!nameservers(None).unwrap().is_empty());
     }
 
     #[test]
     fn challenge_parsing() {
-        let c = parse_challenge(r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:a/b:pull""#).unwrap();
+        let c = parse_challenge(
+            r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:a/b:pull""#,
+        )
+        .unwrap();
         assert_eq!(c["realm"], "https://ghcr.io/token");
         assert_eq!(c["scope"], "repository:a/b:pull");
         assert!(parse_challenge("Basic realm=x").is_none());
@@ -682,6 +861,13 @@ mod tests {
     fn client_builds_with_extra_ca() {
         build_http_client(&HttpConfig::default(), Duration::from_secs(5)).unwrap();
         let bad = tempfile::NamedTempFile::new().unwrap();
-        assert!(build_http_client(&HttpConfig { dns: None, extra_ca: Some(bad.path().into()) }, Duration::from_secs(5)).is_err());
+        assert!(build_http_client(
+            &HttpConfig {
+                dns: None,
+                extra_ca: Some(bad.path().into())
+            },
+            Duration::from_secs(5)
+        )
+        .is_err());
     }
 }

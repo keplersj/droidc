@@ -13,7 +13,12 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Directories whose contents are dropped (the directory itself is kept, empty).
-const DROP_DIRS: [&str; 4] = ["boot", "usr/lib/modules", "usr/lib/firmware", "usr/lib/ostree-boot"];
+const DROP_DIRS: [&str; 4] = [
+    "boot",
+    "usr/lib/modules",
+    "usr/lib/firmware",
+    "usr/lib/ostree-boot",
+];
 
 /// Whether an image path (relative, no leading slash) is dropped.
 pub fn is_dropped(rel: &str) -> bool {
@@ -29,7 +34,9 @@ pub fn is_dropped(rel: &str) -> bool {
     if in_boot_area && (base.starts_with("vmlinuz") || base.starts_with("initramfs")) {
         return true;
     }
-    if rel.starts_with("usr/lib/systemd/boot/") && (base.ends_with(".efi") || base.ends_with(".efi.signed")) {
+    if rel.starts_with("usr/lib/systemd/boot/")
+        && (base.ends_with(".efi") || base.ends_with(".efi.signed"))
+    {
         return true;
     }
     false
@@ -105,7 +112,13 @@ fn normalize(p: &Path) -> std::result::Result<String, String> {
 }
 
 impl<'a> Unpacker<'a> {
-    pub fn new(root: PathBuf, map: PathMap, strategy: Box<dyn LinkStrategy>, skip_var: bool, em: &'a Emitter) -> Self {
+    pub fn new(
+        root: PathBuf,
+        map: PathMap,
+        strategy: Box<dyn LinkStrategy>,
+        skip_var: bool,
+        em: &'a Emitter,
+    ) -> Self {
         Unpacker {
             root,
             map,
@@ -128,7 +141,11 @@ impl<'a> Unpacker<'a> {
 
     /// Verify (creating missing directories) that no component of `rel`'s parent is a symlink or
     /// a non-directory. Returns Err(reason) for entries that must be skipped.
-    fn ensure_parent(&mut self, rel: &str, create: bool) -> Result<std::result::Result<(), String>> {
+    fn ensure_parent(
+        &mut self,
+        rel: &str,
+        create: bool,
+    ) -> Result<std::result::Result<(), String>> {
         let parent = match rel.rfind('/') {
             Some(i) => &rel[..i],
             None => return Ok(Ok(())),
@@ -144,7 +161,12 @@ impl<'a> Unpacker<'a> {
                 Ok(md) if md.file_type().is_symlink() => {
                     return Ok(Err(format!("parent '{}' is a symlink", cur.display())));
                 }
-                Ok(_) => return Ok(Err(format!("parent '{}' is not a directory", cur.display()))),
+                Ok(_) => {
+                    return Ok(Err(format!(
+                        "parent '{}' is not a directory",
+                        cur.display()
+                    )))
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     if !create {
                         return Ok(Err("parent missing".into()));
@@ -189,7 +211,9 @@ impl<'a> Unpacker<'a> {
             }
             fs::remove_dir(path).context(path.display())?;
         } else {
-            self.strategy.before_remove(path, &self.map).context(path.display())?;
+            self.strategy
+                .before_remove(path, &self.map)
+                .context(path.display())?;
             fs::remove_file(path).context(path.display())?;
         }
         Ok(())
@@ -234,7 +258,10 @@ impl<'a> Unpacker<'a> {
             return Ok(Flow::Done);
         }
         let base = rel.rsplit('/').next().unwrap().to_string();
-        let parent_rel = rel.rfind('/').map(|i| rel[..i].to_string()).unwrap_or_default();
+        let parent_rel = rel
+            .rfind('/')
+            .map(|i| rel[..i].to_string())
+            .unwrap_or_default();
 
         // Whiteouts.
         if let Some(victim) = base.strip_prefix(".wh.") {
@@ -257,7 +284,11 @@ impl<'a> Unpacker<'a> {
                     self.meta.remove(&k);
                 }
             } else {
-                let vrel = if parent_rel.is_empty() { victim.to_string() } else { format!("{parent_rel}/{victim}") };
+                let vrel = if parent_rel.is_empty() {
+                    victim.to_string()
+                } else {
+                    format!("{parent_rel}/{victim}")
+                };
                 if self.ensure_parent(&vrel, false)?.is_ok() {
                     let p = self.phys(&vrel);
                     self.remove_any(&p)?;
@@ -286,12 +317,22 @@ impl<'a> Unpacker<'a> {
             for e in exts.flatten() {
                 if let Ok(k) = e.key() {
                     if let Some(name) = k.strip_prefix("SCHILY.xattr.") {
-                        xattrs.insert(name.to_string(), base64::engine::general_purpose::STANDARD.encode(e.value_bytes()));
+                        xattrs.insert(
+                            name.to_string(),
+                            base64::engine::general_purpose::STANDARD.encode(e.value_bytes()),
+                        );
                     }
                 }
             }
         }
-        let mk = |t: &'static str, l: Option<String>| Meta { t, u: uid, g: gid, m: mode & 0o7777, x: xattrs.clone(), l };
+        let mk = |t: &'static str, l: Option<String>| Meta {
+            t,
+            u: uid,
+            g: gid,
+            m: mode & 0o7777,
+            x: xattrs.clone(),
+            l,
+        };
 
         use tar::EntryType as T;
         match etype {
@@ -305,13 +346,18 @@ impl<'a> Unpacker<'a> {
                     }
                     Err(_) => fs::create_dir(&path).context(path.display())?,
                 }
-                fs::set_permissions(&path, fs::Permissions::from_mode((mode & 0o777) | 0o700)).context(path.display())?;
+                fs::set_permissions(&path, fs::Permissions::from_mode((mode & 0o777) | 0o700))
+                    .context(path.display())?;
                 self.meta.insert(rel, mk("d", None));
             }
             T::Regular | T::Continuous | T::GNUSparse => {
                 self.remove_any(&path)?;
                 self.forget_meta(&rel);
-                let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&path).context(path.display())?;
+                let mut f = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .context(path.display())?;
                 std::io::copy(&mut entry, &mut f).context(path.display())?;
                 f.set_permissions(fs::Permissions::from_mode((mode & 0o777) | 0o600))?;
                 let _ = f.set_modified(UNIX_EPOCH + Duration::from_secs(mtime));
@@ -327,7 +373,8 @@ impl<'a> Unpacker<'a> {
                 self.forget_meta(&rel);
                 symlink(&target, &path).context(path.display())?;
                 self.stats.files += 1;
-                self.meta.insert(rel, mk("l", Some(target.to_string_lossy().into_owned())));
+                self.meta
+                    .insert(rel, mk("l", Some(target.to_string_lossy().into_owned())));
             }
             T::Link => {
                 let traw = match entry.link_name().context("link name")? {
@@ -354,12 +401,18 @@ impl<'a> Unpacker<'a> {
                 }
                 self.remove_any(&path)?;
                 self.forget_meta(&rel);
-                self.strategy.link(&tphys, &path, &self.map).context(format!("link {rel} -> {trel}"))?;
+                self.strategy
+                    .link(&tphys, &path, &self.map)
+                    .context(format!("link {rel} -> {trel}"))?;
                 self.stats.files += 1;
                 self.stats.hardlinks += 1;
                 self.meta.insert(rel, mk("h", Some(trel)));
             }
-            _ => return Ok(Flow::Skip(format!("{rel}: unsupported entry type {etype:?}"))),
+            _ => {
+                return Ok(Flow::Skip(format!(
+                    "{rel}: unsupported entry type {etype:?}"
+                )))
+            }
         }
         Ok(Flow::Done)
     }
@@ -367,7 +420,10 @@ impl<'a> Unpacker<'a> {
     /// Finish: move the image's `/etc` to `usr/etc` and return the collected metadata.
     pub fn finish(mut self) -> Result<(BTreeMap<String, Meta>, UnpackStats, String)> {
         let etc = self.root.join("etc");
-        if fs::symlink_metadata(&etc).map(|m| m.is_dir()).unwrap_or(false) {
+        if fs::symlink_metadata(&etc)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
             let dest = self.root.join("usr/etc");
             fs::create_dir_all(self.root.join("usr")).context("usr")?;
             if fs::symlink_metadata(&dest).is_ok() {
@@ -403,7 +459,9 @@ pub fn write_metadata(path: &Path, meta: &BTreeMap<String, Meta>) -> Result<()> 
     let mut enc = zstd::stream::write::Encoder::new(f, 3)?;
     for (p, m) in meta {
         let mut v = serde_json::to_value(m)?;
-        v.as_object_mut().unwrap().insert("p".into(), serde_json::Value::String(p.clone()));
+        v.as_object_mut()
+            .unwrap()
+            .insert("p".into(), serde_json::Value::String(p.clone()));
         writeln!(enc, "{v}")?;
     }
     enc.finish()?.sync_all()?;
@@ -429,6 +487,11 @@ pub mod tests {
 
     /// Tiny tar builder for synthetic layers.
     pub struct Layer(pub tar::Builder<Vec<u8>>);
+    impl Default for Layer {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
     impl Layer {
         pub fn new() -> Self {
             Layer(tar::Builder::new(Vec::new()))
@@ -468,13 +531,27 @@ pub mod tests {
         }
     }
 
-    pub fn unpack(layers: Vec<Vec<u8>>, kind: LinkKind) -> (tempfile::TempDir, PathBuf, BTreeMap<String, Meta>, UnpackStats) {
+    pub fn unpack(
+        layers: Vec<Vec<u8>>,
+        kind: LinkKind,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        BTreeMap<String, Meta>,
+        UnpackStats,
+    ) {
         let d = tempfile::tempdir().unwrap();
         let root = d.path().canonicalize().unwrap().join("rootfs");
         fs::create_dir_all(&root).unwrap();
         let (em, _b) = capture();
         let map = PathMap::identity(&root);
-        let mut u = Unpacker::new(root.clone(), map, make_strategy(kind, DEFAULT_L2S_PREFIX), false, &em);
+        let mut u = Unpacker::new(
+            root.clone(),
+            map,
+            make_strategy(kind, DEFAULT_L2S_PREFIX),
+            false,
+            &em,
+        );
         for l in layers {
             u.apply_layer(&l[..]).unwrap();
         }
@@ -494,7 +571,10 @@ pub mod tests {
             .symlink("bin", "usr/bin")
             .bytes();
         let (_d, root, meta, _) = unpack(vec![l], LinkKind::Hardlink);
-        assert_eq!(fs::read(root.join("usr/etc/os-release")).unwrap(), b"NAME=x\n");
+        assert_eq!(
+            fs::read(root.join("usr/etc/os-release")).unwrap(),
+            b"NAME=x\n"
+        );
         assert!(!root.join("etc").exists());
         // setuid dropped on disk, recorded in metadata
         let md = fs::metadata(root.join("usr/bin/su")).unwrap();
@@ -502,9 +582,18 @@ pub mod tests {
         assert_eq!(meta["usr/bin/su"].m, 0o4755);
         assert_eq!(meta["usr/bin/su"].u, 1000);
         // dirs forced owner-writable, files owner-readable
-        assert_eq!(fs::metadata(root.join("usr/bin")).unwrap().mode() & 0o777, 0o755);
-        assert_eq!(fs::metadata(root.join("usr/secret")).unwrap().mode() & 0o777, 0o600);
-        assert_eq!(fs::read_link(root.join("bin")).unwrap(), PathBuf::from("usr/bin"));
+        assert_eq!(
+            fs::metadata(root.join("usr/bin")).unwrap().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(root.join("usr/secret")).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::read_link(root.join("bin")).unwrap(),
+            PathBuf::from("usr/bin")
+        );
         assert!(meta.contains_key("usr/etc/os-release"));
         assert!(!meta.contains_key("etc/os-release"));
     }
@@ -575,7 +664,13 @@ pub mod tests {
         let root = d.path().join("rootfs");
         fs::create_dir_all(&root).unwrap();
         let (em, _) = capture();
-        let mut u = Unpacker::new(root.clone(), PathMap::identity(&root), make_strategy(LinkKind::Hardlink, ".l2s."), false, &em);
+        let mut u = Unpacker::new(
+            root.clone(),
+            PathMap::identity(&root),
+            make_strategy(LinkKind::Hardlink, ".l2s."),
+            false,
+            &em,
+        );
         // hand-craft a header with ../ (the builder refuses, so write the bytes directly)
         let mut b = tar::Builder::new(Vec::new());
         let mut h = tar::Header::new_gnu();
@@ -588,7 +683,9 @@ pub mod tests {
         b.append(&h, &b"x"[..]).unwrap();
         // symlink pointing outside, then a file written "through" it
         let mut l = Layer::new();
-        l = l.symlink("link", outside.to_str().unwrap()).file("link/pwn", 0o644, b"x");
+        l = l
+            .symlink("link", outside.to_str().unwrap())
+            .file("link/pwn", 0o644, b"x");
         let mut hl = Layer::new();
         hl = hl.hardlink("hl", "../outside/evil");
         u.apply_layer(&b.into_inner().unwrap()[..]).unwrap();
@@ -596,13 +693,19 @@ pub mod tests {
         u.apply_layer(&hl.bytes()[..]).unwrap();
         assert!(!outside.join("evil").exists());
         assert!(!outside.join("pwn").exists());
-        assert!(fs::symlink_metadata(root.join("link")).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(root.join("link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert!(u.stats.skipped >= 2);
     }
 
     #[test]
     fn replacing_file_does_not_write_through_hardlinks() {
-        let l1 = Layer::new().file("a", 0o644, b"OLD").hardlink("b", "a").bytes();
+        let l1 = Layer::new()
+            .file("a", 0o644, b"OLD")
+            .hardlink("b", "a")
+            .bytes();
         let l2 = Layer::new().file("a", 0o644, b"NEW").bytes();
         for kind in [LinkKind::Hardlink, LinkKind::Link2Symlink, LinkKind::Copy] {
             let (_d, root, _, st) = unpack(vec![l1.clone(), l2.clone()], kind);
@@ -615,9 +718,19 @@ pub mod tests {
     #[test]
     fn cross_layer_hardlink_with_replaced_target() {
         // layer 1: f; layer 2: g hard-links f; layer 3 replaces f and deletes g's sibling.
-        let l1 = Layer::new().dir("x/", 0o755).file("x/f", 0o755, b"ONE").bytes();
-        let l2 = Layer::new().dir("y/", 0o755).hardlink("y/g", "x/f").hardlink("y/h", "x/f").bytes();
-        let l3 = Layer::new().file("x/f", 0o755, b"TWO").file("y/.wh.h", 0o644, b"").bytes();
+        let l1 = Layer::new()
+            .dir("x/", 0o755)
+            .file("x/f", 0o755, b"ONE")
+            .bytes();
+        let l2 = Layer::new()
+            .dir("y/", 0o755)
+            .hardlink("y/g", "x/f")
+            .hardlink("y/h", "x/f")
+            .bytes();
+        let l3 = Layer::new()
+            .file("x/f", 0o755, b"TWO")
+            .file("y/.wh.h", 0o644, b"")
+            .bytes();
         for kind in [LinkKind::Hardlink, LinkKind::Link2Symlink] {
             let (_d, root, meta, st) = unpack(vec![l1.clone(), l2.clone(), l3.clone()], kind);
             assert_eq!(fs::read(root.join("x/f")).unwrap(), b"TWO");
@@ -635,7 +748,8 @@ pub mod tests {
     #[test]
     fn xattrs_recorded() {
         let mut b = tar::Builder::new(Vec::new());
-        b.append_pax_extensions([("SCHILY.xattr.security.capability", &b"\x01\x02"[..])]).unwrap();
+        b.append_pax_extensions([("SCHILY.xattr.security.capability", &b"\x01\x02"[..])])
+            .unwrap();
         let mut h = tar::Header::new_gnu();
         h.set_entry_type(tar::EntryType::Regular);
         h.set_size(1);
@@ -652,7 +766,8 @@ pub mod tests {
         let gz = d.path().join("l.tar.gz");
         let zs = d.path().join("l.tar.zst");
         let raw = d.path().join("l.tar");
-        let mut e = flate2::write::GzEncoder::new(File::create(&gz).unwrap(), flate2::Compression::fast());
+        let mut e =
+            flate2::write::GzEncoder::new(File::create(&gz).unwrap(), flate2::Compression::fast());
         e.write_all(&l).unwrap();
         e.finish().unwrap();
         fs::write(&zs, zstd::encode_all(&l[..], 3).unwrap()).unwrap();

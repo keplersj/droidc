@@ -39,7 +39,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
-        Error { kind, message: message.into() }
+        Error {
+            kind,
+            message: message.into(),
+        }
     }
     pub fn network(m: impl Into<String>) -> Self {
         Self::new(ErrorKind::Network, m)

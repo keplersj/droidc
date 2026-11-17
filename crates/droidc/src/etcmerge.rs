@@ -29,12 +29,19 @@ enum Ent {
 }
 
 fn is_l2s_target(t: &Path) -> bool {
-    t.file_name().map(|n| n.to_string_lossy().starts_with(".l2s.") || n.to_string_lossy().starts_with(".proot.l2s.")).unwrap_or(false)
+    t.file_name()
+        .map(|n| {
+            n.to_string_lossy().starts_with(".l2s.")
+                || n.to_string_lossy().starts_with(".proot.l2s.")
+        })
+        .unwrap_or(false)
 }
 
 fn stat(p: Option<PathBuf>) -> Ent {
     let Some(p) = p else { return Ent::None };
-    let Ok(md) = fs::symlink_metadata(&p) else { return Ent::None };
+    let Ok(md) = fs::symlink_metadata(&p) else {
+        return Ent::None;
+    };
     let ft = md.file_type();
     if ft.is_dir() {
         Ent::Dir(md.mode() & 0o777)
@@ -56,11 +63,15 @@ fn stat(p: Option<PathBuf>) -> Ent {
 }
 
 fn same_content(a: &Path, b: &Path) -> bool {
-    let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) else { return false };
+    let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) else {
+        return false;
+    };
     if ma.len() != mb.len() {
         return false;
     }
-    let (Ok(mut fa), Ok(mut fb)) = (fs::File::open(a), fs::File::open(b)) else { return false };
+    let (Ok(mut fa), Ok(mut fb)) = (fs::File::open(a), fs::File::open(b)) else {
+        return false;
+    };
     let (mut ba, mut bb) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
     loop {
         let na = match read_full(&mut fa, &mut ba) {
@@ -109,7 +120,8 @@ fn copy_ent(e: &Ent, src: &Path, dst: &Path) -> Result<()> {
         Ent::Dir(_) => copy_tree(src, dst),
         Ent::File(p, mode) => {
             fs::copy(p, dst).context(dst.display())?;
-            fs::set_permissions(dst, fs::Permissions::from_mode(mode | 0o600)).context(dst.display())?;
+            fs::set_permissions(dst, fs::Permissions::from_mode(mode | 0o600))
+                .context(dst.display())?;
             Ok(())
         }
         Ent::Link(t) => {
@@ -130,7 +142,8 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         let e = stat(Some(s.clone()));
         copy_ent(&e, &s, &d)?;
     }
-    fs::set_permissions(dst, fs::Permissions::from_mode((md.mode() & 0o777) | 0o700)).context(dst.display())?;
+    fs::set_permissions(dst, fs::Permissions::from_mode((md.mode() & 0o777) | 0o700))
+        .context(dst.display())?;
     Ok(())
 }
 
@@ -153,7 +166,9 @@ fn trees_equal(a: &Path, b: &Path) -> bool {
             if ma != mb {
                 return false;
             }
-            names(&[Some(a), Some(b)]).iter().all(|n| trees_equal(&a.join(n), &b.join(n)))
+            names(&[Some(a), Some(b)])
+                .iter()
+                .all(|n| trees_equal(&a.join(n), &b.join(n)))
         }
         _ => same(&ea, &eb),
     }
@@ -178,12 +193,20 @@ impl Merger {
                         Ent::Dir(mop) if mop == mol => *mnp,
                         _ => *mol,
                     };
-                    let sub_op = if matches!(eop, Ent::Dir(_)) { cop.as_deref() } else { None };
+                    let sub_op = if matches!(eop, Ent::Dir(_)) {
+                        cop.as_deref()
+                    } else {
+                        None
+                    };
                     self.dir(sub_op, &col, cnp.as_deref(), &dst)?;
                     fs::set_permissions(&dst, fs::Permissions::from_mode(mode | 0o700))?;
                 }
                 (Ent::Dir(_), _) => {
-                    let unchanged = matches!(eop, Ent::Dir(_)) && cop.as_deref().map(|p| trees_equal(p, &col)).unwrap_or(false);
+                    let unchanged = matches!(eop, Ent::Dir(_))
+                        && cop
+                            .as_deref()
+                            .map(|p| trees_equal(p, &col))
+                            .unwrap_or(false);
                     if unchanged {
                         copy_ent(&enp, cnp.as_deref().unwrap_or(Path::new("")), &dst)?;
                         self.st.taken_new += 1;
@@ -217,15 +240,28 @@ impl Merger {
 }
 
 /// Merge into `out` (must not exist). With no old live tree this is a plain copy of `new_pristine`.
-pub fn merge(old_pristine: Option<&Path>, old_live: Option<&Path>, new_pristine: &Path, out: &Path) -> Result<MergeStats> {
-    let mut m = Merger { st: MergeStats::default() };
+pub fn merge(
+    old_pristine: Option<&Path>,
+    old_live: Option<&Path>,
+    new_pristine: &Path,
+    out: &Path,
+) -> Result<MergeStats> {
+    let mut m = Merger {
+        st: MergeStats::default(),
+    };
     match old_live {
         Some(ol) if ol.is_dir() => {
             fs::create_dir(out).context(out.display())?;
             let op = old_pristine.filter(|p| p.is_dir());
-            let np = if new_pristine.is_dir() { Some(new_pristine) } else { None };
+            let np = if new_pristine.is_dir() {
+                Some(new_pristine)
+            } else {
+                None
+            };
             m.dir(op, ol, np, out)?;
-            let mode = fs::metadata(ol).map(|md| md.mode() & 0o777).unwrap_or(0o755);
+            let mode = fs::metadata(ol)
+                .map(|md| md.mode() & 0o777)
+                .unwrap_or(0o755);
             fs::set_permissions(out, fs::Permissions::from_mode(mode | 0o700))?;
         }
         _ => {
@@ -256,7 +292,13 @@ mod tests {
         for n in ["op", "ol", "np"] {
             fs::create_dir(r.join(n)).unwrap();
         }
-        T { op: r.join("op"), ol: r.join("ol"), np: r.join("np"), out: r.join("out"), _d: d }
+        T {
+            op: r.join("op"),
+            ol: r.join("ol"),
+            np: r.join("np"),
+            out: r.join("out"),
+            _d: d,
+        }
     }
     fn w(root: &Path, p: &str, c: &str, mode: u32) {
         let f = root.join(p);
@@ -294,7 +336,10 @@ mod tests {
         assert_eq!(rd(&t.out, "deleted.conf"), None);
         assert_eq!(rd(&t.out, "removed-upstream"), None);
         assert_eq!(rd(&t.out, "added-local").unwrap(), "mine");
-        assert_eq!(fs::metadata(t.out.join("added-local")).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(t.out.join("added-local")).unwrap().mode() & 0o777,
+            0o600
+        );
         assert_eq!(rd(&t.out, "brand-new").unwrap(), "n");
         assert_eq!(rd(&t.out, "sub/x").unwrap(), "v2");
         assert_eq!(rd(&t.out, "sub/y").unwrap(), "v2y");
@@ -322,7 +367,7 @@ mod tests {
         symlink("a", t.op.join("l2")).unwrap();
         symlink("LOCAL", t.ol.join("l2")).unwrap();
         symlink("b", t.np.join("l2")).unwrap(); // local change kept
-        // directory added locally with content; directory removed upstream but locally modified
+                                                // directory added locally with content; directory removed upstream but locally modified
         w(&t.ol, "mydir/f", "1", 0o644);
         w(&t.op, "olddir/f", "1", 0o644);
         w(&t.ol, "olddir/f", "1", 0o644);
@@ -337,7 +382,10 @@ mod tests {
         // symlink-to-file locally changed to a regular file
         merge(Some(&t.op), Some(&t.ol), &t.np, &t.out).unwrap();
         assert_eq!(fs::read_link(t.out.join("l1")).unwrap(), PathBuf::from("b"));
-        assert_eq!(fs::read_link(t.out.join("l2")).unwrap(), PathBuf::from("LOCAL"));
+        assert_eq!(
+            fs::read_link(t.out.join("l2")).unwrap(),
+            PathBuf::from("LOCAL")
+        );
         assert_eq!(rd(&t.out, "mydir/f").unwrap(), "1");
         assert_eq!(rd(&t.out, "olddir/extra").unwrap(), "2");
         assert_eq!(rd(&t.out, "olddir/f").unwrap(), "1");
@@ -352,8 +400,14 @@ mod tests {
         symlink("a/b", t.np.join("lnk")).unwrap();
         let st = merge(None, None, &t.np, &t.out).unwrap();
         assert_eq!(rd(&t.out, "a/b").unwrap(), "x");
-        assert_eq!(fs::metadata(t.out.join("a/b")).unwrap().mode() & 0o777, 0o640);
-        assert_eq!(fs::read_link(t.out.join("lnk")).unwrap(), PathBuf::from("a/b"));
+        assert_eq!(
+            fs::metadata(t.out.join("a/b")).unwrap().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            fs::read_link(t.out.join("lnk")).unwrap(),
+            PathBuf::from("a/b")
+        );
         assert_eq!(st, MergeStats::default());
     }
 

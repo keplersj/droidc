@@ -27,7 +27,9 @@ pub fn rmtree(p: &Path) -> Result<()> {
 /// du-like: allocated bytes of a tree (hard-linked inodes counted once, symlinks not followed).
 pub fn disk_usage(p: &Path) -> u64 {
     fn walk(p: &Path, seen: &mut HashSet<(u64, u64)>, total: &mut u64) {
-        let Ok(md) = fs::symlink_metadata(p) else { return };
+        let Ok(md) = fs::symlink_metadata(p) else {
+            return;
+        };
         if md.nlink() > 1 && !md.is_dir() && !seen.insert((md.dev(), md.ino())) {
             return;
         }
@@ -47,7 +49,8 @@ pub fn disk_usage(p: &Path) -> u64 {
 
 /// Free bytes available to unprivileged users on the filesystem holding `p`.
 pub fn free_space(p: &Path) -> Result<u64> {
-    let s = rustix::fs::statvfs(p).map_err(|e| Error::internal(format!("statvfs {}: {e}", p.display())))?;
+    let s = rustix::fs::statvfs(p)
+        .map_err(|e| Error::internal(format!("statvfs {}: {e}", p.display())))?;
     Ok(s.f_bavail.saturating_mul(s.f_frsize))
 }
 

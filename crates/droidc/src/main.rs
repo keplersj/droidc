@@ -10,7 +10,11 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "droidc", version, about = "Run bootc images on Android under proot")]
+#[command(
+    name = "droidc",
+    version,
+    about = "Run bootc images on Android under proot"
+)]
 struct Cli {
     /// Root directory for blobs, deployments and persistent state
     #[arg(long, global = true, env = "DROIDC_ROOT")]
@@ -66,7 +70,9 @@ fn default_root() -> PathBuf {
     if let Some(x) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
         return PathBuf::from(x).join("droidc");
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     home.join(".local/share/droidc")
 }
 
@@ -74,11 +80,24 @@ fn human(cmd: &str, d: &Value) {
     let s = |v: &Value| v.as_str().unwrap_or("-").to_string();
     match cmd {
         "switch" | "upgrade" if d["changed"] == true => {
-            println!("deployed {} ({}), previous: {}", s(&d["id"]), s(&d["deployment"]["image_ref"]), s(&d["previous"]))
+            println!(
+                "deployed {} ({}), previous: {}",
+                s(&d["id"]),
+                s(&d["deployment"]["image_ref"]),
+                s(&d["previous"])
+            )
         }
-        "switch" | "upgrade" if d["verify_only"] == true => println!("verified {} ({})", s(&d["manifest_digest"]), s(&d["signature"]["mode"])),
+        "switch" | "upgrade" if d["verify_only"] == true => println!(
+            "verified {} ({})",
+            s(&d["manifest_digest"]),
+            s(&d["signature"]["mode"])
+        ),
         "switch" | "upgrade" => println!("already up to date: {}", s(&d["id"])),
-        "rollback" => println!("current is now {}, previous {}", s(&d["current"]), s(&d["previous"])),
+        "rollback" => println!(
+            "current is now {}, previous {}",
+            s(&d["current"]),
+            s(&d["previous"])
+        ),
         _ => println!("{}", serde_json::to_string_pretty(d).unwrap_or_default()),
     }
 }
@@ -88,11 +107,18 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
     let http = HttpConfig::from_env(cli.dns.clone());
     let l2s = std::env::var("DROIDC_L2S_PREFIX").unwrap_or_else(|_| DEFAULT_L2S_PREFIX.to_string());
     match &cli.cmd {
-        Cmd::Switch { reference, insecure_allow_unsigned, platform, links, verify_only } => {
+        Cmd::Switch {
+            reference,
+            insecure_allow_unsigned,
+            platform,
+            links,
+            verify_only,
+        } => {
             let mut o = SwitchOpts::new(reference);
             o.insecure = *insecure_allow_unsigned;
             o.platform = platform.as_deref().map(Platform::parse).transpose()?;
-            o.links = LinkKind::parse(links).ok_or_else(|| Error::invalid(format!("unknown --links '{links}'")))?;
+            o.links = LinkKind::parse(links)
+                .ok_or_else(|| Error::invalid(format!("unknown --links '{links}'")))?;
             o.http = http;
             o.l2s_prefix = l2s;
             o.verify_only = *verify_only;
