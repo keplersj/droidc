@@ -37,7 +37,7 @@ jobs:
       - name: Switch to Bluefin LTS (verified, link2symlink)
         run: |
           B=$PWD/target/aarch64-unknown-linux-musl/release/droidc
-          R=/mnt/droidc-root; sudo mkdir -p $R && sudo chown "$USER" $R || R=$RUNNER_TEMP/r
+          R=/droidc-measure; sudo mkdir -p $R && sudo chown "$USER" $R
           echo "R=$R" >> "$GITHUB_ENV"
           df -h "$R"
           start=$(date +%s)
