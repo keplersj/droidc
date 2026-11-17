@@ -60,7 +60,9 @@ pub fn verify(
     sigs: &[SignatureBlob],
     now: SystemTime,
 ) -> Result<Verified, VerifyError> {
-    let entry = policy.find(repository).ok_or_else(|| VerifyError::NoPolicyMatch(repository.to_string()))?;
+    let entry = policy
+        .find(repository)
+        .ok_or_else(|| VerifyError::NoPolicyMatch(repository.to_string()))?;
     if sigs.is_empty() {
         return Err(VerifyError::NoSignatures);
     }
@@ -107,12 +109,13 @@ pub fn verify(
                     }
                 }
             }
-            Err(last.unwrap_or_else(|| VerifyError::Invalid("policy entry has no verifiers".into())))
+            Err(last
+                .unwrap_or_else(|| VerifyError::Invalid("policy entry has no verifiers".into())))
         });
         match r {
             Ok(v) => return Ok(v),
             Err(e) => {
-                if best.as_ref().map_or(true, |b| e.rank() > b.rank()) {
+                if best.as_ref().is_none_or(|b| e.rank() > b.rank()) {
                     best = Some(e)
                 }
             }

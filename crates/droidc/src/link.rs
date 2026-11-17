@@ -175,7 +175,7 @@ fn copy_entry(target: &Path, link: &Path) -> io::Result<()> {
     if md.file_type().is_symlink() {
         symlink(fs::read_link(target)?, link)
     } else {
-        fs::copy(target, link).map(|_| ())
+        crate::fsutil::copy_file(target, link)
     }
 }
 

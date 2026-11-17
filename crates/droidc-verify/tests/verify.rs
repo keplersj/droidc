@@ -16,12 +16,19 @@ struct Fixture {
 }
 
 fn load(arch: &str) -> Fixture {
-    let base = format!("{}/tests/fixtures/bluefin-lts-stable-{arch}", env!("CARGO_MANIFEST_DIR"));
+    let base = format!(
+        "{}/tests/fixtures/bluefin-lts-stable-{arch}",
+        env!("CARGO_MANIFEST_DIR")
+    );
     let j: Value = serde_json::from_slice(&std::fs::read(format!("{base}.json")).unwrap()).unwrap();
-    let annotations: BTreeMap<String, String> = serde_json::from_value(j["annotations"].clone()).unwrap();
+    let annotations: BTreeMap<String, String> =
+        serde_json::from_value(j["annotations"].clone()).unwrap();
     Fixture {
         digest: j["manifest_digest"].as_str().unwrap().to_string(),
-        sig: SignatureBlob { payload: std::fs::read(format!("{base}.payload")).unwrap(), annotations },
+        sig: SignatureBlob {
+            payload: std::fs::read(format!("{base}.payload")).unwrap(),
+            annotations,
+        },
     }
 }
 
@@ -38,7 +45,14 @@ fn bundle(f: &Fixture) -> Value {
 fn real_bluefin_fixtures_verify_with_default_policy() {
     for arch in ["arm64", "amd64"] {
         let f = load(arch);
-        let v = verify(&Policy::default_policy(), REPO, &f.digest, &[f.sig.clone()], now()).unwrap();
+        let v = verify(
+            &Policy::default_policy(),
+            REPO,
+            &f.digest,
+            std::slice::from_ref(&f.sig),
+            now(),
+        )
+        .unwrap();
         assert_eq!(v.mode, "keyless");
         assert_eq!(v.issuer.as_deref(), Some(GITHUB_ACTIONS_ISSUER));
         assert_eq!(
@@ -54,14 +68,24 @@ fn any_valid_signature_suffices() {
     let f = load("arm64");
     let mut junk = f.sig.clone();
     junk.payload = b"{}".to_vec();
-    verify(&Policy::default_policy(), REPO, &f.digest, &[junk, f.sig.clone()], now()).unwrap();
+    verify(
+        &Policy::default_policy(),
+        REPO,
+        &f.digest,
+        &[junk, f.sig.clone()],
+        now(),
+    )
+    .unwrap();
 }
 
 #[test]
 fn tampered_payload_digest_fails() {
     let f = load("arm64");
     let mut s = f.sig.clone();
-    s.payload = String::from_utf8(s.payload).unwrap().replace("sha256:d2a1", "sha256:d2a2").into_bytes();
+    s.payload = String::from_utf8(s.payload)
+        .unwrap()
+        .replace("sha256:d2a1", "sha256:d2a2")
+        .into_bytes();
     let e = verify(&Policy::default_policy(), REPO, &f.digest, &[s], now()).unwrap_err();
     assert!(matches!(e, VerifyError::DigestMismatch(_)), "{e:?}");
 }
@@ -70,7 +94,10 @@ fn tampered_payload_digest_fails() {
 fn tampered_payload_content_fails_signature() {
     let f = load("arm64");
     let mut s = f.sig.clone();
-    s.payload = String::from_utf8(s.payload).unwrap().replace("bluefin-lts", "bluefin-ltz").into_bytes();
+    s.payload = String::from_utf8(s.payload)
+        .unwrap()
+        .replace("bluefin-lts", "bluefin-ltz")
+        .into_bytes();
     let e = verify(&Policy::default_policy(), REPO, &f.digest, &[s], now()).unwrap_err();
     assert!(matches!(e, VerifyError::BadSignature(_)), "{e:?}");
 }
@@ -79,7 +106,14 @@ fn tampered_payload_content_fails_signature() {
 fn wrong_manifest_digest_fails() {
     let f = load("arm64");
     let other = load("amd64");
-    let e = verify(&Policy::default_policy(), REPO, &other.digest, &[f.sig.clone()], now()).unwrap_err();
+    let e = verify(
+        &Policy::default_policy(),
+        REPO,
+        &other.digest,
+        std::slice::from_ref(&f.sig),
+        now(),
+    )
+    .unwrap_err();
     assert!(matches!(e, VerifyError::DigestMismatch(_)), "{e:?}");
 }
 
@@ -102,7 +136,10 @@ fn wrong_subject_regex_fails() {
 #[test]
 fn wrong_issuer_fails() {
     let f = load("arm64");
-    let p = policy_with(r"^https://github\.com/projectbluefin/", "https://accounts.google.com");
+    let p = policy_with(
+        r"^https://github\.com/projectbluefin/",
+        "https://accounts.google.com",
+    );
     let e = verify(&p, REPO, &f.digest, &[f.sig], now()).unwrap_err();
     assert!(matches!(e, VerifyError::IdentityMismatch(_)), "{e:?}");
 }
@@ -113,7 +150,9 @@ fn exact_subject_is_enforced() {
     let mut p = Policy::default_policy();
     let k = p.images[0].keyless.as_mut().unwrap();
     k.subject_regex = None;
-    k.subject = Some("https://github.com/projectbluefin/actions/.github/workflows/other.yml@refs/tags/v1".into());
+    k.subject = Some(
+        "https://github.com/projectbluefin/actions/.github/workflows/other.yml@refs/tags/v1".into(),
+    );
     let e = verify(&p, REPO, &f.digest, &[f.sig], now()).unwrap_err();
     assert!(matches!(e, VerifyError::IdentityMismatch(_)), "{e:?}");
 }
@@ -137,7 +176,8 @@ fn corrupted_set_fails() {
 fn modified_integrated_time_breaks_set() {
     let f = load("arm64");
     let mut b = bundle(&f);
-    b["Payload"]["integratedTime"] = Value::from(b["Payload"]["integratedTime"].as_i64().unwrap() + 1);
+    b["Payload"]["integratedTime"] =
+        Value::from(b["Payload"]["integratedTime"].as_i64().unwrap() + 1);
     let mut s = f.sig.clone();
     s.annotations.insert(ANN_BUNDLE.into(), b.to_string());
     let e = verify(&Policy::default_policy(), REPO, &f.digest, &[s], now()).unwrap_err();
@@ -158,7 +198,10 @@ fn signature_from_other_signature_fails() {
     let f = load("arm64");
     let g = load("amd64");
     let mut s = f.sig.clone();
-    s.annotations.insert(ANN_SIGNATURE.into(), g.sig.annotations[ANN_SIGNATURE].clone());
+    s.annotations.insert(
+        ANN_SIGNATURE.into(),
+        g.sig.annotations[ANN_SIGNATURE].clone(),
+    );
     let e = verify(&Policy::default_policy(), REPO, &f.digest, &[s], now()).unwrap_err();
     assert!(matches!(e, VerifyError::BadSignature(_)), "{e:?}");
 }
@@ -166,8 +209,18 @@ fn signature_from_other_signature_fails() {
 #[test]
 fn no_matching_policy_entry_rejects() {
     let f = load("arm64");
-    let e = verify(&Policy::default_policy(), "quay.io/centos-bootc/centos-bootc", &f.digest, &[f.sig], now()).unwrap_err();
-    assert!(matches!(e, VerifyError::NoPolicyMatch(ref r) if r == "quay.io/centos-bootc/centos-bootc"), "{e:?}");
+    let e = verify(
+        &Policy::default_policy(),
+        "quay.io/centos-bootc/centos-bootc",
+        &f.digest,
+        &[f.sig],
+        now(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(e, VerifyError::NoPolicyMatch(ref r) if r == "quay.io/centos-bootc/centos-bootc"),
+        "{e:?}"
+    );
 }
 
 #[test]
@@ -180,7 +233,14 @@ fn no_signatures_fails() {
 #[test]
 fn integrated_time_in_the_future_fails() {
     let f = load("arm64");
-    let e = verify(&Policy::default_policy(), REPO, &f.digest, &[f.sig], UNIX_EPOCH + Duration::from_secs(1_700_000_000)).unwrap_err();
+    let e = verify(
+        &Policy::default_policy(),
+        REPO,
+        &f.digest,
+        &[f.sig],
+        UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+    )
+    .unwrap_err();
     assert!(matches!(e, VerifyError::Tlog(_)), "{e:?}");
 }
 
@@ -192,7 +252,11 @@ fn test_signing_key(seed: u8) -> SigningKey {
 }
 
 fn spki_der(k: &SigningKey) -> Vec<u8> {
-    k.verifying_key().to_public_key_der().unwrap().as_bytes().to_vec()
+    k.verifying_key()
+        .to_public_key_der()
+        .unwrap()
+        .as_bytes()
+        .to_vec()
 }
 
 fn trusted_root_with_rekor_key(k: &SigningKey, path: &std::path::Path) {
@@ -213,7 +277,8 @@ fn resign_set(f: &Fixture, k: &SigningKey, integrated: i64) -> SignatureBlob {
     let signed = serde_json::json!({"body": p["body"], "integratedTime": p["integratedTime"], "logID": p["logID"], "logIndex": p["logIndex"]});
     let canon = serde_json_canonicalizer::to_vec(&signed).unwrap();
     let sig: Signature = k.sign(&canon);
-    b["SignedEntryTimestamp"] = Value::String(base64::engine::general_purpose::STANDARD.encode(sig.to_der().as_bytes()));
+    b["SignedEntryTimestamp"] =
+        Value::String(base64::engine::general_purpose::STANDARD.encode(sig.to_der().as_bytes()));
     let mut s = f.sig.clone();
     s.annotations.insert(ANN_BUNDLE.into(), b.to_string());
     s
@@ -267,10 +332,14 @@ fn override_root_with_resigned_set_verifies_and_expiry_fails() {
 
 fn key_policy(k: &SigningKey) -> Policy {
     let pem = k.verifying_key().to_public_key_pem(LineEnding::LF).unwrap();
-    Policy::from_json(&serde_json::json!({
-        "version": 1, "default": "reject",
-        "images": [{"match": "ghcr.io/ublue-os/*", "keys": [pem]}]
-    }).to_string()).unwrap()
+    Policy::from_json(
+        &serde_json::json!({
+            "version": 1, "default": "reject",
+            "images": [{"match": "ghcr.io/ublue-os/*", "keys": [pem]}]
+        })
+        .to_string(),
+    )
+    .unwrap()
 }
 
 fn key_sig(k: &SigningKey, digest: &str) -> SignatureBlob {
@@ -280,8 +349,14 @@ fn key_sig(k: &SigningKey, digest: &str) -> SignatureBlob {
     ).into_bytes();
     let sig: Signature = k.sign(&payload);
     let mut annotations = BTreeMap::new();
-    annotations.insert(ANN_SIGNATURE.to_string(), base64::engine::general_purpose::STANDARD.encode(sig.to_der().as_bytes()));
-    SignatureBlob { payload, annotations }
+    annotations.insert(
+        ANN_SIGNATURE.to_string(),
+        base64::engine::general_purpose::STANDARD.encode(sig.to_der().as_bytes()),
+    );
+    SignatureBlob {
+        payload,
+        annotations,
+    }
 }
 
 #[test]
@@ -290,16 +365,46 @@ fn key_based_verifies_and_wrong_key_fails() {
     let k1 = test_signing_key(1);
     let k2 = test_signing_key(2);
     let s = key_sig(&k1, &d);
-    let v = verify(&key_policy(&k1), "ghcr.io/ublue-os/x", &d, &[s.clone()], now()).unwrap();
-    assert_eq!((v.mode.as_str(), v.subject, v.policy_match.as_str()), ("key", None, "ghcr.io/ublue-os/*"));
-    let e = verify(&key_policy(&k2), "ghcr.io/ublue-os/x", &d, &[s.clone()], now()).unwrap_err();
+    let v = verify(
+        &key_policy(&k1),
+        "ghcr.io/ublue-os/x",
+        &d,
+        std::slice::from_ref(&s),
+        now(),
+    )
+    .unwrap();
+    assert_eq!(
+        (v.mode.as_str(), v.subject, v.policy_match.as_str()),
+        ("key", None, "ghcr.io/ublue-os/*")
+    );
+    let e = verify(
+        &key_policy(&k2),
+        "ghcr.io/ublue-os/x",
+        &d,
+        std::slice::from_ref(&s),
+        now(),
+    )
+    .unwrap_err();
     assert!(matches!(e, VerifyError::BadSignature(_)), "{e:?}");
     // digest mismatch
-    let e = verify(&key_policy(&k1), "ghcr.io/ublue-os/x", &format!("sha256:{}", "cd".repeat(32)), &[s.clone()], now()).unwrap_err();
+    let e = verify(
+        &key_policy(&k1),
+        "ghcr.io/ublue-os/x",
+        &format!("sha256:{}", "cd".repeat(32)),
+        std::slice::from_ref(&s),
+        now(),
+    )
+    .unwrap_err();
     assert!(matches!(e, VerifyError::DigestMismatch(_)), "{e:?}");
     // glob does not match the bare prefix or other orgs
     for r in ["ghcr.io/ublue-os", "ghcr.io/ublue-osx/x", "ghcr.io/other/x"] {
-        assert!(matches!(verify(&key_policy(&k1), r, &d, &[s.clone()], now()), Err(VerifyError::NoPolicyMatch(_))), "{r}");
+        assert!(
+            matches!(
+                verify(&key_policy(&k1), r, &d, std::slice::from_ref(&s), now()),
+                Err(VerifyError::NoPolicyMatch(_))
+            ),
+            "{r}"
+        );
     }
 }
 
@@ -307,7 +412,14 @@ fn key_based_verifies_and_wrong_key_fails() {
 fn default_policy_ublue_key_rejects_foreign_signature() {
     let d = format!("sha256:{}", "ab".repeat(32));
     let s = key_sig(&test_signing_key(3), &d);
-    let e = verify(&Policy::default_policy(), "ghcr.io/ublue-os/silverblue-main", &d, &[s], now()).unwrap_err();
+    let e = verify(
+        &Policy::default_policy(),
+        "ghcr.io/ublue-os/silverblue-main",
+        &d,
+        &[s],
+        now(),
+    )
+    .unwrap_err();
     assert!(matches!(e, VerifyError::BadSignature(_)), "{e:?}");
 }
 
@@ -325,7 +437,10 @@ fn policy_roundtrip_and_validation() {
         r#"{"version":1,"default":"reject","images":[{"match":"a","keyless":{"issuer":"x","subject_regex":"("}}]}"#,
         "not json",
     ] {
-        assert!(matches!(Policy::from_json(bad), Err(VerifyError::Policy(_))), "{bad}");
+        assert!(
+            matches!(Policy::from_json(bad), Err(VerifyError::Policy(_))),
+            "{bad}"
+        );
     }
 }
 

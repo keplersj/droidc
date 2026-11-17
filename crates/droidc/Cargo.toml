@@ -32,5 +32,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = "0.26"
 hickory-resolver = { version = "0.25", default-features = false, features = ["tokio"] }
 
+# Android's app seccomp filter lacks legacy syscalls (mkdir, chmod, unlink, ...) on x86_64, and rustix's
+# default linux_raw backend issues raw syscalls: go through bionic's libc wrappers instead.
+[target.'cfg(target_os = "android")'.dependencies]
+rustix = { version = "1", features = ["use-libc"] }
+
 [dev-dependencies]
 tempfile = "3"

@@ -70,18 +70,30 @@ impl Policy {
     pub fn from_json(s: &str) -> Result<Self, VerifyError> {
         let p: Policy = serde_json::from_str(s).map_err(|e| VerifyError::Policy(e.to_string()))?;
         if p.version != 1 {
-            return Err(VerifyError::Policy(format!("unsupported version {}", p.version)));
+            return Err(VerifyError::Policy(format!(
+                "unsupported version {}",
+                p.version
+            )));
         }
         if p.default != "reject" {
-            return Err(VerifyError::Policy(format!("unsupported default `{}` (only \"reject\")", p.default)));
+            return Err(VerifyError::Policy(format!(
+                "unsupported default `{}` (only \"reject\")",
+                p.default
+            )));
         }
         for e in &p.images {
             if e.keyless.is_none() && e.keys.is_empty() {
-                return Err(VerifyError::Policy(format!("entry `{}` has neither keyless nor keys", e.match_)));
+                return Err(VerifyError::Policy(format!(
+                    "entry `{}` has neither keyless nor keys",
+                    e.match_
+                )));
             }
             if let Some(k) = &e.keyless {
                 if k.issuer.is_empty() {
-                    return Err(VerifyError::Policy(format!("entry `{}`: keyless.issuer is required", e.match_)));
+                    return Err(VerifyError::Policy(format!(
+                        "entry `{}`: keyless.issuer is required",
+                        e.match_
+                    )));
                 }
                 if k.subject.is_none() && k.subject_regex.is_none() {
                     return Err(VerifyError::Policy(format!(
@@ -91,13 +103,19 @@ impl Policy {
                 }
                 if let Some(r) = &k.subject_regex {
                     regex::Regex::new(r).map_err(|e2| {
-                        VerifyError::Policy(format!("entry `{}`: bad subject_regex: {e2}", e.match_))
+                        VerifyError::Policy(format!(
+                            "entry `{}`: bad subject_regex: {e2}",
+                            e.match_
+                        ))
                     })?;
                 }
             }
             for k in &e.keys {
                 if !k.contains("-----BEGIN PUBLIC KEY-----") {
-                    return Err(VerifyError::Policy(format!("entry `{}`: key is not a PEM PUBLIC KEY", e.match_)));
+                    return Err(VerifyError::Policy(format!(
+                        "entry `{}`: key is not a PEM PUBLIC KEY",
+                        e.match_
+                    )));
                 }
             }
         }

@@ -24,6 +24,18 @@ cargo zigbuild --release --target aarch64-unknown-linux-musl -p droidc
 file target/*-musl/release/droidc          # "statically linked"
 ```
 
+Android host-side builds (bionic, run by Selkie as `libdroidc.so`; the musl build is the guest-side
+`libdroidc-guest.so`). Android's app seccomp filter has no legacy syscalls (`mkdir`, `chmod`, ...) on
+x86_64, so musl binaries get SIGSYS there; on Android rustix uses its libc backend (bionic wrappers):
+
+```sh
+rustup target add aarch64-linux-android x86_64-linux-android
+cargo install cargo-ndk --locked
+export ANDROID_NDK_HOME=/path/to/android-ndk-r27c
+cargo ndk -t arm64-v8a -t x86_64 --platform 26 build --release -p droidc
+# -> target/aarch64-linux-android/release/droidc, target/x86_64-linux-android/release/droidc
+```
+
 `zig cc` is the C compiler for `ring` and `zstd-sys`; it needs no musl-gcc packages and no NDK, and
 works the same on x86_64 and arm64 GitHub runners (see `.github/workflows/ci.yml`).
 

@@ -54,6 +54,29 @@ pub fn free_space(p: &Path) -> Result<u64> {
     Ok(s.f_bavail.saturating_mul(s.f_frsize))
 }
 
+/// Copy a regular file's bytes and permission bits with a plain read/write loop. Deliberately not
+/// `std::fs::copy`/`io::copy`, which use `copy_file_range`/`sendfile` through raw `syscall()`: those
+/// can be killed (SIGSYS) by Android's app seccomp filter.
+pub fn copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    let mut r = fs::File::open(src)?;
+    let mode = r.metadata()?.mode();
+    let mut w = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dst)?;
+    let mut buf = vec![0u8; 128 * 1024];
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        w.write_all(&buf[..n])?;
+    }
+    w.set_permissions(fs::Permissions::from_mode(mode & 0o7777))
+}
+
 pub fn is_empty_dir(p: &Path) -> bool {
     match fs::read_dir(p) {
         Ok(mut rd) => rd.next().is_none(),

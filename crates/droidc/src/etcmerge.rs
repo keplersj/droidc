@@ -119,7 +119,7 @@ fn copy_ent(e: &Ent, src: &Path, dst: &Path) -> Result<()> {
         Ent::None | Ent::Other => Ok(()),
         Ent::Dir(_) => copy_tree(src, dst),
         Ent::File(p, mode) => {
-            fs::copy(p, dst).context(dst.display())?;
+            crate::fsutil::copy_file(p, dst).context(dst.display())?;
             fs::set_permissions(dst, fs::Permissions::from_mode(mode | 0o600))
                 .context(dst.display())?;
             Ok(())

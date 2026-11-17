@@ -69,7 +69,7 @@ impl Window {
         })
     }
     pub(crate) fn contains(&self, t: i64) -> bool {
-        self.start.map_or(true, |s| t >= s) && self.end.map_or(true, |e| t <= e)
+        self.start.is_none_or(|s| t >= s) && self.end.is_none_or(|e| t <= e)
     }
 }
 
@@ -113,7 +113,10 @@ impl TrustedRoot {
                 .map(|x| b64_decode(&x.raw_bytes))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(err)?;
-            cas.push(Ca { certs, valid: Window::parse(&c.valid_for).map_err(err)? });
+            cas.push(Ca {
+                certs,
+                valid: Window::parse(&c.valid_for).map_err(err)?,
+            });
         }
         Ok(TrustedRoot { tlogs, cas })
     }
