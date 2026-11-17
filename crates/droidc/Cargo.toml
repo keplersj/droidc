@@ -1,0 +1,10 @@
+[package]
+name = "droidc"
+description = "Run bootc images on Android under proot: pull, verify, unpack, deploy, rollback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+droidc-verify = { path = "../droidc-verify" }
