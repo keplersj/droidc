@@ -75,8 +75,8 @@ identical to `ublue-os/main`'s key, used by the default policy for `ghcr.io/ublu
 
 ## Why not `sigstore` (sigstore-rs)?
 
-Not adopted: it drags in a large dependency tree (async runtime, reqwest/TUF client, OCI client,
-and by default OpenSSL via `openssl`/`pkcs8` paths for cosign bundles) aimed at online workflows,
+Not adopted: it drags in a large dependency tree (async runtime, HTTP/TUF and OCI clients, optional native-TLS/OpenSSL
+features) aimed at online workflows,
 while droidc already has its own OCI client and needs a ~700 line offline check. Its offline
 verification path with caller-supplied blobs and a custom trusted root is also awkward to drive
 without the registry client. Implementing the pipeline directly on RustCrypto keeps the binary
