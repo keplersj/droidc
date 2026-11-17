@@ -7,6 +7,22 @@ export DROIDC_L2S_PREFIX=${DROIDC_L2S_PREFIX:-.proot.l2s.}   # Ubuntu's proot is
 J() { "$D" --root "$ROOT" --json "$@" | tee -a "$ROOT.log" | tail -n1; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 mkdir -p "$(dirname "$ROOT")"; : > "$ROOT.log"
+ROOT_REAL=$(readlink -f "$ROOT")
+
+# Run a command inside the current deployment. proot first (what Selkie uses; Ubuntu's 5.1.0 is not
+# reliable on GitHub runners), else sudo chroot with the root bind-mounted at its own absolute path
+# so the absolute host paths inside link2symlink chains resolve.
+run_in() {
+  if [ "${USE_CHROOT:-0}" != 1 ] && PROOT_NO_SECCOMP=1 proot -r "$ROOT/current/rootfs" -w / "$@"; then return 0; fi
+  echo "(proot failed, using chroot fallback)" >&2
+  USE_CHROOT=1
+  local rf; rf=$(readlink -f "$ROOT/current/rootfs")
+  sudo mkdir -p "$rf$ROOT_REAL"
+  sudo mount --bind "$ROOT_REAL" "$rf$ROOT_REAL"
+  local rc=0; sudo chroot "$rf" "$@" || rc=$?
+  sudo umount "$rf$ROOT_REAL"
+  return $rc
+}
 
 echo "== platform"; "$D" --json platform | tail -n1
 
@@ -23,9 +39,9 @@ grep -q '"10' "$ROOT/current/rootfs/usr/lib/os-release" || fail "os-release vers
 [ "$(readlink "$ROOT/current")" = "deployments/$ID1" ] || fail "current is not a relative link"
 
 echo "== run in the deployment (proot)"
-OUT=$(proot -r "$ROOT/current/rootfs" -w / /usr/bin/cat /etc/os-release)
+OUT=$(run_in /usr/bin/cat /etc/os-release)
 echo "$OUT" | grep -q 'CentOS Stream' || fail "proot cat"
-proot -r "$ROOT/current/rootfs" -w / /usr/bin/true || fail "proot true (hard-linked binary)"
+run_in /usr/bin/true || fail "proot true (hard-linked binary)"
 
 echo "== shell-spec"
 J shell-spec | jq -e '.ok and (.data.binds | length == 3)' >/dev/null || fail "shell-spec"
@@ -48,7 +64,7 @@ J rollback | jq -e '.ok and .data.changed' >/dev/null || fail "rollback"
 S=$(J status)
 [ "$(echo "$S" | jq -r .data.current.id)" = "$ID1" ] || fail "current after rollback"
 [ "$(echo "$S" | jq -r .data.previous.id)" = "$ID2" ] || fail "previous after rollback"
-proot -r "$ROOT/current/rootfs" -w / /usr/bin/cat /etc/os-release | grep -q 'CentOS Stream' || fail "proot after rollback"
+run_in /usr/bin/cat /etc/os-release | grep -q 'CentOS Stream' || fail "proot after rollback"
 
 echo "== gc"
 G=$(J gc); echo "$G" | jq -e '.ok' >/dev/null || fail "gc"
