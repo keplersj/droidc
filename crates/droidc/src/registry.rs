@@ -548,46 +548,65 @@ impl Registry {
             }
         }
         let url = Self::blob_url(r, &desc.digest);
-        let mut resp = self.get_with(&self.bulk, r, &url, None, if have > 0 { Some(have) } else { None })?;
-        let st = resp.status();
-        if have > 0 && st.as_u16() != 206 {
-            // Server ignored the range: start over.
-            have = 0;
-            hasher = Sha256::new();
-            let _ = fs::remove_file(&part);
-            if st.is_success() {
-                // we already have a full-body response, use it
-            } else {
-                resp = self.get_with(&self.bulk, r, &url, None, None)?;
-            }
-        }
-        if !resp.status().is_success() {
-            return Err(if resp.status().as_u16() == 404 {
-                Error::not_found(format!("blob {} not found", desc.digest))
-            } else {
-                Error::network(format!("blob {}: HTTP {}", desc.digest, resp.status()))
-            });
-        }
-        on_bytes(have);
         let mut out = fs::OpenOptions::new().create(true).append(true).open(&part).context(part.display())?;
         let mut buf = vec![0u8; 256 * 1024];
         let mut got = 0u64;
-        loop {
-            let n = resp.read(&mut buf).map_err(|e| Error::network(format!("blob {}: {e}", desc.digest)))?;
-            if n == 0 {
-                break;
+        let mut failures = 0;
+        on_bytes(have);
+        'attempt: loop {
+            let mut resp = self.get_with(&self.bulk, r, &url, None, if have > 0 { Some(have) } else { None })?;
+            let st = resp.status();
+            if have > 0 && st.as_u16() != 206 && st.is_success() {
+                // Server ignored the range: start over from zero.
+                on_bytes(0);
+                out.set_len(0)?;
+                use std::io::Seek;
+                out.seek(std::io::SeekFrom::Start(0))?;
+                hasher = Sha256::new();
+                have = 0;
+                got = 0;
             }
-            hasher.update(&buf[..n]);
-            out.write_all(&buf[..n]).context(part.display())?;
-            got += n as u64;
-            on_bytes(n as u64);
+            if !st.is_success() {
+                return Err(if st.as_u16() == 404 {
+                    Error::not_found(format!("blob {} not found", desc.digest))
+                } else {
+                    Error::network(format!("blob {}: HTTP {st}", desc.digest))
+                });
+            }
+            loop {
+                match resp.read(&mut buf) {
+                    Ok(0) if desc.size == 0 || have >= desc.size => break 'attempt,
+                    Ok(0) => {
+                        failures += 1;
+                        if failures > 6 {
+                            return Err(Error::network(format!("blob {}: connection closed early at {have}/{} bytes", desc.digest, desc.size)));
+                        }
+                        continue 'attempt;
+                    }
+                    Ok(n) => {
+                        hasher.update(&buf[..n]);
+                        out.write_all(&buf[..n]).context(part.display())?;
+                        have += n as u64;
+                        got += n as u64;
+                        on_bytes(n as u64);
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        if failures > 6 {
+                            return Err(Error::network(format!("blob {}: {e}", desc.digest)));
+                        }
+                        std::thread::sleep(Duration::from_millis(500 * failures));
+                        continue 'attempt; // resume from `have` with a Range request
+                    }
+                }
+            }
         }
         out.sync_all()?;
         drop(out);
         let digest = hex::encode(hasher.finalize());
-        if digest != hexpart || (desc.size != 0 && have + got != desc.size) {
+        if digest != hexpart || (desc.size != 0 && have != desc.size) {
             let _ = fs::remove_file(&part);
-            return Err(Error::network(format!("blob {} failed verification (got sha256:{digest}, {} bytes)", desc.digest, have + got)));
+            return Err(Error::network(format!("blob {} failed verification (got sha256:{digest}, {} bytes)", desc.digest, have)));
         }
         if let Some(p) = blob_path.parent() {
             fs::create_dir_all(p)?;

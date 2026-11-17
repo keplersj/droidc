@@ -54,6 +54,10 @@ fn open_root(path: &Path) -> Result<(Root, RootLock)> {
     let root = Root::new(canon);
     let lock = RootLock::acquire(&root)?;
     root.init()?;
+    if !root.policy().exists() {
+        // First run: write the default trust policy.
+        fs::write(root.policy(), Policy::default_policy().to_json()).context("write policy.json")?;
+    }
     Ok((root, lock))
 }
 
@@ -159,7 +163,7 @@ pub fn install(root: &Root, em: &Emitter, input: InstallInput<'_>) -> Result<Dep
     let have_cur = prev.is_some() && cur_rootfs.join("etc").is_dir();
     let (op, ol) = if have_cur { (Some(cur_rootfs.join("usr/etc")), Some(cur_rootfs.join("etc"))) } else { (None, None) };
     let ms = etcmerge::merge(op.as_deref(), ol.as_deref(), &rootfs.join("usr/etc"), &rootfs.join("etc"))?;
-    em.progress("etc-merge", 1, 1, "files", &format!("/etc: {} from image, {} local kept, {} local deletions kept", ms.taken_new, ms.kept_local, ms.kept_deleted));
+    em.progress("etc-merge", 1, 1, "files", &format!("/etc: {} taken from image, {} local changes kept, {} local deletions kept", ms.taken_new, ms.kept_local, ms.kept_deleted));
     fs::create_dir_all(rootfs.join("var"))?;
 
     write_metadata(&stage.join("metadata.jsonl.zst"), &meta)?;

@@ -9,6 +9,7 @@ pub mod link;
 pub mod platform;
 pub mod registry;
 pub mod status;
+pub mod supervise;
 pub mod record;
 pub mod unpack;
 pub mod verify_glue;
