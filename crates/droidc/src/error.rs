@@ -99,3 +99,9 @@ impl<T> Context<T> for std::io::Result<T> {
         self.map_err(|e| Error::new(io_kind(&e), format!("{what}: {e}")))
     }
 }
+
+impl<T> Context<T> for Result<T> {
+    fn context(self, what: impl fmt::Display) -> Result<T> {
+        self.map_err(|e| Error::new(e.kind, format!("{what}: {}", e.message)))
+    }
+}
