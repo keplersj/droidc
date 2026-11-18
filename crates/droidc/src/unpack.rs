@@ -516,6 +516,20 @@ pub mod tests {
             self.0.append_data(&mut h, p, data).unwrap();
             self
         }
+        pub fn file_as(mut self, p: &str, mode: u32, uid: u64, gid: u64, data: &[u8]) -> Self {
+            let mut h = Self::hdr(tar::EntryType::Regular, mode, data.len() as u64);
+            h.set_uid(uid);
+            h.set_gid(gid);
+            self.0.append_data(&mut h, p, data).unwrap();
+            self
+        }
+        pub fn dir_as(mut self, p: &str, mode: u32, uid: u64, gid: u64) -> Self {
+            let mut h = Self::hdr(tar::EntryType::Directory, mode, 0);
+            h.set_uid(uid);
+            h.set_gid(gid);
+            self.0.append_data(&mut h, p, std::io::empty()).unwrap();
+            self
+        }
         pub fn symlink(mut self, p: &str, target: &str) -> Self {
             let mut h = Self::hdr(tar::EntryType::Symlink, 0o777, 0);
             self.0.append_link(&mut h, p, target).unwrap();

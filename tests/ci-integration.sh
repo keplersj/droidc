@@ -56,6 +56,20 @@ RC=0; sudo "$D" --root "$ROOT_REAL" enter -- /bin/sh -c 'exit 3' || RC=$?
 [ "$RC" = 3 ] || fail "enter exit status $RC"
 [ -z "$(findmnt -rn -o TARGET | grep -F "$ROOT_REAL/" || true)" ] || fail "enter leaked mounts"
 
+echo "== fix-ownership (root), then non-root commands refuse, then --undo"
+F=$(sudo "$D" --root "$ROOT_REAL" --json fix-ownership | tail -n1)
+echo "$F" | jq -c '.data | {applied, via_l2s, xattr_errors, skipped}'
+echo "$F" | jq -e '.ok and .data.applied > 1000' >/dev/null || fail "fix-ownership: $F"
+P=$(sudo "$D" --root "$ROOT_REAL" enter -- stat -c '%u %a' /usr/bin/passwd)
+[ "$P" = "0 4755" ] || fail "passwd after fix-ownership: $P"
+J shell-spec --launcher chroot | jq -e '[.data.launcher.warnings[] | select(test("ownership"))] | length == 0' >/dev/null \
+  || fail "ownership warning after fix-ownership"
+J upgrade | jq -e '.ok == false and .error.kind == "invalid"' >/dev/null || fail "non-root upgrade should refuse"
+U=$(sudo "$D" --root "$ROOT_REAL" --json fix-ownership --undo | tail -n1)
+echo "$U" | jq -e '.ok' >/dev/null || fail "undo: $U"
+LEFT=$(sudo find "$ROOT_REAL" ! -user "$(id -u)" -print -quit)
+[ -z "$LEFT" ] || fail "undo left files not owned by $(id -un): $LEFT"
+
 echo "== upgrade is a no-op"
 J upgrade | jq -e '.ok and .data.changed == false' >/dev/null || fail "upgrade no-op"
 

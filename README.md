@@ -52,6 +52,7 @@ droidc supervise --session --width 1920 --height 1200   # inside the guest: the 
 droidc session set --renderer screencast --exec '["gnome-shell","--headless","--virtual-monitor","{width}x{height}"]' \
   --services '[["pipewire"],["wireplumber"]]' --name GNOME   # for images without session labels
 sudo droidc --root ~/droidc enter -- bash -l   # with root: namespaces + chroot instead of proot
+sudo droidc --root ~/droidc fix-ownership [--undo]   # apply the image's owners/setuid (root only from then on)
 ```
 
 `--root`/`DROIDC_ROOT`, `--dns`/`DROIDC_DNS` (comma separated IPs; else `/etc/resolv.conf`, else

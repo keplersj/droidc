@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 fn rec(root: &Root, id: Option<String>) -> Value {
@@ -230,8 +229,8 @@ pub fn shell_spec(root_path: &Path, launcher: Launcher) -> Result<ShellSpec> {
                 binds.push(bind(c.clone(), &c));
                 warnings.push("deployment uses link2symlink; redeploy with --links hardlink as root for real hard links".into());
             }
-            if !owned_by_root(Path::new(&rootfs)) {
-                warnings.push("ownership not applied: files belong to the app uid, so setuid binaries (sudo, su, pkexec) and ownership checks (sshd, polkit) will fail".into());
+            if record.ownership.as_deref() != Some(crate::record::OWNERSHIP_IMAGE) {
+                warnings.push("ownership not applied (run `droidc fix-ownership` as root): setuid binaries (sudo, su, pkexec) and ownership checks (sshd, polkit) will fail".into());
             }
             LauncherSpec::Chroot {
                 requires_root: true,
@@ -271,11 +270,4 @@ pub fn shell_spec(root_path: &Path, launcher: Launcher) -> Result<ShellSpec> {
         session_label: record.session_label,
         launcher,
     })
-}
-
-/// Whether unpack applied image ownership (it does not without root: everything is the app uid).
-fn owned_by_root(rootfs: &Path) -> bool {
-    fs::symlink_metadata(rootfs.join("usr"))
-        .map(|m| m.uid() == 0)
-        .unwrap_or(false)
 }

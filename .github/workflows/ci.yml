@@ -20,6 +20,11 @@ jobs:
       - run: cargo test --workspace
         # includes tests/net.rs: real keyless verification of ghcr.io/projectbluefin/bluefin-lts
         # from manifests + .sig only (no layers)
+      - name: Root-only unit tests (real chown/chmod/setuid)
+        run: |
+          BIN=$(cargo test -p droidc --lib --no-run --message-format=json \
+            | jq -r 'select(.executable != null and .target.kind[0] == "lib") | .executable' | tail -1)
+          sudo "$BIN" --exact deploy::tests::fix_ownership_then_undo_as_root
 
   build:
     strategy:

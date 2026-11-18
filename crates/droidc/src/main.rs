@@ -7,7 +7,7 @@ use droidc::link::{LinkKind, DEFAULT_L2S_PREFIX};
 use droidc::platform::Platform;
 use droidc::registry::HttpConfig;
 use droidc::session::{self, Renderer, SessionSpec};
-use droidc::{bridge, enter, logcat, login1, status, supervise};
+use droidc::{bridge, enter, logcat, login1, ownership, status, supervise};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -65,6 +65,12 @@ enum Cmd {
     },
     /// Detected platform
     Platform,
+    /// (as root) apply the image's uid/gid/mode/xattrs to the current deployment, or with --undo
+    /// give the whole root back to the app uid
+    FixOwnership {
+        #[arg(long)]
+        undo: bool,
+    },
     /// (as root) run a command in the current deployment: namespaces + chroot, no proot
     Enter {
         /// Extra bind after the deployment's, HOST:/GUEST (repeatable)
@@ -284,6 +290,8 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
         }
         Cmd::Platform => Ok(("platform", serde_json::to_value(Platform::detect()?)?)),
         Cmd::Session { action } => Ok(("session", session_cmd(&root, action)?)),
+        Cmd::FixOwnership { undo: false } => Ok(("fix-ownership", ownership::fix(&root, &l2s)?)),
+        Cmd::FixOwnership { undo: true } => Ok(("fix-ownership", ownership::undo(&root)?)),
         Cmd::Supervise { .. }
         | Cmd::Bridge { .. }
         | Cmd::Login1

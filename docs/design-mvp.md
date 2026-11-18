@@ -154,6 +154,7 @@ droidc [--root DIR] [--json] [--dns IPS] <command>
   shell-spec [--launcher proot|chroot]  how to enter the current deployment (rootfs, binds, env, cwd)
   platform                      detected platform
   enter [--bind H:G] [--env K=V] [--hostname N] -- <cmd...>   (as root) run cmd in the deployment
+  fix-ownership [--undo]        (as root) apply image uid/gid/mode/xattrs; --undo: back to the app uid
   supervise -- <cmd...>         (inside the guest) start session services, dbus first, then cmd
   supervise --session [--width W --height H --scale S] [-- cmd...]
                                 (inside the guest) start the graphical session, see "Graphical session"
@@ -274,6 +275,29 @@ followed inside the rootfs and its target created. A failing `optional` mount is
 Unverified on Android: the link2symlink self-bind assumes `<root>` canonicalizes to the same path in
 su's mount namespace as in the app's when the chains were written (Magisk's namespace modes and
 Android's app data isolation may differ). If not, the record needs the canonical root used at unpack.
+
+## `fix-ownership` (root)
+
+Applies `metadata.jsonl.zst` to the current deployment: uid/gid, then the full mode (setuid,
+setgid, sticky; chown clears them), then xattrs (chown clears `security.capability`;
+`security.selinux` is never applied). Rows map to trees: `usr/etc/X` also to the live `etc/X`;
+`var/X` to `<root>/var/X` (only the deployment that seeded `<root>/var` has `var/` rows, unpack drops
+them for the others). Every row is resolved with `openat2(O_PATH|O_NOFOLLOW, RESOLVE_IN_ROOT)` and
+must match its recorded type, so neither the image nor a guest that ran as root (swapping a
+directory for a symlink to a host path) can make it touch a host file. The exception: an `f`/`h`
+row that link2symlink turned into a chain is followed and accepted only if it ends at a regular file
+named with the l2s prefix inside the canonical root. `f`/`d`/`l` rows are applied first; an `h` row
+only for an inode no `f` row reached (hard-link headers carry their own, often wrong, mode). The
+record gets `"ownership":"image"`; result `{id, ownership, applied, via_l2s, xattr_errors,
+skipped:{reason: n}}` (the `l2s chain does not resolve` count shows a canonical root mismatch).
+
+From then on the root is root-only: every mutating command (`switch`, `upgrade`, `rollback`, `gc`)
+run without root refuses up front with kind `invalid` (etcmerge cannot read a `0000` /etc/shadow, gc
+could not delete root-owned trees), and `shell-spec --launcher chroot` drops its ownership warning.
+New deployments made by a root `switch` need `fix-ownership` again. `--undo` lchowns everything under
+the root (all deployments, `var`, `home`, blobs) to the owner of the root directory, sets directories
+`| 0o700` and files `| 0o600` without setuid/setgid/sticky, drops `security.capability`, never
+follows symlinks, and clears `ownership` in every record: proot and non-root commands work again.
 
 ## Session label
 

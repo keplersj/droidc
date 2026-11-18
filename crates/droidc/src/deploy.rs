@@ -48,11 +48,14 @@ impl SwitchOpts {
 }
 
 /// Create the root (if needed), canonicalize it and take the lock.
-fn open_root(path: &Path) -> Result<(Root, RootLock)> {
+pub(crate) fn open_root(path: &Path) -> Result<(Root, RootLock)> {
     fs::create_dir_all(path).context(path.display())?;
     let canon = fs::canonicalize(path).context(path.display())?;
     let root = Root::new(canon);
     let lock = RootLock::acquire(&root)?;
+    if !rustix::process::geteuid().is_root() {
+        refuse_image_owned(&root)?;
+    }
     root.init()?;
     if !root.policy().exists() {
         // First run: write the default trust policy.
@@ -242,7 +245,27 @@ pub fn install(root: &Root, em: &Emitter, input: InstallInput<'_>) -> Result<Dep
     Ok(rec)
 }
 
-fn write_record(path: &Path, rec: &Deployment) -> Result<()> {
+/// Without root, nothing may touch a deployment whose image ownership was applied: etcmerge cannot
+/// read a `0000` /etc/shadow and gc cannot delete root-owned trees (it would stop half way).
+fn refuse_image_owned(root: &Root) -> Result<()> {
+    for e in fs::read_dir(root.deployments())
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let id = e.file_name().to_string_lossy().into_owned();
+        if let Ok(r) = root.read_record(&id) {
+            if r.ownership.as_deref() == Some(crate::record::OWNERSHIP_IMAGE) {
+                return Err(Error::invalid(format!(
+                    "deployment {id} has image ownership: run droidc as root, or `fix-ownership --undo` as root first"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn write_record(path: &Path, rec: &Deployment) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, serde_json::to_vec_pretty(rec)?).context(tmp.display())?;
     fs::File::open(&tmp)?.sync_all()?;
@@ -426,6 +449,7 @@ fn build_record(
         signature: sig,
         insecure,
         stats: Stats::default(),
+        ownership: None,
     }
 }
 
@@ -699,6 +723,7 @@ mod tests {
             signature: SignatureInfo::none(),
             insecure: true,
             stats: Stats::default(),
+            ownership: None,
         }
     }
 
@@ -1034,6 +1059,116 @@ mod tests {
             ..Default::default()
         };
         assert!(plan(&root.path, &o).is_err());
+    }
+
+    /// Real chown/chmod: runs only as root (CI under sudo, or locally in
+    /// `unshare --user --map-root-user --map-auto`).
+    #[test]
+    fn fix_ownership_then_undo_as_root() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if !rustix::process::geteuid().is_root() {
+            eprintln!("skipped: needs root");
+            return;
+        }
+        let (_d, root, ld) = setup();
+        // the app uid the root belongs to
+        std::os::unix::fs::chown(&root.path, Some(1000), Some(1000)).unwrap();
+        let layers = vec![Layer::new()
+            .dir_as("etc/", 0o755, 0, 0)
+            .file_as("etc/shadow", 0o000, 0, 0, b"s")
+            .dir_as("usr/", 0o755, 0, 0)
+            .dir_as("usr/bin/", 0o755, 0, 0)
+            .file_as("usr/bin/su", 0o4755, 0, 0, b"su")
+            .hardlink("usr/bin/sudo", "usr/bin/su") // header says 1000:1000 0644
+            .symlink("usr/share", "/") // hostile: rows below it must not reach the host
+            .dir_as("srv/", 0o750, 999, 998)
+            .dir_as("var/", 0o755, 0, 0)
+            .dir_as("var/lib/", 0o700, 999, 999)
+            .bytes()];
+        do_install(&root, &ld, "aaaa", layers, LinkKind::Link2Symlink);
+        root.set_link("current", "aaaa").unwrap();
+        let rf = root.deployment("aaaa").join("rootfs");
+        // A guest that ran as root swapped a recorded directory for a symlink to a host path.
+        let sentinel = _d.path().join("sentinel");
+        fs::create_dir(&sentinel).unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir(rf.join("opt")).unwrap();
+        fs::write(rf.join("opt/keep"), "").unwrap();
+        fs::rename(rf.join("srv"), rf.join("opt/srv")).unwrap();
+        std::os::unix::fs::symlink(&sentinel, rf.join("srv")).unwrap();
+        let r = crate::ownership::fix(&root.path, ".l2s.").unwrap();
+        assert_eq!(r["ownership"], "image");
+        let su = fs::metadata(rf.join("usr/bin/su")).unwrap();
+        assert_eq!((su.uid(), su.mode() & 0o7777), (0, 0o4755), "{r}");
+        let sudo = fs::metadata(rf.join("usr/bin/sudo")).unwrap(); // l2s chain, same inode
+        assert_eq!(sudo.ino(), su.ino());
+        assert_eq!(
+            sudo.mode() & 0o7777,
+            0o4755,
+            "h row must not override the f row"
+        );
+        let host = fs::metadata(&sentinel).unwrap();
+        assert_eq!(
+            (host.uid(), host.mode() & 0o777),
+            (0, 0o755),
+            "host path untouched"
+        );
+        assert_eq!(r["skipped"]["type mismatch"], 1, "{r}");
+        for shadow in ["usr/etc/shadow", "etc/shadow"] {
+            let m = fs::metadata(rf.join(shadow)).unwrap();
+            assert_eq!((m.uid(), m.mode() & 0o777), (0, 0), "{shadow}");
+        }
+        assert_eq!(fs::metadata(root.var().join("lib")).unwrap().uid(), 999);
+        assert_eq!(
+            root.read_record("aaaa").unwrap().ownership.as_deref(),
+            Some("image")
+        );
+        let spec = crate::status::shell_spec(&root.path, Launcher::Chroot).unwrap();
+        let crate::status::LauncherSpec::Chroot { warnings, .. } = spec.launcher else {
+            panic!()
+        };
+        assert!(
+            !warnings.iter().any(|w| w.contains("ownership")),
+            "{warnings:?}"
+        );
+
+        let u = crate::ownership::undo(&root.path).unwrap();
+        assert_eq!(u["deployments"], json!(["aaaa"]));
+        for p in [
+            rf.join("usr/bin/su"),
+            rf.join("etc/shadow"),
+            rf.join("opt/srv"),
+            root.var().join("lib"),
+        ] {
+            let m = fs::metadata(&p).unwrap();
+            assert_eq!(m.uid(), 1000, "{}", p.display());
+            assert_eq!(m.mode() & 0o7000, 0, "{}", p.display());
+            assert_eq!(m.mode() & 0o600, 0o600, "{}", p.display());
+        }
+        assert!(root.read_record("aaaa").unwrap().ownership.is_none());
+        let host = fs::metadata(&sentinel).unwrap();
+        assert_eq!(host.uid(), 0, "undo does not follow symlinks");
+        let _ = fs::set_permissions(&root.path, fs::Permissions::from_mode(0o755));
+    }
+
+    #[test]
+    fn image_owned_deployments_need_root() {
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let (_d, root, ld) = setup();
+        let (em, _) = capture();
+        do_install(&root, &ld, "aaaa", image("A", "x"), LinkKind::Copy);
+        root.set_link("current", "aaaa").unwrap();
+        let mut r = root.read_record("aaaa").unwrap();
+        r.ownership = Some("image".into());
+        write_record(&root.deployment("aaaa").join("deployment.json"), &r).unwrap();
+        let e = gc(&root.path, &em).unwrap_err();
+        assert_eq!(e.kind, crate::error::ErrorKind::Invalid);
+        assert!(e.message.contains("fix-ownership --undo"), "{}", e.message);
+        assert!(root.deployment("aaaa").is_dir());
+        // read-only commands still work
+        crate::status::status(&root.path).unwrap();
     }
 
     #[test]
