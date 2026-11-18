@@ -253,8 +253,9 @@ gnome-shell 50 aborts without a connection), the `services`, then by renderer:
 - `screencast`: `exec` with `WAYLAND_DISPLAY` unset, then `droidc bridge --width W --height H` (or the
   command given after `--`). The bridge waits for the ScreenCast service, records the monitor
   (`Meta-0`, the first virtual monitor) with a linked RemoteDesktop session, reads frames from
-  `gst-launch-1.0 pipewiresrc` (the image's own PipeWire client: the static droidc can't load
-  libpipewire), presents them as one fullscreen `xdg_toplevel` over `wl_shm`, and sends the toplevel's
+  `gst-launch-1.0 pipewiresrc autoconnect=false` (the image's own PipeWire client: the static droidc
+  can't load libpipewire), linked to Mutter's node with `pw-link` because WirePlumber's policy won't
+  link a stream to a stream (`target-object` fails with "target not found"), presents them as one fullscreen `xdg_toplevel` over `wl_shm`, and sends the toplevel's
   pointer, touch and key events (evdev codes) back through RemoteDesktop.
 
 The session ends when the session compositor, the bridge or the given command exits; every service
@@ -264,7 +265,11 @@ systemd), else `dbus-broker-launch` socket-activated as below.
 
 Verified on Bluefin LTS (gnome-shell 50.0, x86_64, no GPU, unprivileged bwrap sandbox): mutter creates a
 "surfaceless renderer without GPU" (llvmpipe), extensions load, frames arrive through
-ScreenCast → PipeWire → gst, and `NotifyKeyboardKeycode` input toggles the overview.
+ScreenCast → PipeWire → gst, and `NotifyKeyboardKeycode` input toggles the overview. Through Selkie's
+compositor (headless build on Linux) the chain runs at about 50 fps for cursor motion at 1280x800;
+heavy GNOME animations (overview with blur) render at a few fps on llvmpipe. Requirements on the
+image for `screencast`: `gst-launch-1.0` with the PipeWire plugin, `pw-link`, and a PipeWire session
+(e.g. `services=[["pipewire"],["wireplumber"]]`).
 
 ## `supervise`
 

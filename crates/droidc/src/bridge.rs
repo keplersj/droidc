@@ -7,7 +7,7 @@
 //! 1. creates a RemoteDesktop session and a ScreenCast session linked to it, records the monitor
 //!    and waits for its PipeWire node;
 //! 2. reads BGRx frames from `gst-launch-1.0 pipewiresrc` (the image's own PipeWire client: a
-//!    static binary can't load libpipewire);
+//!    static binary can't load libpipewire), linked to the stream with `pw-link`;
 //! 3. presents them as one fullscreen `xdg_toplevel` through `wl_shm` on the host compositor
 //!    (`$WAYLAND_DISPLAY`), and sends the toplevel's pointer, touch and keyboard input back
 //!    through RemoteDesktop.
@@ -209,34 +209,94 @@ impl<T: serde::Serialize + zbus::zvariant::DynamicType> DynBody for T {
     }
 }
 
-fn gst_source(node: u32) -> Vec<String> {
-    ["gst-launch-1.0", "-q", "pipewiresrc"]
-        .iter()
-        .map(|s| s.to_string())
-        .chain([format!("path={node}"), "always-copy=true".into()])
-        .collect()
+/// PipeWire node name of our capture stream.
+fn capture_name() -> String {
+    format!("droidc-bridge-{}", std::process::id())
+}
+
+/// `gst-launch-1.0` reading from a pipewiresrc that waits to be linked (see [`spawn_capture`]),
+/// with `src` extra source properties, followed by `tail`.
+fn gst_argv(src: &[&str], tail: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = [
+        "gst-launch-1.0",
+        "-q",
+        "pipewiresrc",
+        "autoconnect=false",
+        "always-copy=true",
+    ]
+    .map(String::from)
+    .to_vec();
+    argv.push(format!(
+        "stream-properties=props,node.name={}",
+        capture_name()
+    ));
+    argv.extend(src.iter().map(|s| s.to_string()));
+    argv.push("!".into());
+    argv.extend_from_slice(tail);
+    argv
+}
+
+/// Starts gst and links the session compositor's stream node to it with `pw-link`. Linking by
+/// `target-object` would go through WirePlumber's policy, which does not link a stream to another
+/// stream (Mutter's ScreenCast node is `Stream/Output/Video`), so the link is made directly.
+fn spawn_capture(
+    node: u32,
+    src: &[&str],
+    tail: &[String],
+    stdout: Stdio,
+) -> Result<std::process::Child> {
+    let argv = gst_argv(src, tail);
+    let mut gst = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdout(stdout)
+        .spawn()
+        .map_err(|e| Error::not_found(format!("{}: {e}", argv[0])))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(Some(st)) = gst.try_wait() {
+            return Err(Error::internal(format!(
+                "gst-launch-1.0 exited with {st} before it was linked"
+            )));
+        }
+        let out = Command::new("pw-link")
+            .arg(node.to_string())
+            .arg(capture_name())
+            .stdout(Stdio::null())
+            .output()
+            .map_err(|e| Error::not_found(format!("pw-link: {e}")))?;
+        if out.status.success() {
+            return Ok(gst);
+        }
+        if Instant::now() > deadline {
+            let last = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let _ = gst.kill();
+            let _ = gst.wait();
+            return Err(Error::internal(format!(
+                "pw-link {node} {}: {last}",
+                capture_name()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 fn dump_frame(node: u32, out: &std::path::Path) -> Result<i32> {
-    let mut argv = gst_source(node);
-    argv.extend(
-        [
-            "num-buffers=3",
-            "!",
-            "videoconvert",
-            "!",
-            "pngenc",
-            "snapshot=true",
-            "!",
-            "filesink",
-        ]
-        .map(String::from),
-    );
-    argv.push(format!("location={}", out.display()));
-    let st = Command::new(&argv[0])
-        .args(&argv[1..])
-        .status()
-        .map_err(|e| Error::not_found(format!("{}: {e}", argv[0])))?;
+    let mut tail: Vec<String> = [
+        "videoconvert",
+        "!",
+        "pngenc",
+        "snapshot=true",
+        "!",
+        "filesink",
+    ]
+    .map(String::from)
+    .to_vec();
+    tail.push(format!("location={}", out.display()));
+    // The third frame: the first ones can still be partially drawn.
+    let mut gst = spawn_capture(node, &["num-buffers=3"], &tail, Stdio::inherit())?;
+    let st = gst
+        .wait()
+        .map_err(|e| Error::internal(format!("gst-launch-1.0: {e}")))?;
     Ok(st.code().unwrap_or(1))
 }
 
@@ -269,15 +329,12 @@ struct Frames {
 fn present(opts: &Opts, remote: Arc<Remote>) -> Result<i32> {
     let (w, h) = (opts.width, opts.height);
     let frame_len = (w * h * 4) as usize;
-    let mut argv = gst_source(remote.node);
-    argv.extend(["!", "videoconvert", "!", "videoscale", "!"].map(String::from));
-    argv.push(format!("video/x-raw,format=BGRx,width={w},height={h}"));
-    argv.extend(["!", "fdsink", "fd=1"].map(String::from));
-    let mut gst = Command::new(&argv[0])
-        .args(&argv[1..])
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| Error::not_found(format!("{}: {e}", argv[0])))?;
+    let mut tail: Vec<String> = ["videoconvert", "!", "videoscale", "!"]
+        .map(String::from)
+        .to_vec();
+    tail.push(format!("video/x-raw,format=BGRx,width={w},height={h}"));
+    tail.extend(["!", "fdsink", "fd=1"].map(String::from));
+    let mut gst = spawn_capture(remote.node, &[], &tail, Stdio::piped())?;
     let mut stdout = gst.stdout.take().unwrap();
 
     let (wake_r, wake_w) =
