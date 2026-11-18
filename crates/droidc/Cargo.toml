@@ -26,11 +26,15 @@ base64 = "0.22"
 flate2 = "1"
 tar = "0.4"
 zstd = "0.13"
-rustix = { version = "1", features = ["fs", "system", "process"] }
+rustix = { version = "1", features = ["fs", "system", "process", "mm", "pipe", "event"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-manual-roots-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "0.26"
 hickory-resolver = { version = "0.25", default-features = false, features = ["tokio"] }
+# `droidc bridge`: Mutter ScreenCast/RemoteDesktop over D-Bus, presented as a Wayland client.
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
 
 # Android's app seccomp filter lacks legacy syscalls (mkdir, chmod, unlink, ...) on x86_64, and rustix's
 # default linux_raw backend issues raw syscalls: go through bionic's libc wrappers instead.

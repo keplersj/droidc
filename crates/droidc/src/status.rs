@@ -59,5 +59,9 @@ pub fn shell_spec(root_path: &Path) -> Result<Value> {
         },
         "cwd": "/root",
         "session_label": record.session_label,
+        "session": crate::session::describe(
+            &crate::session::resolve(root_path)?,
+            record.session_label.as_deref(),
+        ),
     }))
 }

@@ -154,6 +154,11 @@ droidc [--root DIR] [--json] [--dns IPS] <command>
   shell-spec                    how to enter the current deployment (rootfs, binds, env, cwd)
   platform                      detected platform
   supervise -- <cmd...>         (inside the guest) start session services, dbus first, then cmd
+  supervise --session [--width W --height H --scale S] [-- cmd...]
+                                (inside the guest) start the graphical session, see "Graphical session"
+  bridge [--width W --height H --connector C --dump-frame PNG]
+                                (inside the guest) show a headless session compositor on the host compositor
+  session show|set|clear        the graphical session (override, else image labels)
 ```
 
 ### `--json` output: newline-delimited JSON on stdout
@@ -196,26 +201,80 @@ layers) and returns `{"changed":false,"verify_only":true,"id","manifest_digest",
 ```json
 {"rootfs":"<root>/current/rootfs","binds":[{"host":"<root>/var","guest":"/var"},{"host":"<root>/home","guest":"/home"},{"host":"<root>","guest":"/run/droidc/root"}],
  "env":{"DROIDC_ROOT":"/run/droidc/root","HOME":"/root","PATH":"...","TERM":"xterm-256color","LANG":"C.UTF-8"},
- "cwd":"/root","session_label":"gnome"}
+ "cwd":"/root","session_label":"gnome",
+ "session":{"name":"GNOME","renderer":"screencast","exec":["gnome-shell","--headless","--virtual-monitor","{width}x{height}"],
+            "services":[["pipewire"],["wireplumber"]],"configured":true,"source":"label|override"}}
 ```
+
+`session.configured` is false (and `renderer`/`exec` null) when neither labels nor an override describe
+a graphical session.
 
 Selkie adds Android binds (`/dev`, `/proc`, `/sys`, fake proc files, `/usr/bin/droidc` → the
 `libdroidc.so` path) and runs `proot`.
 
 ## Session label
 
-`containers.droidc.session` from the image config labels (`gamescope`, `plasma`, `gnome`), recorded
-as `session_label`; `null` when absent (Bluefin LTS doesn't set it yet, so Selkie defaults GNOME
-images by name only for display).
+`containers.droidc.session` from the image config labels is the session's display name, recorded
+as `session_label` and exported as `XDG_CURRENT_DESKTOP`; `null` when absent.
 
-## `supervise` (seed of the session supervisor)
+## Graphical session
+
+droidc keeps no table of desktops. The image says how its session starts and how its pixels reach the
+host compositor (Selkie's in-app Wayland compositor, listening on `$XDG_RUNTIME_DIR/wayland-0`):
+
+| Label | Value |
+| --- | --- |
+| `containers.droidc.session.renderer` | `wayland`: the session compositor runs nested, as a Wayland client of the host compositor (KWin `--wayland-display`, cosmic-comp, gamescope, weston, sway, labwc...). `screencast`: it runs headless with a virtual monitor and exposes Mutter's `org.gnome.Mutter.ScreenCast`/`RemoteDesktop` D-Bus API (gnome-shell 49+, which has no nested mode); `droidc bridge` presents it. |
+| `containers.droidc.session.exec` | JSON argv of the session compositor. Placeholders: `{width}`, `{height}`, `{scale}`, `{wayland_display}`. |
+| `containers.droidc.session.services` | Optional JSON list of argv started first, e.g. `[["pipewire"],["wireplumber"]]`. |
+
+For example, in a Containerfile:
+
+```Dockerfile
+LABEL containers.droidc.session="GNOME" \
+      containers.droidc.session.renderer="screencast" \
+      containers.droidc.session.exec='["gnome-shell","--headless","--virtual-monitor","{width}x{height}"]' \
+      containers.droidc.session.services='[["pipewire"],["wireplumber"]]'
+LABEL containers.droidc.session="gamescope" \
+      containers.droidc.session.renderer="wayland" \
+      containers.droidc.session.exec='["gamescope","-W","{width}","-H","{height}","--","steam"]'
+```
+
+Images without the labels (Bluefin LTS today) get the same keys from `<root>/session.json`, written by
+`droidc session set --renderer R --exec JSON [--services JSON] [--name N]`; it takes precedence over the
+labels and survives upgrades. `droidc session clear` removes it.
+
+`supervise --session`, in order: runtime dir, machine-id, session bus, a **system bus** on
+`/run/dbus/system_bus_socket` (`DBUS_SYSTEM_BUS_ADDRESS`; nothing system-wide runs on it, but
+gnome-shell 50 aborts without a connection), the `services`, then by renderer:
+
+- `wayland`: `exec` with `WAYLAND_DISPLAY` = the host socket. A command given after `--` runs as an
+  extra client.
+- `screencast`: `exec` with `WAYLAND_DISPLAY` unset, then `droidc bridge --width W --height H` (or the
+  command given after `--`). The bridge waits for the ScreenCast service, records the monitor
+  (`Meta-0`, the first virtual monitor) with a linked RemoteDesktop session, reads frames from
+  `gst-launch-1.0 pipewiresrc` (the image's own PipeWire client: the static droidc can't load
+  libpipewire), presents them as one fullscreen `xdg_toplevel` over `wl_shm`, and sends the toplevel's
+  pointer, touch and key events (evdev codes) back through RemoteDesktop.
+
+The session ends when the session compositor, the bridge or the given command exits; every service
+and bus started for it is then stopped (TERM, then KILL after 3 s). Both buses are `dbus-daemon`
+when the image has it (it activates `.service` files itself, which dbus-broker can't do without
+systemd), else `dbus-broker-launch` socket-activated as below.
+
+Verified on Bluefin LTS (gnome-shell 50.0, x86_64, no GPU, unprivileged bwrap sandbox): mutter creates a
+"surfaceless renderer without GPU" (llvmpipe), extensions load, frames arrive through
+ScreenCast → PipeWire → gst, and `NotifyKeyboardKeycode` input toggles the overview.
+
+## `supervise`
 
 `droidc supervise -- cmd...` runs inside the guest: creates `XDG_RUNTIME_DIR` (0700) if needed, starts
 a session bus and exports `DBUS_SESSION_BUS_ADDRESS`, runs `cmd` as a child, reaps all children and
 exits with the command's status (the command always runs, even if no bus could be started).
-CentOS/Bluefin images ship only `dbus-broker` and `systemd --user` cannot run under proot, so droidc
-does the socket activation itself: bind+listen `$XDG_RUNTIME_DIR/bus`, spawn
-`dbus-broker-launch --scope user` with that socket as fd 3 and `LISTEN_FDS=1`,
-`LISTEN_FDNAMES=dbus.socket`, `LISTEN_PID=<broker pid>` (set by a tiny `sh -c ... exec` wrapper so the
-pid matches). Falls back to `dbus-daemon --session --fork --print-address` when present. Untested
-against a real broker inside proot (the plumbing has a unit test with a fake broker).
+`systemd --user` cannot run under proot. The bus is `dbus-daemon --nofork` (session configuration)
+when the image has it (Bluefin LTS does), kept as a child so it stops with the supervisor. Images with
+only `dbus-broker` (CentOS Stream 10 bootc) get socket activation done by droidc: bind+listen
+`$XDG_RUNTIME_DIR/bus`, spawn `dbus-broker-launch --scope user` with that socket as fd 3 and
+`LISTEN_FDS=1`, `LISTEN_FDNAMES=dbus.socket`, `LISTEN_PID=<broker pid>` (set by a tiny `sh -c ... exec`
+wrapper so the pid matches). dbus-broker forwards D-Bus activation to systemd, so on such images
+activatable services don't start.
