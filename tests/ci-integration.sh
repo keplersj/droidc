@@ -65,7 +65,8 @@ P=$(sudo "$D" --root "$ROOT_REAL" enter -- stat -L -c '%u %a' /usr/bin/passwd)
 [ "$P" = "0 4755" ] || fail "passwd after fix-ownership: $P"
 J shell-spec --launcher chroot | jq -e '[.data.launcher.warnings[] | select(test("ownership"))] | length == 0' >/dev/null \
   || fail "ownership warning after fix-ownership"
-J upgrade | jq -e '.ok == false and .error.kind == "invalid"' >/dev/null || fail "non-root upgrade should refuse"
+NR=$(J upgrade)
+echo "$NR" | jq -e '.ok == false and .error.kind == "invalid"' >/dev/null || fail "non-root upgrade should refuse: $NR"
 U=$(sudo "$D" --root "$ROOT_REAL" --json fix-ownership --undo | tail -n1)
 echo "$U" | jq -e '.ok' >/dev/null || fail "undo: $U"
 LEFT=$(sudo find "$ROOT_REAL" ! -user "$(id -u)" -print -quit)
