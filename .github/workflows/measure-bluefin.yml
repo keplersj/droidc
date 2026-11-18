@@ -82,12 +82,13 @@ jobs:
           { cat "$D/rootfs/etc/passwd"; echo "selkie:x:$(id -u):$(id -g):Selkie:/root:/bin/bash"; } > $W/passwd
           { cat "$D/rootfs/etc/group"; echo "selkie:x:$(id -g):"; } > $W/group
           set +e
-          timeout 300 bwrap --bind "$D/rootfs" / --bind "$R" "$R" --bind "$R" /run/droidc/root \
-            --bind $W/tmp /tmp --bind $W/run /run --bind $W/var /var \
+          # Bind order matters: /run first, then the root inside it.
+          timeout 300 bwrap --bind "$D/rootfs" / --bind "$R" "$R" \
+            --bind $W/tmp /tmp --bind $W/run /run --bind "$R" /run/droidc/root --bind $W/var /var \
             --ro-bind $W/passwd /etc/passwd --ro-bind $W/group /etc/group --ro-bind "$B" /usr/bin/droidc \
             --dev /dev --proc /proc --ro-bind /sys /sys --unshare-pid --die-with-parent --clearenv \
             --setenv HOME /root --setenv PATH /usr/bin:/usr/sbin --setenv DROIDC_ROOT /run/droidc/root \
-            --setenv LIBGL_ALWAYS_SOFTWARE 1 \
+            --setenv LIBGL_ALWAYS_SOFTWARE 1 --setenv PIPEWIRE_REMOTE pipewire-0-manager \
             /usr/bin/droidc supervise --session --width 1280 --height 800 -- \
             /usr/bin/droidc bridge --width 1280 --height 800 --dump-frame /tmp/gnome.png > session.log 2>&1
           echo "exit=$?"

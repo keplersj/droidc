@@ -275,7 +275,9 @@ ScreenCast → PipeWire → gst, and `NotifyKeyboardKeycode` input toggles the o
 compositor (headless build on Linux) the chain runs at about 50 fps for cursor motion at 1280x800;
 heavy GNOME animations (overview with blur) render at a few fps on llvmpipe. Requirements on the
 image for `screencast`: `gst-launch-1.0` with the PipeWire plugin, `pw-link`, and a PipeWire session
-(e.g. `services=[["pipewire"],["wireplumber"]]`).
+(e.g. `services=[["pipewire"],["wireplumber"]]`). On Android, PipeWire's Flatpak check
+(`/proc/<pid>/root`) fails for every client and restricts it to nothing, so Selkie sets
+`PIPEWIRE_REMOTE=pipewire-0-manager` (the default configuration's unrestricted socket) for the session.
 
 ## `supervise`
 
