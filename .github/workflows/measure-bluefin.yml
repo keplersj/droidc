@@ -2,11 +2,12 @@ name: measure-bluefin
 
 # Measures a real Bluefin LTS arm64 deployment on an arm64 runner: download size, unpack time,
 # size on disk and hard-link count with the Android link strategy (link2symlink), signature
-# verification, and a smoke run of os-release / flatpak inside the deployment.
+# verification, a smoke run of os-release / flatpak inside the deployment, and its GNOME session
+# headless (supervise --session + bridge --dump-frame) in an unprivileged bwrap sandbox.
 # Runs when this file changes or by hand.
 on:
   push:
-    paths: [".github/workflows/measure-bluefin.yml"]
+    paths: [".github/workflows/measure-bluefin.yml", "crates/droidc/src/supervise.rs", "crates/droidc/src/bridge.rs", "crates/droidc/src/session.rs"]
   workflow_dispatch:
     inputs:
       ref:
@@ -65,3 +66,40 @@ jobs:
           done
           { echo '```'; cat smoke.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           sudo umount "$D/rootfs$R"
+      - name: GNOME session headless (supervise --session, bridge --dump-frame, unprivileged bwrap)
+        run: |
+          sudo apt-get install -y bubblewrap python3-pil >/dev/null
+          # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          B=$PWD/target/aarch64-unknown-linux-musl/release/droidc
+          "$B" --root "$R" --json session set --renderer screencast --name GNOME \
+            --exec '["gnome-shell","--headless","--virtual-monitor","{width}x{height}"]' \
+            --services '[["pipewire"],["wireplumber"]]' | tail -1 | jq -e .ok
+          D=$(readlink -f "$R/current")
+          W=$RUNNER_TEMP/gui; mkdir -p $W/tmp $W/run/user/$(id -u) $W/var
+          chmod 700 $W/run/user/$(id -u)
+          # The app uid of Selkie is unknown to the image: add it, as Selkie does.
+          { cat "$D/rootfs/etc/passwd"; echo "selkie:x:$(id -u):$(id -g):Selkie:/root:/bin/bash"; } > $W/passwd
+          { cat "$D/rootfs/etc/group"; echo "selkie:x:$(id -g):"; } > $W/group
+          set +e
+          timeout 300 bwrap --bind "$D/rootfs" / --bind "$R" "$R" --bind "$R" /run/droidc/root \
+            --bind $W/tmp /tmp --bind $W/run /run --bind $W/var /var \
+            --ro-bind $W/passwd /etc/passwd --ro-bind $W/group /etc/group --ro-bind "$B" /usr/bin/droidc \
+            --dev /dev --proc /proc --ro-bind /sys /sys --unshare-pid --die-with-parent --clearenv \
+            --setenv HOME /root --setenv PATH /usr/bin:/usr/sbin --setenv DROIDC_ROOT /run/droidc/root \
+            --setenv LIBGL_ALWAYS_SOFTWARE 1 \
+            /usr/bin/droidc supervise --session --width 1280 --height 800 -- \
+            /usr/bin/droidc bridge --width 1280 --height 800 --dump-frame /tmp/gnome.png > session.log 2>&1
+          echo "exit=$?"
+          set -e
+          grep -E "bridge|droidc|warn" session.log | head -20 || true
+          cp $W/tmp/gnome.png gnome.png
+          python3 -c "from PIL import Image; im=Image.open('gnome.png').convert('RGB'); n=len(set(im.resize((160,100)).getdata())); print('distinct colors', n); assert n > 50, 'uniform frame'"
+          echo "- GNOME headless frame: captured (see artifact gnome-frame)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gnome-frame
+          path: |
+            gnome.png
+            session.log
