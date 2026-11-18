@@ -1,23 +1,27 @@
 //! `droidc enter -- cmd...`: run a command in the current deployment with real root instead of
 //! proot (Magisk, KernelSU, Shizuku started as root; Selkie runs this through `su`).
 //!
-//! The parent unshares mount/pid/uts/ipc namespaces, makes every mount private so nothing leaks
-//! into Android's namespace, and re-execs itself as `__enter-init`, which is PID 1 of the new pid
-//! namespace. The init dies with the parent (`PR_SET_PDEATHSIG`), and the kernel then kills
-//! everything else in the namespace. The init mounts the chroot launcher's `mounts`, then the
-//! binds, chroots, runs the command and reaps until it exits.
+//! The parent unshares a mount namespace (required) and pid/uts/ipc/cgroup namespaces (each
+//! best-effort: Android kernels may lack some), makes every mount private so nothing leaks into
+//! Android's namespace, and re-execs itself as `__enter-init`. With a pid namespace the init is its
+//! PID 1: it dies with the parent (`PR_SET_PDEATHSIG`) and the kernel then kills everything else in
+//! the namespace. Without one it is a subreaper and kills what is left when the command exits. The
+//! init mounts the chroot launcher's `mounts`, creates its `symlinks`, binds, chroots, runs the
+//! command and reaps until it exits.
 //!
 //! Every guest path is resolved with `openat2(RESOLVE_IN_ROOT)` against the rootfs, so a symlink
 //! in the image (bootc's `/home -> var/home`, or a hostile absolute one) can never make a mount
 //! land on the host. Missing mount points are created inside the rootfs.
 
 use crate::error::{Context, Error, Result};
-use crate::status::{self, Bind, Launcher, LauncherSpec, Mount};
-use rustix::fs::{mkdirat, openat, openat2, Mode, OFlags, ResolveFlags};
+use crate::status::{self, Bind, Launcher, LauncherSpec, Mount, Symlink};
+use rustix::fs::{
+    chownat, fstat, mkdirat, openat, openat2, symlinkat, AtFlags, Mode, OFlags, ResolveFlags,
+};
 use rustix::io::Errno;
 use rustix::mount::{mount, mount_bind_recursive, mount_change, MountFlags, MountPropagationFlags};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::CString;
 use std::fs;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -30,10 +34,20 @@ pub struct Plan {
     /// Canonical (`deployments/<id>/rootfs`): pins the deployment against a concurrent switch.
     pub rootfs: String,
     pub mounts: Vec<Mount>,
+    pub symlinks: Vec<Symlink>,
     pub binds: Vec<Bind>,
     pub env: BTreeMap<String, String>,
     pub cwd: String,
     pub hostname: Option<String>,
+    /// The namespaces the parent actually got (set after unshare).
+    #[serde(default)]
+    pub namespaces: Vec<String>,
+}
+
+impl Plan {
+    fn has_ns(&self, name: &str) -> bool {
+        self.namespaces.iter().any(|n| n == name)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -48,7 +62,10 @@ pub struct EnterOpts {
 pub fn plan(root_path: &Path, opts: &EnterOpts) -> Result<(Plan, Vec<String>)> {
     let spec = status::shell_spec(root_path, Launcher::Chroot)?;
     let LauncherSpec::Chroot {
-        mounts, warnings, ..
+        mounts,
+        symlinks,
+        warnings,
+        ..
     } = spec.launcher
     else {
         unreachable!("chroot spec");
@@ -77,10 +94,12 @@ pub fn plan(root_path: &Path, opts: &EnterOpts) -> Result<(Plan, Vec<String>)> {
         Plan {
             rootfs: rootfs.display().to_string(),
             mounts,
+            symlinks,
             binds,
             env,
             cwd: spec.cwd,
             hostname: opts.hostname.clone(),
+            namespaces: Vec::new(),
         },
         warnings,
     ))
@@ -96,24 +115,45 @@ pub fn enter(root_path: &Path, opts: &EnterOpts, cmd: &[String]) -> Result<i32> 
             "enter needs root (run it through su); without root use shell-spec and proot",
         ));
     }
-    let (plan, warnings) = plan(root_path, opts)?;
+    let (mut plan, warnings) = plan(root_path, opts)?;
     for w in &warnings {
         eprintln!("warn: {w}");
     }
     let exe = std::env::current_exe().context("current_exe")?;
-    let flags = rustix::thread::UnshareFlags::NEWNS
-        | rustix::thread::UnshareFlags::NEWPID
-        | rustix::thread::UnshareFlags::NEWUTS
-        | rustix::thread::UnshareFlags::NEWIPC;
-    // SAFETY: no FILES flag, so no fd table is unshared. Single-threaded here (unshare(NEWNS)
-    // would fail with EINVAL otherwise).
-    unsafe { rustix::thread::unshare_unsafe(flags) }.map_err(|e| sys("unshare", e))?;
+    use rustix::thread::{unshare_unsafe, UnshareFlags};
+    // SAFETY (all unshare calls): no FILES flag, so no fd table is unshared. Single-threaded here
+    // (unshare(NEWNS) would fail with EINVAL otherwise).
+    unsafe { unshare_unsafe(UnshareFlags::NEWNS) }
+        .map_err(|e| sys("unshare mount namespace", e))?;
+    plan.namespaces.push("mount".into());
+    for (name, flag) in [
+        ("pid", UnshareFlags::NEWPID),
+        ("uts", UnshareFlags::NEWUTS),
+        ("ipc", UnshareFlags::NEWIPC),
+        ("cgroup", UnshareFlags::NEWCGROUP),
+    ] {
+        // DROIDC_ENTER_NO_NS=pid,ipc,...: behave as if the kernel lacked them (testing).
+        let skip = std::env::var("DROIDC_ENTER_NO_NS").unwrap_or_default();
+        if skip.split(',').any(|s| s == name) {
+            eprintln!("warn: {name} namespace skipped (DROIDC_ENTER_NO_NS)");
+            continue;
+        }
+        match unsafe { unshare_unsafe(flag) } {
+            Ok(()) => plan.namespaces.push(name.into()),
+            Err(e) => eprintln!("warn: no {name} namespace: {e}"),
+        }
+    }
+    if plan.hostname.is_some() && !plan.has_ns("uts") {
+        // sethostname would rename Android itself.
+        eprintln!("warn: --hostname ignored without a uts namespace");
+        plan.hostname = None;
+    }
     mount_change(
         "/",
         MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
     )
     .map_err(|e| sys("make / rprivate", e))?;
-    // The first child after unshare(NEWPID) is PID 1 of the new namespace.
+    // With a pid namespace, the first child after unshare(NEWPID) is its PID 1.
     let mut child = Command::new(exe)
         .arg("__enter-init")
         .arg(serde_json::to_string(&plan)?)
@@ -129,11 +169,18 @@ pub fn enter(root_path: &Path, opts: &EnterOpts, cmd: &[String]) -> Result<i32> 
         .unwrap_or(1))
 }
 
-/// PID 1 of the new pid namespace.
+/// The init: PID 1 of the new pid namespace, or a subreaper without one.
 pub fn init(plan_json: &str, cmd: &[String]) -> Result<i32> {
     rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))
         .map_err(|e| sys("PR_SET_PDEATHSIG", e))?;
     let plan: Plan = serde_json::from_str(plan_json)?;
+    let pid_ns = plan.has_ns("pid");
+    if !pid_ns {
+        // Orphans reparent to us, so we can find and kill them when the command exits. If `enter`
+        // itself is SIGKILLed we die too and they are left behind: Android needs CONFIG_PID_NS.
+        rustix::process::set_child_subreaper(Some(rustix::process::getpid()))
+            .map_err(|e| sys("PR_SET_CHILD_SUBREAPER", e))?;
+    }
     let rootfd = rustix::fs::open(
         &plan.rootfs,
         OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -141,16 +188,19 @@ pub fn init(plan_json: &str, cmd: &[String]) -> Result<i32> {
     )
     .map_err(|e| sys(&plan.rootfs, e))?;
     for m in &plan.mounts {
+        if m.fstype.as_deref() == Some("cgroup2") && !plan.has_ns("cgroup") {
+            eprintln!("warn: no cgroup namespace, not mounting {}", m.guest);
+            continue;
+        }
         if let Err(e) = do_mount(&rootfd, m) {
             if !m.optional {
                 return Err(e);
             }
             eprintln!("warn: {e}");
         }
-        if m.fstype.as_deref() == Some("devpts") {
-            // /dev is the host's: point its ptmx at our devpts instance.
-            bind_ptmx(&rootfd, &format!("{}/ptmx", m.guest))?;
-        }
+    }
+    for l in &plan.symlinks {
+        make_symlink(&rootfd, &l.target, &l.guest)?;
     }
     for b in &plan.binds {
         bind_into(&rootfd, &b.host, &b.guest)?;
@@ -174,17 +224,88 @@ pub fn init(plan_json: &str, cmd: &[String]) -> Result<i32> {
                 Error::internal(format!("{}: {e}", cmd[0]))
             }
         })?;
-    // When PID 1 exits the kernel kills the rest of the namespace.
-    crate::supervise::reap_until(child.id() as i32)
+    let code = crate::supervise::reap_until(child.id() as i32)?;
+    // With a pid namespace, the kernel kills the rest when PID 1 exits.
+    if !pid_ns {
+        kill_descendants();
+    }
+    Ok(code)
 }
 
-fn bind_ptmx(rootfd: &OwnedFd, ptmx: &str) -> Result<()> {
-    let src = fd_of(rootfd, ptmx)?;
-    let dst = ensure_target(rootfd, "/dev/ptmx", false)?;
-    mount_bind_recursive(proc_fd(&src), proc_fd(&dst)).map_err(|e| sys("bind ptmx", e))
+/// SIGKILL every process below us (reading the guest's `/proc`, which is in our pid namespace)
+/// and reap them, until none is left.
+fn kill_descendants() {
+    use rustix::process::{kill_process, wait, Pid, Signal, WaitOptions};
+    let me = rustix::process::getpid().as_raw_nonzero().get();
+    for _ in 0..100 {
+        let parents = ppids();
+        let below: Vec<i32> = parents
+            .keys()
+            .copied()
+            .filter(|&p| is_descendant(&parents, p, me))
+            .collect();
+        if below.is_empty() {
+            return;
+        }
+        for p in below {
+            let _ = kill_process(Pid::from_raw(p).unwrap(), Signal::KILL);
+        }
+        while let Ok(Some(_)) = wait(WaitOptions::NOHANG) {}
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn ppids() -> HashMap<i32, i32> {
+    let mut m = HashMap::new();
+    for e in fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        if let Ok(stat) = fs::read_to_string(e.path().join("stat")) {
+            if let Some(ppid) = parse_ppid(&stat) {
+                m.insert(pid, ppid);
+            }
+        }
+    }
+    m
+}
+
+/// `ppid` from `/proc/<pid>/stat` (`pid (comm) state ppid ...`; comm may contain spaces and ')').
+fn parse_ppid(stat: &str) -> Option<i32> {
+    stat.get(stat.rfind(')')? + 1..)?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+fn is_descendant(parents: &HashMap<i32, i32>, mut p: i32, ancestor: i32) -> bool {
+    for _ in 0..4096 {
+        match parents.get(&p) {
+            Some(&pp) if pp == ancestor => return true,
+            Some(&pp) if pp > 0 && pp != p => p = pp,
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn make_symlink(rootfd: &OwnedFd, target: &str, guest: &str) -> Result<()> {
+    let (dir, name) = guest
+        .rsplit_once('/')
+        .filter(|(_, n)| !n.is_empty())
+        .ok_or_else(|| Error::invalid(format!("symlink {guest}: no file name")))?;
+    let parent = ensure_target(rootfd, if dir.is_empty() { "/" } else { dir }, true)?;
+    match symlinkat(target, parent.as_fd(), name) {
+        Ok(()) | Err(Errno::EXIST) => Ok(()),
+        Err(e) => Err(sys(&format!("symlink {guest}"), e)),
+    }
 }
 
 fn do_mount(rootfd: &OwnedFd, m: &Mount) -> Result<()> {
+    if let (None, Some(host)) = (&m.fstype, &m.bind) {
+        return bind_into(rootfd, host, &m.guest);
+    }
     let target = ensure_target(rootfd, &m.guest, true)?;
     let t = proc_fd(&target);
     match (&m.fstype, &m.bind) {
@@ -200,8 +321,7 @@ fn do_mount(rootfd: &OwnedFd, m: &Mount) -> Result<()> {
             )
             .map_err(|e| sys(&format!("mount {fstype} on {}", m.guest), e))
         }
-        (None, Some(host)) => mount_bind_recursive(host.as_str(), t.as_str())
-            .map_err(|e| sys(&format!("bind {host} on {}", m.guest), e)),
+        (None, Some(_)) => unreachable!("handled above"),
         (None, None) => Err(Error::invalid(format!(
             "mount {}: no fstype or bind",
             m.guest
@@ -287,7 +407,17 @@ fn ensure_target_at(rootfd: &OwnedFd, guest: &str, dir: bool, depth: u32) -> Res
             mkdirat(parent.as_fd(), *c, Mode::from_raw_mode(0o755))
         };
         match made {
-            Ok(()) | Err(Errno::EXIST) => {}
+            Ok(()) => {
+                // We are root but the tree belongs to the app uid, whose `gc` must be able to
+                // delete what we add: give new entries their parent's owner.
+                let st =
+                    fstat(&parent).map_err(|e| sys(&format!("stat parent of /{prefix}"), e))?;
+                let uid = rustix::process::Uid::from_raw(st.st_uid);
+                let gid = rustix::process::Gid::from_raw(st.st_gid);
+                chownat(&parent, *c, Some(uid), Some(gid), AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(|e| sys(&format!("chown /{prefix}"), e))?;
+            }
+            Err(Errno::EXIST) => {}
             Err(e) => return Err(sys(&format!("create /{prefix}"), e)),
         }
         parent = fd_of(rootfd, &prefix)?;
@@ -336,6 +466,31 @@ mod tests {
         let (f, d) = parse_options("nosuid,noexec,newinstance,ptmxmode=0666");
         assert_eq!(f, MountFlags::NOSUID | MountFlags::NOEXEC);
         assert_eq!(d, "newinstance,ptmxmode=0666");
+    }
+
+    #[test]
+    fn ppid_parsing_and_descendants() {
+        assert_eq!(parse_ppid("42 (a b) c)) S 7 42 42 0"), Some(7));
+        assert_eq!(parse_ppid("garbage"), None);
+        let m: HashMap<i32, i32> = [(10, 1), (11, 10), (12, 11), (20, 1), (1, 0)].into();
+        assert!(is_descendant(&m, 12, 10));
+        assert!(is_descendant(&m, 11, 10));
+        assert!(!is_descendant(&m, 20, 10));
+        assert!(!is_descendant(&m, 10, 10));
+        let cyc: HashMap<i32, i32> = [(5, 6), (6, 5)].into();
+        assert!(!is_descendant(&cyc, 5, 99));
+    }
+
+    #[test]
+    fn symlinks_are_created_inside_the_rootfs() {
+        let d = tempfile::tempdir().unwrap();
+        let r = open_root(d.path());
+        make_symlink(&r, "pts/ptmx", "/dev/ptmx").unwrap();
+        make_symlink(&r, "pts/ptmx", "/dev/ptmx").unwrap(); // idempotent
+        assert_eq!(
+            fs::read_link(d.path().join("dev/ptmx")).unwrap(),
+            Path::new("pts/ptmx")
+        );
     }
 
     #[test]

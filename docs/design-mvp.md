@@ -219,19 +219,28 @@ Selkie adds Android binds (`/dev`, `/proc`, `/sys`, fake proc files, `/usr/bin/d
 started as root). Selkie chooses; droidc runs as the app uid and cannot tell. `launcher` becomes:
 
 ```json
-{"kind":"chroot","requires_root":true,"namespaces":["mount","pid","uts","ipc"],
- "mounts":[{"fstype":"proc","guest":"/proc"},{"fstype":"sysfs","guest":"/sys"},
-           {"fstype":"cgroup2","guest":"/sys/fs/cgroup"},{"bind":"/dev","guest":"/dev"},
-           {"fstype":"devpts","guest":"/dev/pts","options":"newinstance,ptmxmode=0666"},
-           {"fstype":"tmpfs","guest":"/run","options":"mode=0755"},{"fstype":"tmpfs","guest":"/tmp","options":"mode=1777"}],
+{"kind":"chroot","requires_root":true,"namespaces":["mount","pid","uts","ipc","cgroup"],
+ "mounts":[{"fstype":"proc","guest":"/proc","options":"nosuid,nodev,noexec"},
+           {"fstype":"sysfs","guest":"/sys","options":"ro,nosuid,nodev,noexec"},
+           {"fstype":"cgroup2","guest":"/sys/fs/cgroup","options":"...","optional":true},
+           {"fstype":"tmpfs","guest":"/dev","options":"nosuid,mode=0755"},
+           {"bind":"/dev/null","guest":"/dev/null"}, ...zero, full, random, urandom, tty,
+           {"fstype":"devpts","guest":"/dev/pts","options":"nosuid,noexec,newinstance,ptmxmode=0666,mode=0620"},
+           {"fstype":"tmpfs","guest":"/dev/shm",...},{"fstype":"tmpfs","guest":"/run",...},{"fstype":"tmpfs","guest":"/tmp",...}],
+ "symlinks":[{"target":"pts/ptmx","guest":"/dev/ptmx"},{"target":"/proc/self/fd","guest":"/dev/fd"}, ...stdin, stdout, stderr],
  "warnings":["..."]}
 ```
 
-The launcher unshares `namespaces`, mounts `mounts` then `binds` under `rootfs`, chroots and execs.
-A link2symlink deployment gets one more bind, the canonical `<root>` at the same path in the guest,
-so its absolute chains resolve without proot. `warnings` flags a link2symlink deployment and a rootfs
-whose `/usr` is not owned by uid 0 (ownership from `metadata.jsonl.zst` not applied), in which case
-setuid binaries and ownership checks fail.
+The launcher unshares `namespaces` (`mount` required, the rest best-effort), mounts `mounts`, creates
+`symlinks`, binds `binds` under `rootfs`, chroots and execs. `options` are fstab style: `ro`,
+`nosuid`, `nodev`, `noexec` are flags, the rest is filesystem data. `/dev` is a private tmpfs with
+only harmless host nodes, so the guest never sees Android's block devices or binder; Selkie adds GPU,
+input, fuse and tun nodes with `--bind`. cgroup2 is mounted only inside a cgroup namespace (the guest
+sees its own subtree, never Android's whole tree), otherwise skipped. A link2symlink deployment gets
+one more bind, the canonical `<root>` at the same path in the guest, so its absolute chains resolve
+without proot. `warnings` flags a link2symlink deployment and a rootfs whose `/usr` is not owned by
+uid 0 (ownership from `metadata.jsonl.zst` not applied), in which case setuid binaries and ownership
+checks fail.
 
 ## `enter` (root launcher)
 
@@ -242,21 +251,29 @@ the exit status is the command's (128+signal if it was killed).
 
 1. Refuse unless euid is 0. Print the spec's `warnings` to stderr.
 2. Canonicalize `rootfs` (pins `deployments/<id>` against a concurrent switch), add `--bind`/`--env`.
-3. `unshare(mount|pid|uts|ipc)`, make `/` recursively private (nothing reaches Android's namespace),
-   re-exec itself as the hidden `__enter-init <plan-json> -- cmd`, which is PID 1 of the new pid
-   namespace, and wait for it.
-4. Init: `PR_SET_PDEATHSIG(SIGKILL)` (killing `enter` kills init, and the kernel then kills the
-   whole namespace); mounts, then binds; for devpts, bind its `ptmx` over `/dev/ptmx`; hostname;
-   `chroot`, `chdir(cwd)` (else `/`); run cmd with exactly the spec env; reap all children until cmd
-   exits.
+3. `unshare` the mount namespace (required), then pid, uts, ipc and cgroup one at a time, warning
+   about each the kernel lacks (Android configs often have no SysV IPC). `--hostname` is dropped
+   without a uts namespace (it would rename Android). Make `/` recursively private (nothing reaches
+   Android's namespace), re-exec itself as the hidden `__enter-init <plan-json> -- cmd`, and wait.
+4. Init: `PR_SET_PDEATHSIG(SIGKILL)`. With a pid namespace it is PID 1, and when it exits or is
+   killed with `enter`, the kernel kills the whole namespace. Without one it is a
+   `PR_SET_CHILD_SUBREAPER` and SIGKILLs every remaining descendant when cmd exits; if `enter` itself
+   is SIGKILLed, guest processes are left behind, so Android kernels need `CONFIG_PID_NS`.
+5. Mounts, symlinks, binds; hostname; `chroot`, `chdir(cwd)` (else `/`); run cmd with exactly the
+   spec env; reap all children until cmd exits.
 
 Every guest path is resolved with `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)` against the
 rootfs and mounted through `/proc/self/fd/N`, so image symlinks (bootc's `/home -> var/home`, or a
 hostile absolute or `..` one) can never put a mount on the host. Missing mount points are created
-inside the rootfs (directories, or an empty file when the source is a file); a dangling symlink is
-followed inside the rootfs and its target created. A failing `optional` mount (cgroup2) is a warning.
+inside the rootfs (directories, or an empty file when the source is a file) and chowned to their
+parent directory's owner, so the app-uid `gc` can still delete the deployment; a dangling symlink is
+followed inside the rootfs and its target created. A failing `optional` mount is a warning.
 
-With Magisk, su's default mount namespace mode (inherit) is fine: the app's view includes `<root>`.
+`DROIDC_ENTER_NO_NS=pid,ipc,...` skips those namespaces as if the kernel lacked them (testing).
+
+Unverified on Android: the link2symlink self-bind assumes `<root>` canonicalizes to the same path in
+su's mount namespace as in the app's when the chains were written (Magisk's namespace modes and
+Android's app data isolation may differ). If not, the record needs the canonical root used at unpack.
 
 ## Session label
 

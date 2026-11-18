@@ -82,6 +82,13 @@ pub struct Mount {
     pub optional: bool,
 }
 
+/// A symlink created at `guest` (after the mounts) pointing at `target`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Symlink {
+    pub target: String,
+    pub guest: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum LauncherSpec {
@@ -92,9 +99,11 @@ pub enum LauncherSpec {
     },
     Chroot {
         requires_root: bool,
+        /// `mount` is required; the others are best-effort (Android kernels may lack some).
         namespaces: Vec<String>,
         /// Mounted inside the new mount namespace before the binds; guest paths are in `rootfs`.
         mounts: Vec<Mount>,
+        symlinks: Vec<Symlink>,
         warnings: Vec<String>,
     },
 }
@@ -131,29 +140,59 @@ fn fs_mount(fstype: &str, guest: &str, options: &str) -> Mount {
     }
 }
 
+fn bind_mount(host: &str) -> Mount {
+    Mount {
+        fstype: None,
+        bind: Some(host.into()),
+        guest: host.into(),
+        options: None,
+        optional: false,
+    }
+}
+
+/// A private `/dev` (tmpfs) with only the harmless host nodes: the guest never sees Android's
+/// block devices or binder. Selkie adds GPU, input, fuse and tun nodes with `--bind`.
 pub fn chroot_mounts() -> Vec<Mount> {
-    vec![
+    let mut m = vec![
         fs_mount("proc", "/proc", "nosuid,nodev,noexec"),
         fs_mount("sysfs", "/sys", "ro,nosuid,nodev,noexec"),
+        // Only mounted inside a cgroup namespace, never Android's whole tree.
         Mount {
             optional: true,
             ..fs_mount("cgroup2", "/sys/fs/cgroup", "nosuid,nodev,noexec")
         },
-        Mount {
-            fstype: None,
-            bind: Some("/dev".into()),
-            guest: "/dev".into(),
-            options: None,
-            optional: false,
-        },
+        fs_mount("tmpfs", "/dev", "nosuid,mode=0755"),
+    ];
+    m.extend(
+        ["null", "zero", "full", "random", "urandom", "tty"]
+            .map(|n| bind_mount(&format!("/dev/{n}"))),
+    );
+    m.extend([
         fs_mount(
             "devpts",
             "/dev/pts",
-            "nosuid,noexec,newinstance,ptmxmode=0666",
+            "nosuid,noexec,newinstance,ptmxmode=0666,mode=0620",
         ),
+        fs_mount("tmpfs", "/dev/shm", "nosuid,nodev,mode=1777"),
         fs_mount("tmpfs", "/run", "nosuid,nodev,mode=0755"),
         fs_mount("tmpfs", "/tmp", "nosuid,nodev,mode=1777"),
+    ]);
+    m
+}
+
+pub fn chroot_symlinks() -> Vec<Symlink> {
+    [
+        ("pts/ptmx", "/dev/ptmx"),
+        ("/proc/self/fd", "/dev/fd"),
+        ("/proc/self/fd/0", "/dev/stdin"),
+        ("/proc/self/fd/1", "/dev/stdout"),
+        ("/proc/self/fd/2", "/dev/stderr"),
     ]
+    .map(|(t, g)| Symlink {
+        target: t.into(),
+        guest: g.into(),
+    })
+    .to_vec()
 }
 
 pub fn shell_spec(root_path: &Path, launcher: Launcher) -> Result<ShellSpec> {
@@ -196,8 +235,11 @@ pub fn shell_spec(root_path: &Path, launcher: Launcher) -> Result<ShellSpec> {
             }
             LauncherSpec::Chroot {
                 requires_root: true,
-                namespaces: ["mount", "pid", "uts", "ipc"].map(String::from).to_vec(),
+                namespaces: ["mount", "pid", "uts", "ipc", "cgroup"]
+                    .map(String::from)
+                    .to_vec(),
                 mounts: chroot_mounts(),
+                symlinks: chroot_symlinks(),
                 warnings,
             }
         }

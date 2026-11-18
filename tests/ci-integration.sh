@@ -43,9 +43,14 @@ J shell-spec | jq -e '.ok and (.data.binds | length == 3)' >/dev/null || fail "s
 
 echo "== enter (root: namespaces + chroot, link2symlink chains via the root self-bind)"
 J shell-spec --launcher chroot | jq -e '.ok and .data.launcher.kind == "chroot" and (.data.binds | length == 4)' >/dev/null || fail "shell-spec chroot"
-OUT=$(sudo "$D" --root "$ROOT_REAL" enter --env FOO=bar -- /bin/sh -c 'echo "pid=$$ foo=$FOO"; cat /etc/os-release; ls /run/droidc/root/deployments')
+OUT=$(sudo "$D" --root "$ROOT_REAL" enter --env FOO=bar -- /bin/sh -c 'echo "pid=$$ foo=$FOO"; cat /etc/os-release; ls /run/droidc/root/deployments; echo "ptmx=$(readlink /dev/ptmx) cg=$(cat /proc/self/cgroup)"; ls /dev')
 echo "$OUT" | grep -q 'pid=2 foo=bar' || fail "enter pid/env: $OUT"
 echo "$OUT" | grep -q 'CentOS Stream' || fail "enter os-release"
+echo "$OUT" | grep -qx 'ptmx=pts/ptmx cg=0::/' || fail "enter /dev/ptmx or cgroup namespace: $OUT"
+! echo "$OUT" | grep -qE '^(sd[a-z]|nvme|loop|kmsg|mem)' || fail "enter: host /dev leaked: $OUT"
+# without a pid namespace, init kills what the command left behind
+sudo env DROIDC_ENTER_NO_NS=pid "$D" --root "$ROOT_REAL" enter -- /bin/sh -c '(setsid sleep 4245 &); exit 0'
+pgrep -x sleep -a | grep -q 4245 && fail "enter left a process behind without a pid namespace"
 sudo "$D" --root "$ROOT_REAL" enter -- /usr/bin/true || fail "enter true (link2symlink binary)"
 RC=0; sudo "$D" --root "$ROOT_REAL" enter -- /bin/sh -c 'exit 3' || RC=$?
 [ "$RC" = 3 ] || fail "enter exit status $RC"
