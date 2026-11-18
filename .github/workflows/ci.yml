@@ -25,6 +25,7 @@ jobs:
           BIN=$(cargo test -p droidc --lib --no-run --message-format=json \
             | jq -r 'select(.executable != null and .target.kind[0] == "lib") | .executable' | tail -1)
           sudo "$BIN" --exact deploy::tests::fix_ownership_then_undo_as_root
+          sudo "$BIN" --exact deploy::tests::apply_ownership_applies_once_as_root
 
   build:
     strategy:

@@ -147,6 +147,7 @@ locally → keep local; deleted locally → stays deleted. First deployment: liv
 ```
 droidc [--root DIR] [--json] [--dns IPS] <command>
   switch <ref> [--insecure-allow-unsigned] [--platform os/arch] [--links auto|hardlink|link2symlink|copy]
+         [--apply-ownership]    (root) fix-ownership the deployment it activates
   upgrade                       re-pull current ref; no-op if digest unchanged
   rollback                      swap current and previous
   status                        current, previous, staged
@@ -168,7 +169,7 @@ droidc [--root DIR] [--json] [--dns IPS] <command>
 Every line is one object with an `event` field. Human text goes to stderr.
 
 ```json
-{"event":"progress","phase":"resolve|download|verify|unpack|etc-merge|deploy|gc","current":123,"total":456,"unit":"bytes|files|layers","message":"layer 3/68"}
+{"event":"progress","phase":"resolve|download|verify|unpack|etc-merge|deploy|ownership|gc","current":123,"total":456,"unit":"bytes|files|layers","message":"layer 3/68"}
 {"event":"log","level":"info|warn|error","message":"..."}
 {"event":"result","ok":true,"data":{...}}
 {"event":"result","ok":false,"error":{"kind":"network|signature|storage|not-found|invalid|locked|internal","message":"..."}}
@@ -294,7 +295,12 @@ skipped:{reason: n}}` (the `l2s chain does not resolve` count shows a canonical 
 From then on the root is root-only: every mutating command (`switch`, `upgrade`, `rollback`, `gc`)
 run without root refuses up front with kind `invalid` (etcmerge cannot read a `0000` /etc/shadow, gc
 could not delete root-owned trees), and `shell-spec --launcher chroot` drops its ownership warning.
-New deployments made by a root `switch` need `fix-ownership` again. `--undo` lchowns everything under
+`switch --apply-ownership` (root; refused before any download otherwise) does the same for the
+deployment it activates, right after activation (`<root>/var` is seeded by then) and before gc;
+when the image is already current it applies it if not yet applied, so it is idempotent. Its result
+gets `"ownership": <report>|null` (null: not requested or already applied). `upgrade` keeps the
+current deployment's mode: image-owned in, image-owned out. A root `switch` without the flag while
+other deployments are image-owned warns. `--undo` lchowns everything under
 the root (all deployments, `var`, `home`, blobs) to the owner of the root directory, sets directories
 `| 0o700` and files `| 0o600` without setuid/setgid/sticky, drops `security.capability`, never
 follows symlinks, and clears `ownership` in every record: proot and non-root commands work again.

@@ -15,6 +15,7 @@
 
 use crate::deploy::{open_root, write_record};
 use crate::error::{Error, Result};
+use crate::layout::Root;
 use crate::record::OWNERSHIP_IMAGE;
 use crate::unpack::read_metadata;
 use base64::Engine;
@@ -30,7 +31,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
-fn require_root(what: &str) -> Result<()> {
+pub(crate) fn require_root(what: &str) -> Result<()> {
     if rustix::process::geteuid().is_root() {
         Ok(())
     } else {
@@ -195,7 +196,13 @@ pub fn fix(root_path: &Path, l2s_prefix: &str) -> Result<Value> {
     let id = root
         .current_id()
         .ok_or_else(|| Error::not_found("no current deployment"))?;
-    let dep = root.deployment(&id);
+    apply_image(&root, &id, l2s_prefix)
+}
+
+/// Apply the image's ownership to deployment `id` (lock held by the caller, `<root>/var` already
+/// seeded) and mark its record.
+pub(crate) fn apply_image(root: &Root, id: &str, l2s_prefix: &str) -> Result<Value> {
+    let dep = root.deployment(id);
     let rows = read_metadata(&dep.join("metadata.jsonl.zst"))?;
     let rootfs = open_dir(&dep.join("rootfs"))?;
     let var = open_dir(&root.var())?;
@@ -245,7 +252,7 @@ pub fn fix(root_path: &Path, l2s_prefix: &str) -> Result<Value> {
             }
         }
     }
-    let mut rec = root.read_record(&id)?;
+    let mut rec = root.read_record(id)?;
     rec.ownership = Some(OWNERSHIP_IMAGE.into());
     write_record(&dep.join("deployment.json"), &rec)?;
     Ok(json!({

@@ -94,6 +94,17 @@ echo "== gc"
 G=$(J gc); echo "$G" | jq -e '.ok' >/dev/null || fail "gc"
 test -d "$ROOT/deployments/$ID1" -a -d "$ROOT/deployments/$ID2" || fail "gc removed a kept deployment"
 
+echo "== switch --apply-ownership (root, activates the present stream9 deployment), upgrade keeps it"
+A=$(sudo "$D" --root "$ROOT_REAL" --json switch quay.io/centos-bootc/centos-bootc:stream9 --insecure-allow-unsigned --links link2symlink --apply-ownership | tail -n1)
+echo "$A" | jq -e --arg id "$ID2" '.ok and .data.changed and .data.id == $id and .data.ownership.ownership == "image" and .data.deployment.ownership == "image"' >/dev/null \
+  || fail "switch --apply-ownership: $A"
+P=$(sudo "$D" --root "$ROOT_REAL" enter -- stat -c '%u %a' /usr/bin/passwd)
+[ "$P" = "0 4755" ] || fail "passwd after switch --apply-ownership: $P"
+UP=$(sudo "$D" --root "$ROOT_REAL" --json upgrade | tail -n1)
+echo "$UP" | jq -e '.ok and .data.changed == false and .data.ownership == null and .data.deployment.ownership == "image"' >/dev/null \
+  || fail "root upgrade of an image-owned deployment: $UP"
+sudo "$D" --root "$ROOT_REAL" --json fix-ownership --undo | tail -n1 | jq -e .ok >/dev/null || fail "final undo"
+
 echo "== last line of every command is a result"
 tail -n1 "$ROOT.log" | jq -e '.event == "result"' >/dev/null || fail "last line"
 echo "OK"

@@ -31,6 +31,9 @@ pub struct SwitchOpts {
     pub l2s_prefix: String,
     /// Resolve and verify the signature only; change nothing.
     pub verify_only: bool,
+    /// (root) Apply the image's uid/gid/mode/xattrs to the deployment it activates, as
+    /// `fix-ownership` does.
+    pub apply_ownership: bool,
 }
 
 impl SwitchOpts {
@@ -43,6 +46,7 @@ impl SwitchOpts {
             http: HttpConfig::default(),
             l2s_prefix: DEFAULT_L2S_PREFIX.into(),
             verify_only: false,
+            apply_ownership: false,
         }
     }
 }
@@ -460,6 +464,12 @@ pub fn switch(root_path: &Path, em: &Emitter, opts: &SwitchOpts) -> Result<Value
 }
 
 pub fn switch_locked(root: &Root, em: &Emitter, opts: &SwitchOpts) -> Result<Value> {
+    if opts.apply_ownership {
+        // Before any download.
+        crate::ownership::require_root("--apply-ownership")?;
+    } else if rustix::process::geteuid().is_root() && has_image_owned(root) {
+        em.warn("other deployments have image ownership; pass --apply-ownership to keep this one consistent");
+    }
     let reg = Registry::new(&opts.http)?;
     let plat = match &opts.platform {
         Some(p) => p.clone(),
@@ -506,9 +516,11 @@ pub fn switch_locked(root: &Root, em: &Emitter, opts: &SwitchOpts) -> Result<Val
     }
 
     if root.current_id().as_deref() == Some(id.as_str()) {
+        // Idempotent: `switch --apply-ownership` on the current image still applies it once.
+        let own = apply_ownership_if_needed(root, em, opts, &id)?;
         let rec = root.read_record(&id).ok();
         return Ok(
-            json!({"changed": false, "id": id, "manifest_digest": res.manifest_digest, "deployment": rec}),
+            json!({"changed": false, "id": id, "manifest_digest": res.manifest_digest, "deployment": rec, "ownership": own}),
         );
     }
 
@@ -558,8 +570,50 @@ pub fn switch_locked(root: &Root, em: &Emitter, opts: &SwitchOpts) -> Result<Val
             },
         )?
     };
+    // After activation: `<root>/var` is seeded by then, and its rows need it.
+    let own = apply_ownership_if_needed(root, em, opts, &id)?;
+    let rec = if own.is_null() {
+        rec
+    } else {
+        root.read_record(&id)?
+    };
     let g = gc_locked(root, em)?;
-    Ok(json!({"changed": true, "id": id, "previous": prev, "deployment": rec, "gc": g}))
+    Ok(
+        json!({"changed": true, "id": id, "previous": prev, "deployment": rec, "gc": g, "ownership": own}),
+    )
+}
+
+fn has_image_owned(root: &Root) -> bool {
+    fs::read_dir(root.deployments())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| root.read_record(&e.file_name().to_string_lossy()).ok())
+        .any(|r| r.ownership.as_deref() == Some(crate::record::OWNERSHIP_IMAGE))
+}
+
+/// The `fix-ownership` report, or null when not requested or already applied.
+fn apply_ownership_if_needed(
+    root: &Root,
+    em: &Emitter,
+    opts: &SwitchOpts,
+    id: &str,
+) -> Result<Value> {
+    if !opts.apply_ownership
+        || root.read_record(id)?.ownership.as_deref() == Some(crate::record::OWNERSHIP_IMAGE)
+    {
+        return Ok(Value::Null);
+    }
+    em.progress("ownership", 0, 1, "files", "applying image ownership");
+    let r = crate::ownership::apply_image(root, id, &opts.l2s_prefix)?;
+    em.progress(
+        "ownership",
+        1,
+        1,
+        "files",
+        &format!("applied to {} paths", r["applied"]),
+    );
+    Ok(r)
 }
 
 pub fn upgrade(
@@ -582,6 +636,8 @@ pub fn upgrade(
         http,
         l2s_prefix: l2s_prefix.into(),
         verify_only: false,
+        // Keep the root's mode: an image-owned current deployment upgrades to an image-owned one.
+        apply_ownership: rec.ownership.as_deref() == Some(crate::record::OWNERSHIP_IMAGE),
     };
     switch_locked(&root, em, &opts)
 }
@@ -1169,6 +1225,50 @@ mod tests {
         assert!(root.deployment("aaaa").is_dir());
         // read-only commands still work
         crate::status::status(&root.path).unwrap();
+    }
+
+    #[test]
+    fn apply_ownership_needs_root_before_any_network() {
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let (_d, root, _ld) = setup();
+        let (em, _) = capture();
+        let mut o = SwitchOpts::new("registry.invalid/never/fetched:latest");
+        o.apply_ownership = true;
+        let e = switch_locked(&root, &em, &o).unwrap_err();
+        assert_eq!(e.kind, crate::error::ErrorKind::Invalid, "{}", e.message);
+        assert!(e.message.contains("root"), "{}", e.message);
+    }
+
+    /// Runs only as root, like `fix_ownership_then_undo_as_root`.
+    #[test]
+    fn apply_ownership_applies_once_as_root() {
+        use std::os::unix::fs::MetadataExt;
+        if !rustix::process::geteuid().is_root() {
+            eprintln!("skipped: needs root");
+            return;
+        }
+        let (_d, root, ld) = setup();
+        let (em, _) = capture();
+        let layers = vec![Layer::new()
+            .dir_as("usr/", 0o755, 0, 0)
+            .dir_as("usr/bin/", 0o755, 0, 0)
+            .file_as("usr/bin/su", 0o4755, 0, 0, b"su")
+            .bytes()];
+        do_install(&root, &ld, "aaaa", layers, LinkKind::Copy);
+        root.set_link("current", "aaaa").unwrap();
+        let mut o = SwitchOpts::new("test/aaaa:latest");
+        let skipped = apply_ownership_if_needed(&root, &em, &o, "aaaa").unwrap();
+        assert!(skipped.is_null(), "not requested");
+        o.apply_ownership = true;
+        let r = apply_ownership_if_needed(&root, &em, &o, "aaaa").unwrap();
+        assert_eq!(r["ownership"], "image");
+        let su = root.deployment("aaaa").join("rootfs/usr/bin/su");
+        assert_eq!(fs::metadata(&su).unwrap().mode() & 0o7777, 0o4755);
+        assert!(apply_ownership_if_needed(&root, &em, &o, "aaaa")
+            .unwrap()
+            .is_null());
     }
 
     #[test]

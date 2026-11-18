@@ -48,6 +48,9 @@ enum Cmd {
         /// Resolve and verify the signature only; download and change nothing
         #[arg(long)]
         verify_only: bool,
+        /// (root) Apply the image's uid/gid/mode/xattrs, as fix-ownership does
+        #[arg(long)]
+        apply_ownership: bool,
     },
     /// Re-resolve the current ref; no-op if the digest is unchanged
     Upgrade,
@@ -265,6 +268,7 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
             platform,
             links,
             verify_only,
+            apply_ownership,
         } => {
             let mut o = SwitchOpts::new(reference);
             o.insecure = *insecure_allow_unsigned;
@@ -274,6 +278,7 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
             o.http = http;
             o.l2s_prefix = l2s;
             o.verify_only = *verify_only;
+            o.apply_ownership = *apply_ownership;
             Ok(("switch", deploy::switch(&root, em, &o)?))
         }
         Cmd::Upgrade => Ok(("upgrade", deploy::upgrade(&root, em, http, &l2s)?)),

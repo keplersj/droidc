@@ -53,6 +53,7 @@ droidc session set --renderer screencast --exec '["gnome-shell","--headless","--
   --services '[["pipewire"],["wireplumber"]]' --name GNOME   # for images without session labels
 sudo droidc --root ~/droidc enter -- bash -l   # with root: namespaces + chroot instead of proot
 sudo droidc --root ~/droidc fix-ownership [--undo]   # apply the image's owners/setuid (root only from then on)
+sudo droidc --root ~/droidc switch <ref> --apply-ownership   # same, for the deployment switch activates
 ```
 
 `--root`/`DROIDC_ROOT`, `--dns`/`DROIDC_DNS` (comma separated IPs; else `/etc/resolv.conf`, else
