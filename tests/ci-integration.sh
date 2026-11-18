@@ -63,9 +63,13 @@ echo "$F" | jq -c '.data | {applied, via_l2s, xattr_errors, skipped}'
 echo "$F" | jq -e '.ok and .data.applied > 1000 and .data.via_l2s > 1000' >/dev/null || fail "fix-ownership: $F"
 P=$(sudo "$D" --root "$ROOT_REAL" enter -- stat -L -c '%u %a' /usr/bin/passwd)
 [ "$P" = "0 4755" ] || fail "passwd after fix-ownership: $P"
+# root commands hand droidc's own files back to the root's owner
+for f in lock policy.json "deployments/$ID1/deployment.json" blobs; do
+  [ "$(stat -c %u "$ROOT_REAL/$f")" = "$(id -u)" ] || fail "$f not handed back after a root command"
+done
 J shell-spec --launcher chroot | jq -e '[.data.launcher.warnings[] | select(test("ownership"))] | length == 0' >/dev/null \
   || fail "ownership warning after fix-ownership"
-NR=$(J upgrade)
+NR=$(J upgrade || true)   # droidc exits 1 when it refuses (pipefail)
 echo "$NR" | jq -e '.ok == false and .error.kind == "invalid"' >/dev/null || fail "non-root upgrade should refuse: $NR"
 U=$(sudo "$D" --root "$ROOT_REAL" --json fix-ownership --undo | tail -n1)
 echo "$U" | jq -e '.ok' >/dev/null || fail "undo: $U"

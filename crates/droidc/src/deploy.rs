@@ -51,12 +51,118 @@ impl SwitchOpts {
     }
 }
 
+/// The root lock, plus (when droidc runs as root) handing back what the command created: see
+/// [`hand_back`]. Runs before the lock is released.
+pub(crate) struct RootGuard {
+    root: Root,
+    _lock: RootLock,
+}
+
+impl Drop for RootGuard {
+    fn drop(&mut self) {
+        if rustix::process::geteuid().is_root() {
+            if let Err(e) = hand_back(&self.root) {
+                eprintln!("warn: could not hand the root back to its owner: {e}");
+            }
+        }
+    }
+}
+
+/// Give everything under the root that belongs to uid 0 to the owner of the root directory (the
+/// app uid), so non-root commands and proot keep working after a command ran through su: the lock,
+/// policy.json, blobs, staging, records, and deployments made by a root `switch` without
+/// `--apply-ownership`. Left alone: the `rootfs` of image-owned deployments, and `var`/`home` while
+/// any deployment is image-owned (they carry image and guest owners then). Nothing to do when the
+/// root directory itself belongs to root. Never follows symlinks. Returns the entries changed.
+pub(crate) fn hand_back(root: &Root) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let md = fs::metadata(&root.path).context(root.path.display())?;
+    if md.uid() == 0 {
+        return Ok(0);
+    }
+    let owner = (
+        rustix::process::Uid::from_raw(md.uid()),
+        rustix::process::Gid::from_raw(md.gid()),
+    );
+    let image: HashSet<String> = fs::read_dir(root.deployments())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|id| {
+            root.read_record(id)
+                .is_ok_and(|r| r.ownership.as_deref() == Some(crate::record::OWNERSHIP_IMAGE))
+        })
+        .collect();
+    let mut n = 0;
+    for e in fs::read_dir(&root.path)?.flatten() {
+        let p = e.path();
+        let name = e.file_name().to_string_lossy().into_owned();
+        match name.as_str() {
+            "var" | "home" if !image.is_empty() => {}
+            "deployments" => {
+                give_root_entries(&p, owner, &mut n, false)?;
+                for d in fs::read_dir(&p)?.flatten() {
+                    let id = d.file_name().to_string_lossy().into_owned();
+                    if image.contains(&id) {
+                        give_root_entries(&d.path(), owner, &mut n, false)?;
+                        for f in fs::read_dir(d.path())?.flatten() {
+                            if f.file_name() != "rootfs" {
+                                give_root_entries(&f.path(), owner, &mut n, true)?;
+                            }
+                        }
+                    } else {
+                        give_root_entries(&d.path(), owner, &mut n, true)?;
+                    }
+                }
+            }
+            _ => give_root_entries(&p, owner, &mut n, true)?,
+        }
+    }
+    Ok(n)
+}
+
+/// lchown `p` (and with `recurse`, everything below it) to `owner` where it belongs to uid 0.
+fn give_root_entries(
+    p: &Path,
+    owner: (rustix::process::Uid, rustix::process::Gid),
+    n: &mut u64,
+    recurse: bool,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let md = match fs::symlink_metadata(p) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(Error::from(e)),
+    };
+    if md.uid() == 0 {
+        rustix::fs::chownat(
+            rustix::fs::CWD,
+            p,
+            Some(owner.0),
+            Some(owner.1),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|e| Error::internal(format!("chown {}: {e}", p.display())))?;
+        *n += 1;
+    }
+    if recurse && md.is_dir() {
+        for e in fs::read_dir(p)?.flatten() {
+            give_root_entries(&e.path(), owner, n, true)?;
+        }
+    }
+    Ok(())
+}
+
 /// Create the root (if needed), canonicalize it and take the lock.
-pub(crate) fn open_root(path: &Path) -> Result<(Root, RootLock)> {
+pub(crate) fn open_root(path: &Path) -> Result<(Root, RootGuard)> {
     fs::create_dir_all(path).context(path.display())?;
     let canon = fs::canonicalize(path).context(path.display())?;
     let root = Root::new(canon);
-    let lock = RootLock::acquire(&root)?;
+    let lock = RootGuard {
+        root: root.clone(),
+        _lock: RootLock::acquire(&root)?,
+    };
     if !rustix::process::geteuid().is_root() {
         refuse_image_owned(&root)?;
     }
@@ -1269,6 +1375,73 @@ mod tests {
         assert!(apply_ownership_if_needed(&root, &em, &o, "aaaa")
             .unwrap()
             .is_null());
+    }
+
+    /// Runs only as root, like `fix_ownership_then_undo_as_root`.
+    #[test]
+    fn root_commands_hand_back_what_they_create() {
+        use std::os::unix::fs::MetadataExt;
+        if !rustix::process::geteuid().is_root() {
+            eprintln!("skipped: needs root");
+            return;
+        }
+        let uid = |p: &Path| fs::symlink_metadata(p).unwrap().uid();
+        let (em, _) = capture();
+        // 1. a fresh root the app created: everything droidc adds as root is handed back
+        let d = tempfile::tempdir().unwrap();
+        let rp = d.path().canonicalize().unwrap().join("root");
+        fs::create_dir(&rp).unwrap();
+        std::os::unix::fs::chown(&rp, Some(1000), Some(1000)).unwrap();
+        gc(&rp, &em).unwrap();
+        for p in [
+            "lock",
+            "policy.json",
+            "blobs",
+            "blobs/tmp",
+            "deployments",
+            "staging",
+            "var",
+            "home/root",
+        ] {
+            assert_eq!(uid(&rp.join(p)), 1000, "{p}");
+        }
+        // 2. a deployment made as root without --apply-ownership is handed back too
+        let root = Root::new(&rp);
+        let ld = d.path().join("layers");
+        fs::create_dir(&ld).unwrap();
+        let layers = vec![Layer::new()
+            .dir_as("usr/", 0o755, 0, 0)
+            .dir_as("usr/bin/", 0o755, 0, 0)
+            .file_as("usr/bin/su", 0o4755, 0, 0, b"su")
+            .dir("var/", 0o755)
+            .dir_as("var/lib/", 0o700, 0, 0)
+            .bytes()];
+        do_install(&root, &ld, "aaaa", layers, LinkKind::Copy);
+        root.set_link("current", "aaaa").unwrap();
+        let su = root.deployment("aaaa").join("rootfs/usr/bin/su");
+        assert_eq!(uid(&su), 0, "made as root");
+        gc(&rp, &em).unwrap();
+        assert_eq!(uid(&su), 1000);
+        assert_eq!(uid(&root.current_link()), 1000);
+        // 3. image-owned: rootfs keeps image owners, droidc's own files are handed back, var too
+        crate::ownership::fix(&rp, ".l2s.").unwrap();
+        assert_eq!(uid(&su), 0);
+        assert_eq!(uid(&root.deployment("aaaa").join("deployment.json")), 1000);
+        assert_eq!(
+            uid(&root.var().join("lib")),
+            0,
+            "var keeps image owners in image mode"
+        );
+        fs::write(root.blobs().join("made-as-root"), "").unwrap();
+        gc(&rp, &em).unwrap();
+        assert_eq!(uid(&su), 0);
+        assert_eq!(uid(&root.var().join("lib")), 0);
+        // (gc removed the unreferenced blob; the blobs dir itself stays the app's)
+        assert_eq!(uid(&root.blobs()), 1000);
+        // 4. a root directory that belongs to root: nothing to hand back to
+        std::os::unix::fs::chown(&rp, Some(0), Some(0)).unwrap();
+        assert_eq!(hand_back(&root).unwrap(), 0);
+        crate::ownership::undo(&rp).unwrap_err();
     }
 
     #[test]

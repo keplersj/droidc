@@ -244,6 +244,16 @@ without proot. `warnings` flags a link2symlink deployment and a rootfs whose `/u
 uid 0 (ownership from `metadata.jsonl.zst` not applied), in which case setuid binaries and ownership
 checks fail.
 
+## Running droidc as root
+
+Selkie creates `<root>` as the app before running anything through su. Every command that takes the
+root lock, when run as root, hands back on exit (before releasing the lock) every entry under
+`<root>` that belongs to uid 0 to the owner of `<root>`: the lock, `policy.json`, blobs, staging,
+records, and deployments a root `switch` made without `--apply-ownership`, so non-root commands and
+proot keep working. Left alone: the `rootfs` of image-owned deployments, and `var`/`home` while any
+deployment is image-owned. Nothing happens when `<root>` itself belongs to root. Symlinks are never
+followed.
+
 ## `enter` (root launcher)
 
 `droidc enter -- cmd...` is the `chroot` launcher above, done by droidc so Selkie only runs
