@@ -68,7 +68,7 @@ jobs:
           sudo umount "$D/rootfs$R"
       - name: GNOME session headless (supervise --session, bridge --dump-frame, unprivileged bwrap)
         run: |
-          sudo apt-get install -y bubblewrap python3-pil >/dev/null
+          sudo apt-get update -qq && sudo apt-get install -y bubblewrap python3-pil >/dev/null
           # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           B=$PWD/target/aarch64-unknown-linux-musl/release/droidc
