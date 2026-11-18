@@ -416,6 +416,9 @@ fn ensure_target_at(rootfd: &OwnedFd, guest: &str, dir: bool, depth: u32) -> Res
                 let gid = rustix::process::Gid::from_raw(st.st_gid);
                 chownat(&parent, *c, Some(uid), Some(gid), AtFlags::SYMLINK_NOFOLLOW)
                     .map_err(|e| sys(&format!("chown /{prefix}"), e))?;
+                let dir = proc_fd(&parent);
+                let label = crate::fsutil::selinux_label(Path::new(&dir), true);
+                crate::fsutil::inherit_selinux_label(&Path::new(&dir).join(c), label.as_deref());
             }
             Err(Errno::EXIST) => {}
             Err(e) => return Err(sys(&format!("create /{prefix}"), e)),

@@ -80,10 +80,11 @@ pub(crate) fn hand_back(root: &Root) -> Result<u64> {
     if md.uid() == 0 {
         return Ok(0);
     }
-    let owner = (
-        rustix::process::Uid::from_raw(md.uid()),
-        rustix::process::Gid::from_raw(md.gid()),
-    );
+    let owner = Owner {
+        uid: rustix::process::Uid::from_raw(md.uid()),
+        gid: rustix::process::Gid::from_raw(md.gid()),
+        label: fsutil::selinux_label(&root.path, false),
+    };
     let image: HashSet<String> = fs::read_dir(root.deployments())
         .into_iter()
         .flatten()
@@ -101,34 +102,37 @@ pub(crate) fn hand_back(root: &Root) -> Result<u64> {
         match name.as_str() {
             "var" | "home" if !image.is_empty() => {}
             "deployments" => {
-                give_root_entries(&p, owner, &mut n, false)?;
+                give_root_entries(&p, &owner, &mut n, false)?;
                 for d in fs::read_dir(&p)?.flatten() {
                     let id = d.file_name().to_string_lossy().into_owned();
                     if image.contains(&id) {
-                        give_root_entries(&d.path(), owner, &mut n, false)?;
+                        give_root_entries(&d.path(), &owner, &mut n, false)?;
                         for f in fs::read_dir(d.path())?.flatten() {
                             if f.file_name() != "rootfs" {
-                                give_root_entries(&f.path(), owner, &mut n, true)?;
+                                give_root_entries(&f.path(), &owner, &mut n, true)?;
                             }
                         }
                     } else {
-                        give_root_entries(&d.path(), owner, &mut n, true)?;
+                        give_root_entries(&d.path(), &owner, &mut n, true)?;
                     }
                 }
             }
-            _ => give_root_entries(&p, owner, &mut n, true)?,
+            _ => give_root_entries(&p, &owner, &mut n, true)?,
         }
     }
     Ok(n)
 }
 
-/// lchown `p` (and with `recurse`, everything below it) to `owner` where it belongs to uid 0.
-fn give_root_entries(
-    p: &Path,
-    owner: (rustix::process::Uid, rustix::process::Gid),
-    n: &mut u64,
-    recurse: bool,
-) -> Result<()> {
+/// The root directory's owner and SELinux label: what everything droidc creates should carry.
+struct Owner {
+    uid: rustix::process::Uid,
+    gid: rustix::process::Gid,
+    label: Option<Vec<u8>>,
+}
+
+/// lchown `p` (and with `recurse`, everything below it) to `owner` where it belongs to uid 0, and
+/// give it the root's SELinux label.
+fn give_root_entries(p: &Path, owner: &Owner, n: &mut u64, recurse: bool) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let md = match fs::symlink_metadata(p) {
         Ok(m) => m,
@@ -139,11 +143,12 @@ fn give_root_entries(
         rustix::fs::chownat(
             rustix::fs::CWD,
             p,
-            Some(owner.0),
-            Some(owner.1),
+            Some(owner.uid),
+            Some(owner.gid),
             rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
         )
         .map_err(|e| Error::internal(format!("chown {}: {e}", p.display())))?;
+        fsutil::inherit_selinux_label(p, owner.label.as_deref());
         *n += 1;
     }
     if recurse && md.is_dir() {

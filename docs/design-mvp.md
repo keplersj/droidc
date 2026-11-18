@@ -252,7 +252,10 @@ root lock, when run as root, hands back on exit (before releasing the lock) ever
 records, and deployments a root `switch` made without `--apply-ownership`, so non-root commands and
 proot keep working. Left alone: the `rootfs` of image-owned deployments, and `var`/`home` while any
 deployment is image-owned. Nothing happens when `<root>` itself belongs to root. Symlinks are never
-followed.
+followed. Each entry handed back also gets `<root>`'s SELinux label (`security.selinux`), as do the
+entries `fix-ownership --undo` walks and the mount points `enter` creates (from their parent): on
+Android a file a su process creates in app storage carries that process's MLS level instead of the
+app's categories, and the app could read but not write, rename or delete it.
 
 ## `enter` (root launcher)
 

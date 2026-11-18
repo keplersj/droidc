@@ -294,7 +294,8 @@ pub fn undo(root_path: &Path) -> Result<Value> {
     }
     let (uid, gid) = (Uid::from_raw(md.uid()), Gid::from_raw(md.gid()));
     let mut entries = 0u64;
-    walk_undo(&root.path, uid, gid, &mut entries)?;
+    let label = crate::fsutil::selinux_label(&root.path, false);
+    walk_undo(&root.path, uid, gid, label.as_deref(), &mut entries)?;
     let mut ids = Vec::new();
     for e in fs::read_dir(root.deployments())?.flatten() {
         let id = e.file_name().to_string_lossy().into_owned();
@@ -308,19 +309,21 @@ pub fn undo(root_path: &Path) -> Result<Value> {
     Ok(json!({"entries": entries, "deployments": ids, "uid": md.uid(), "gid": md.gid()}))
 }
 
-/// lchown every entry to the app uid; directories `| 0o700`, regular files `| 0o600`, both without
-/// setuid/setgid/sticky; drop `security.capability`. Never follows symlinks.
-fn walk_undo(p: &Path, uid: Uid, gid: Gid, n: &mut u64) -> Result<()> {
+/// lchown every entry to the app uid and give it the root's SELinux label; directories `| 0o700`,
+/// regular files `| 0o600`, both without setuid/setgid/sticky; drop `security.capability`. Never
+/// follows symlinks.
+fn walk_undo(p: &Path, uid: Uid, gid: Gid, label: Option<&[u8]>, n: &mut u64) -> Result<()> {
     let md = fs::symlink_metadata(p)?;
     let cwd = rustix::fs::CWD;
     chownat(cwd, p, Some(uid), Some(gid), AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|e| Error::internal(format!("chown {}: {e}", p.display())))?;
+    crate::fsutil::inherit_selinux_label(p, label);
     *n += 1;
     let ft = md.file_type();
     if ft.is_dir() {
         fs::set_permissions(p, fs::Permissions::from_mode((md.mode() & 0o777) | 0o700))?;
         for e in fs::read_dir(p)? {
-            walk_undo(&e?.path(), uid, gid, n)?;
+            walk_undo(&e?.path(), uid, gid, label, n)?;
         }
     } else if ft.is_file() {
         fs::set_permissions(p, fs::Permissions::from_mode((md.mode() & 0o777) | 0o600))?;
