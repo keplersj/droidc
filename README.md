@@ -51,6 +51,7 @@ droidc supervise --systemd=on -- bash -l   # run the image's own systemd --user 
 droidc supervise --session --width 1920 --height 1200   # inside the guest: the graphical session
 droidc session set --renderer screencast --exec '["gnome-shell","--headless","--virtual-monitor","{width}x{height}"]' \
   --services '[["pipewire"],["wireplumber"]]' --name GNOME   # for images without session labels
+sudo droidc --root ~/droidc enter -- bash -l   # with root: namespaces + chroot instead of proot
 ```
 
 `--root`/`DROIDC_ROOT`, `--dns`/`DROIDC_DNS` (comma separated IPs; else `/etc/resolv.conf`, else
@@ -72,7 +73,8 @@ Try a deployment under proot: `proot -r <root>/current/rootfs -w / /usr/bin/cat 
   `oci-client` because we need the custom resolver/CA/proxy setup, raw manifest bytes and
   hash-while-streaming resumable downloads (see the module comment in `registry.rs`).
 - `tar` layer parsing, `flate2` gzip (pure-Rust backend), `zstd` zstd layers and the metadata file.
-- `rustix` uname, statvfs, flock, wait, dup2 without libc.
+- `rustix` uname, statvfs, flock, wait, dup2, and for `enter` unshare, mount, openat2, chroot,
+  without libc.
 - `zbus` (blocking) D-Bus client for `droidc bridge` (Mutter ScreenCast/RemoteDesktop).
 - `wayland-client` (pure Rust backend) + `wayland-protocols` (xdg-shell): `droidc bridge` as a
   Wayland client of the host compositor.

@@ -10,19 +10,13 @@ mkdir -p "$(dirname "$ROOT")"; : > "$ROOT.log"
 ROOT_REAL=$(readlink -f "$ROOT")
 
 # Run a command inside the current deployment. proot first (what Selkie uses; Ubuntu's 5.1.0 is not
-# reliable on GitHub runners), else sudo chroot with the root bind-mounted at its own absolute path
-# so the absolute host paths inside link2symlink chains resolve.
+# reliable on GitHub runners), else `droidc enter` as root (namespaces + chroot, what Selkie uses with
+# root).
 run_in() {
   if [ "${USE_CHROOT:-0}" != 1 ] && PROOT_NO_SECCOMP=1 proot -r "$ROOT/current/rootfs" -w / "$@"; then return 0; fi
-  echo "(proot failed, using chroot fallback)" >&2
+  echo "(proot failed, using droidc enter)" >&2
   USE_CHROOT=1
-  local rf; rf=$(readlink -f "$ROOT/current/rootfs")
-  sudo mkdir -p "$rf/var/home"   # bootc images have /home -> var/home (dangling until var is bound)
-  sudo mkdir -p "$rf$ROOT_REAL"
-  sudo mount --bind "$ROOT_REAL" "$rf$ROOT_REAL"
-  local rc=0; sudo chroot "$rf" "$@" || rc=$?
-  sudo umount "$rf$ROOT_REAL"
-  return $rc
+  sudo "$D" --root "$ROOT_REAL" enter -- "$@"
 }
 
 echo "== platform"; "$D" --json platform | tail -n1
@@ -46,6 +40,16 @@ run_in /usr/bin/true || fail "proot true (hard-linked binary)"
 
 echo "== shell-spec"
 J shell-spec | jq -e '.ok and (.data.binds | length == 3)' >/dev/null || fail "shell-spec"
+
+echo "== enter (root: namespaces + chroot, link2symlink chains via the root self-bind)"
+J shell-spec --launcher chroot | jq -e '.ok and .data.launcher.kind == "chroot" and (.data.binds | length == 4)' >/dev/null || fail "shell-spec chroot"
+OUT=$(sudo "$D" --root "$ROOT_REAL" enter --env FOO=bar -- /bin/sh -c 'echo "pid=$$ foo=$FOO"; cat /etc/os-release; ls /run/droidc/root/deployments')
+echo "$OUT" | grep -q 'pid=2 foo=bar' || fail "enter pid/env: $OUT"
+echo "$OUT" | grep -q 'CentOS Stream' || fail "enter os-release"
+sudo "$D" --root "$ROOT_REAL" enter -- /usr/bin/true || fail "enter true (link2symlink binary)"
+RC=0; sudo "$D" --root "$ROOT_REAL" enter -- /bin/sh -c 'exit 3' || RC=$?
+[ "$RC" = 3 ] || fail "enter exit status $RC"
+[ -z "$(findmnt -rn -o TARGET | grep -F "$ROOT_REAL/" || true)" ] || fail "enter leaked mounts"
 
 echo "== upgrade is a no-op"
 J upgrade | jq -e '.ok and .data.changed == false' >/dev/null || fail "upgrade no-op"

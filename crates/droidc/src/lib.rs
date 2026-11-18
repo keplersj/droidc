@@ -2,6 +2,7 @@
 pub mod bridge;
 pub mod cgroups;
 pub mod deploy;
+pub mod enter;
 pub mod error;
 pub mod etcmerge;
 pub mod events;

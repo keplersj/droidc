@@ -153,6 +153,7 @@ droidc [--root DIR] [--json] [--dns IPS] <command>
   gc
   shell-spec [--launcher proot|chroot]  how to enter the current deployment (rootfs, binds, env, cwd)
   platform                      detected platform
+  enter [--bind H:G] [--env K=V] [--hostname N] -- <cmd...>   (as root) run cmd in the deployment
   supervise -- <cmd...>         (inside the guest) start session services, dbus first, then cmd
   supervise --session [--width W --height H --scale S] [-- cmd...]
                                 (inside the guest) start the graphical session, see "Graphical session"
@@ -231,6 +232,31 @@ A link2symlink deployment gets one more bind, the canonical `<root>` at the same
 so its absolute chains resolve without proot. `warnings` flags a link2symlink deployment and a rootfs
 whose `/usr` is not owned by uid 0 (ownership from `metadata.jsonl.zst` not applied), in which case
 setuid binaries and ownership checks fail.
+
+## `enter` (root launcher)
+
+`droidc enter -- cmd...` is the `chroot` launcher above, done by droidc so Selkie only runs
+`su -c '<libdroidc.so> --root <root> enter --bind <libdroidc-guest.so>:/usr/bin/droidc -- droidc supervise -- bash -l'`.
+Not NDJSON: stdio belongs to the command; droidc's own errors go to stderr with exit 127, otherwise
+the exit status is the command's (128+signal if it was killed).
+
+1. Refuse unless euid is 0. Print the spec's `warnings` to stderr.
+2. Canonicalize `rootfs` (pins `deployments/<id>` against a concurrent switch), add `--bind`/`--env`.
+3. `unshare(mount|pid|uts|ipc)`, make `/` recursively private (nothing reaches Android's namespace),
+   re-exec itself as the hidden `__enter-init <plan-json> -- cmd`, which is PID 1 of the new pid
+   namespace, and wait for it.
+4. Init: `PR_SET_PDEATHSIG(SIGKILL)` (killing `enter` kills init, and the kernel then kills the
+   whole namespace); mounts, then binds; for devpts, bind its `ptmx` over `/dev/ptmx`; hostname;
+   `chroot`, `chdir(cwd)` (else `/`); run cmd with exactly the spec env; reap all children until cmd
+   exits.
+
+Every guest path is resolved with `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)` against the
+rootfs and mounted through `/proc/self/fd/N`, so image symlinks (bootc's `/home -> var/home`, or a
+hostile absolute or `..` one) can never put a mount on the host. Missing mount points are created
+inside the rootfs (directories, or an empty file when the source is a file); a dangling symlink is
+followed inside the rootfs and its target created. A failing `optional` mount (cgroup2) is a warning.
+
+With Magisk, su's default mount namespace mode (inherit) is fine: the app's view includes `<root>`.
 
 ## Session label
 

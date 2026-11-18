@@ -1050,6 +1050,23 @@ fn stop_all(pids: &[u32], grace: Duration) {
 
 /// `wait` in [`wait_for_any`] reaps any child of the process, so tests that run a supervisor must not
 /// overlap with tests that spawn and wait for their own children.
+/// Reap every child (orphans included) until `pid` exits; its exit code, or 128+signal.
+pub(crate) fn reap_until(pid: i32) -> Result<i32> {
+    loop {
+        match rustix::process::wait(rustix::process::WaitOptions::empty()) {
+            Ok(Some((p, st))) if p.as_raw_nonzero().get() == pid => {
+                return Ok(st
+                    .exit_status()
+                    .or_else(|| st.terminating_signal().map(|s| 128 + s))
+                    .unwrap_or(1));
+            }
+            Ok(_) => {}
+            Err(e) if e == rustix::io::Errno::INTR => {}
+            Err(e) => return Err(Error::internal(format!("wait: {e}"))),
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) static CHILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

@@ -7,7 +7,7 @@ use droidc::link::{LinkKind, DEFAULT_L2S_PREFIX};
 use droidc::platform::Platform;
 use droidc::registry::HttpConfig;
 use droidc::session::{self, Renderer, SessionSpec};
-use droidc::{bridge, logcat, login1, status, supervise};
+use droidc::{bridge, enter, logcat, login1, status, supervise};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -65,6 +65,27 @@ enum Cmd {
     },
     /// Detected platform
     Platform,
+    /// (as root) run a command in the current deployment: namespaces + chroot, no proot
+    Enter {
+        /// Extra bind after the deployment's, HOST:/GUEST (repeatable)
+        #[arg(long = "bind", value_name = "HOST:GUEST")]
+        binds: Vec<String>,
+        /// Extra environment, KEY=VALUE (repeatable)
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Hostname in the new UTS namespace
+        #[arg(long)]
+        hostname: Option<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        cmd: Vec<String>,
+    },
+    /// PID 1 of `enter`'s namespace (internal)
+    #[command(name = "__enter-init", hide = true)]
+    EnterInit {
+        plan: String,
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
     /// (inside the guest) start session services, then run a command or the graphical session
     Supervise {
         /// Start the deployment's graphical session (see `droidc session`)
@@ -256,43 +277,70 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
         Cmd::ShellSpec { launcher } => {
             let l = status::Launcher::parse(launcher)
                 .ok_or_else(|| Error::invalid(format!("unknown --launcher '{launcher}'")))?;
-            Ok(("shell-spec", status::shell_spec(&root, l)?))
+            Ok((
+                "shell-spec",
+                serde_json::to_value(status::shell_spec(&root, l)?)?,
+            ))
         }
         Cmd::Platform => Ok(("platform", serde_json::to_value(Platform::detect()?)?)),
         Cmd::Session { action } => Ok(("session", session_cmd(&root, action)?)),
-        Cmd::Supervise { .. } | Cmd::Bridge { .. } | Cmd::Login1 | Cmd::Log { .. } => {
-            unreachable!()
-        }
+        Cmd::Supervise { .. }
+        | Cmd::Bridge { .. }
+        | Cmd::Login1
+        | Cmd::Log { .. }
+        | Cmd::Enter { .. }
+        | Cmd::EnterInit { .. } => unreachable!(),
     }
 }
 
 fn main() {
     let cli = Cli::parse();
-    if let Cmd::Supervise {
-        session,
-        width,
-        height,
-        scale,
-        systemd,
-        cmd,
-    } = &cli.cmd
-    {
-        let opts = supervise::Opts {
-            session: session.then(|| supervise::SessionOpts {
-                root: cli.root.clone().unwrap_or_else(default_root),
-                params: session::Params {
-                    width: *width,
-                    height: *height,
-                    scale: *scale,
-                    ..Default::default()
-                },
-            }),
-            systemd: *systemd,
-        };
-        match supervise::supervise_with(cmd, &opts) {
+    // These own stdio (it belongs to the command they run): no NDJSON, errors on stderr, exit 127.
+    let direct = match &cli.cmd {
+        Cmd::Supervise {
+            session,
+            width,
+            height,
+            scale,
+            systemd,
+            cmd,
+        } => {
+            let opts = supervise::Opts {
+                session: session.then(|| supervise::SessionOpts {
+                    root: cli.root.clone().unwrap_or_else(default_root),
+                    params: session::Params {
+                        width: *width,
+                        height: *height,
+                        scale: *scale,
+                        ..Default::default()
+                    },
+                }),
+                systemd: *systemd,
+            };
+            Some(("supervise", supervise::supervise_with(cmd, &opts)))
+        }
+        Cmd::Enter {
+            binds,
+            env,
+            hostname,
+            cmd,
+        } => {
+            let opts = enter::EnterOpts {
+                binds: binds.clone(),
+                env: env.clone(),
+                hostname: hostname.clone(),
+            };
+            let root = cli.root.clone().unwrap_or_else(default_root);
+            Some(("enter", enter::enter(&root, &opts, cmd)))
+        }
+        Cmd::EnterInit { plan, cmd } => Some(("enter", enter::init(plan, cmd))),
+        _ => None,
+    };
+    if let Some((name, r)) = direct {
+        match r {
             Ok(code) => std::process::exit(code),
             Err(e) => {
-                eprintln!("droidc supervise: {e}");
+                eprintln!("droidc {name}: {e}");
                 std::process::exit(127);
             }
         }

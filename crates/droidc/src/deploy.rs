@@ -950,7 +950,9 @@ mod tests {
         assert_eq!(s["current"]["id"], "aaaa");
         assert!(s["previous"].is_null());
         assert!(s["staged"].is_null());
-        let sp = crate::status::shell_spec(&root.path, Launcher::Proot).unwrap();
+        let sp =
+            serde_json::to_value(crate::status::shell_spec(&root.path, Launcher::Proot).unwrap())
+                .unwrap();
         assert_eq!(sp["session_label"], "gnome");
         assert_eq!(sp["launcher"]["kind"], "proot");
         assert_eq!(sp["launcher"]["link2symlink"], false);
@@ -976,7 +978,9 @@ mod tests {
     fn chroot_shell_spec_binds_root_for_link2symlink() {
         let (_d, root, ld) = setup();
         do_install(&root, &ld, "aaaa", image("A", "x"), LinkKind::Link2Symlink);
-        let sp = crate::status::shell_spec(&root.path, Launcher::Chroot).unwrap();
+        let sp =
+            serde_json::to_value(crate::status::shell_spec(&root.path, Launcher::Chroot).unwrap())
+                .unwrap();
         let l = &sp["launcher"];
         assert_eq!(l["kind"], "chroot");
         assert_eq!(l["requires_root"], true);
@@ -992,6 +996,44 @@ mod tests {
         assert_eq!(binds[3]["guest"], canon.as_str());
         // unpacked without root: ownership warning, plus the link2symlink one
         assert_eq!(l["warnings"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn enter_plan_pins_deployment_and_applies_extras() {
+        use crate::enter::{plan, EnterOpts};
+        let (_d, root, ld) = setup();
+        do_install(&root, &ld, "aaaa", image("A", "x"), LinkKind::Copy);
+        let o = EnterOpts {
+            binds: vec!["/data/app/x/libdroidc-guest.so:/usr/bin/droidc".into()],
+            env: vec!["TERM=dumb".into(), "WAYLAND_DISPLAY=wayland-0".into()],
+            hostname: Some("selkie".into()),
+        };
+        let (p, _warnings) = plan(&root.path, &o).unwrap();
+        let canon = fs::canonicalize(&root.path).unwrap();
+        assert_eq!(
+            p.rootfs,
+            canon.join("deployments/aaaa/rootfs").display().to_string()
+        );
+        assert_eq!(p.binds.last().unwrap().guest, "/usr/bin/droidc");
+        assert_eq!(p.env["TERM"], "dumb");
+        assert_eq!(p.env["WAYLAND_DISPLAY"], "wayland-0");
+        assert_eq!(p.env["HOME"], "/root");
+        assert!(p
+            .mounts
+            .iter()
+            .any(|m| m.fstype.as_deref() == Some("devpts")));
+        for bad in ["nocolon", ":/x", "/host:relative"] {
+            let o = EnterOpts {
+                binds: vec![bad.into()],
+                ..Default::default()
+            };
+            assert!(plan(&root.path, &o).is_err(), "{bad}");
+        }
+        let o = EnterOpts {
+            env: vec!["NOEQUALS".into()],
+            ..Default::default()
+        };
+        assert!(plan(&root.path, &o).is_err());
     }
 
     #[test]

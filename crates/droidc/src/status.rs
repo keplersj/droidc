@@ -4,7 +4,9 @@
 use crate::error::{Context, Error, Result};
 use crate::layout::Root;
 use crate::platform::Platform;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -58,7 +60,103 @@ impl Launcher {
     }
 }
 
-pub fn shell_spec(root_path: &Path, launcher: Launcher) -> Result<Value> {
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Bind {
+    pub host: String,
+    pub guest: String,
+}
+
+/// A filesystem to mount under the rootfs (`fstype`) or a host path to bind recursively (`bind`).
+/// `options` is fstab style: `ro,nosuid,nodev,noexec` become mount flags, the rest is fs data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Mount {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fstype: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<String>,
+    pub guest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<String>,
+    /// Failure is a warning, not an error.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum LauncherSpec {
+    Proot {
+        requires_root: bool,
+        /// The deployment contains link2symlink chains; proot must run with --link2symlink.
+        link2symlink: bool,
+    },
+    Chroot {
+        requires_root: bool,
+        namespaces: Vec<String>,
+        /// Mounted inside the new mount namespace before the binds; guest paths are in `rootfs`.
+        mounts: Vec<Mount>,
+        warnings: Vec<String>,
+    },
+}
+
+/// What `supervise --systemd` needs on top of the deployment's binds.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SystemdSpec {
+    /// Bound after `/sys`: the writable cgroup stand-in.
+    pub binds: Vec<Bind>,
+    /// Where the LD_PRELOAD cgroup shim (built for the guest's glibc) is placed in the guest.
+    pub shim: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ShellSpec {
+    pub rootfs: String,
+    pub binds: Vec<Bind>,
+    pub systemd: SystemdSpec,
+    pub env: BTreeMap<String, String>,
+    pub cwd: String,
+    pub session_label: Option<String>,
+    /// The graphical session (see `session::describe`).
+    pub session: Value,
+    pub launcher: LauncherSpec,
+}
+
+fn fs_mount(fstype: &str, guest: &str, options: &str) -> Mount {
+    Mount {
+        fstype: Some(fstype.into()),
+        bind: None,
+        guest: guest.into(),
+        options: Some(options.into()),
+        optional: false,
+    }
+}
+
+pub fn chroot_mounts() -> Vec<Mount> {
+    vec![
+        fs_mount("proc", "/proc", "nosuid,nodev,noexec"),
+        fs_mount("sysfs", "/sys", "ro,nosuid,nodev,noexec"),
+        Mount {
+            optional: true,
+            ..fs_mount("cgroup2", "/sys/fs/cgroup", "nosuid,nodev,noexec")
+        },
+        Mount {
+            fstype: None,
+            bind: Some("/dev".into()),
+            guest: "/dev".into(),
+            options: None,
+            optional: false,
+        },
+        fs_mount(
+            "devpts",
+            "/dev/pts",
+            "nosuid,noexec,newinstance,ptmxmode=0666",
+        ),
+        fs_mount("tmpfs", "/run", "nosuid,nodev,mode=0755"),
+        fs_mount("tmpfs", "/tmp", "nosuid,nodev,mode=1777"),
+    ]
+}
+
+pub fn shell_spec(root_path: &Path, launcher: Launcher) -> Result<ShellSpec> {
     let root = Root::new(root_path);
     let cur = root
         .current_id()
@@ -68,18 +166,20 @@ pub fn shell_spec(root_path: &Path, launcher: Launcher) -> Result<Value> {
     let r = abs.display().to_string();
     let rootfs = format!("{r}/current/rootfs");
     let link2symlink = record.stats.link_strategy_used.contains("link2symlink");
+    let bind = |host: String, guest: &str| Bind {
+        host,
+        guest: guest.into(),
+    };
     let mut binds = vec![
-        json!({"host": format!("{r}/var"), "guest": "/var"}),
-        json!({"host": format!("{r}/home"), "guest": "/home"}),
-        json!({"host": r, "guest": "/run/droidc/root"}),
+        bind(format!("{r}/var"), "/var"),
+        bind(format!("{r}/home"), "/home"),
+        bind(r.clone(), "/run/droidc/root"),
     ];
     let launcher = match launcher {
-        Launcher::Proot => json!({
-            "kind": "proot",
-            "requires_root": false,
-            // The deployment contains link2symlink chains; proot must run with --link2symlink.
-            "link2symlink": link2symlink,
-        }),
+        Launcher::Proot => LauncherSpec::Proot {
+            requires_root: false,
+            link2symlink,
+        },
         Launcher::Chroot => {
             let mut warnings = Vec::new();
             if link2symlink {
@@ -88,55 +188,47 @@ pub fn shell_spec(root_path: &Path, launcher: Launcher) -> Result<Value> {
                 // (they still look like symlinks to lstat, not hard links).
                 let canon = fs::canonicalize(root_path).context(root_path.display())?;
                 let c = canon.display().to_string();
-                binds.push(json!({"host": c, "guest": c}));
-                warnings.push("deployment uses link2symlink; redeploy with --links hardlink as root for real hard links");
+                binds.push(bind(c.clone(), &c));
+                warnings.push("deployment uses link2symlink; redeploy with --links hardlink as root for real hard links".into());
             }
             if !owned_by_root(Path::new(&rootfs)) {
-                warnings.push("ownership not applied: files belong to the app uid, so setuid binaries (sudo, su, pkexec) and ownership checks (sshd, polkit) will fail");
+                warnings.push("ownership not applied: files belong to the app uid, so setuid binaries (sudo, su, pkexec) and ownership checks (sshd, polkit) will fail".into());
             }
-            json!({
-                "kind": "chroot",
-                "requires_root": true,
-                "namespaces": ["mount", "pid", "uts", "ipc"],
-                // Mounted inside the new mount namespace, after the chroot target is known and
-                // before the binds; guest paths are relative to `rootfs`.
-                "mounts": [
-                    {"fstype": "proc", "guest": "/proc"},
-                    {"fstype": "sysfs", "guest": "/sys"},
-                    {"fstype": "cgroup2", "guest": "/sys/fs/cgroup"},
-                    {"bind": "/dev", "guest": "/dev"},
-                    {"fstype": "devpts", "guest": "/dev/pts", "options": "newinstance,ptmxmode=0666"},
-                    {"fstype": "tmpfs", "guest": "/run", "options": "mode=0755"},
-                    {"fstype": "tmpfs", "guest": "/tmp", "options": "mode=1777"},
-                ],
-                "warnings": warnings,
-            })
+            LauncherSpec::Chroot {
+                requires_root: true,
+                namespaces: ["mount", "pid", "uts", "ipc"].map(String::from).to_vec(),
+                mounts: chroot_mounts(),
+                warnings,
+            }
         }
     };
-    Ok(json!({
-        "rootfs": rootfs,
-        "binds": binds,
+    let env = [
+        ("DROIDC_ROOT", "/run/droidc/root"),
+        ("HOME", "/root"),
+        ("PATH", DEFAULT_PATH),
+        ("TERM", "xterm-256color"),
+        ("LANG", "C.UTF-8"),
+    ]
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .into();
+    Ok(ShellSpec {
+        rootfs,
+        binds,
         // Only for `supervise --systemd`: the cgroup stand-in must be bound after `/sys`, and the
         // LD_PRELOAD library (built for the guest's glibc) placed at `shim`.
-        "systemd": {
-            "binds": [{"host": format!("{r}/cgroup"), "guest": "/sys/fs/cgroup"}],
-            "shim": "/usr/lib/droidc/cgshim.so",
+        systemd: SystemdSpec {
+            binds: vec![bind(format!("{r}/cgroup"), "/sys/fs/cgroup")],
+            shim: "/usr/lib/droidc/cgshim.so".into(),
         },
-        "env": {
-            "DROIDC_ROOT": "/run/droidc/root",
-            "HOME": "/root",
-            "PATH": DEFAULT_PATH,
-            "TERM": "xterm-256color",
-            "LANG": "C.UTF-8",
-        },
-        "cwd": "/root",
-        "session_label": record.session_label,
-        "session": crate::session::describe(
+        env,
+        cwd: "/root".into(),
+        session: crate::session::describe(
             &crate::session::resolve(root_path)?,
             record.session_label.as_deref(),
         ),
-        "launcher": launcher,
-    }))
+        session_label: record.session_label,
+        launcher,
+    })
 }
 
 /// Whether unpack applied image ownership (it does not without root: everything is the app uid).
