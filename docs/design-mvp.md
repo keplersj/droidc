@@ -258,6 +258,12 @@ gnome-shell 50 aborts without a connection), the `services`, then by renderer:
   link a stream to a stream (`target-object` fails with "target not found"), presents them as one fullscreen `xdg_toplevel` over `wl_shm`, and sends the toplevel's
   pointer, touch and key events (evdev codes) back through RemoteDesktop.
 
+The buses start without the host's `WAYLAND_DISPLAY` and with `XDG_SESSION_TYPE`/`XDG_CURRENT_DESKTOP`
+already set; once the session compositor's own `wayland-N` socket appears, droidc passes it to
+`UpdateActivationEnvironment`, so D-Bus-activated apps open in the session, not on the host compositor.
+A bus socket that already has a live listener (a terminal's supervisor next to the desktop) is shared,
+never replaced.
+
 The session ends when the session compositor, the bridge or the given command exits; every service
 and bus started for it is then stopped (TERM, then KILL after 3 s). Both buses are `dbus-daemon`
 when the image has it (it activates `.service` files itself, which dbus-broker can't do without
