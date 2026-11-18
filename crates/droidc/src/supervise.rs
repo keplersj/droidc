@@ -14,6 +14,8 @@ use crate::session::{self, Renderer, SessionSpec};
 use std::fs;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
+#[cfg(test)]
+use std::os::unix::net::UnixStream;
 use std::os::unix::net::{UnixDatagram, UnixListener};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -55,6 +57,7 @@ fn start_dbus(socket: &std::path::Path, bin: &std::path::Path) -> Result<(String
         fs::create_dir_all(parent).context(parent.display())?;
     }
     let mut child = Command::new(bin)
+        .env_remove("WAYLAND_DISPLAY")
         .arg("--config-file=/usr/share/dbus-1/session.conf")
         .arg(format!("--address=unix:path={}", socket.display()))
         .arg("--nofork")
@@ -88,6 +91,12 @@ fn start_dbus(socket: &std::path::Path, bin: &std::path::Path) -> Result<(String
 /// A bus on `socket`, exported as `var`. `dbus-daemon` first: it activates `.service` files itself,
 /// while `dbus-broker-launch` hands activation to systemd, which can't run here. Best effort.
 fn start_bus(socket: &std::path::Path, scope: &str, var: &str) -> Option<Child> {
+    // Another supervisor (a terminal next to the desktop) may own a live bus here: share it rather
+    // than replacing the socket under its clients.
+    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+        std::env::set_var(var, format!("unix:path={}", socket.display()));
+        return None;
+    }
     let started = if let Some(bin) = find_in_path("dbus-daemon") {
         start_dbus(socket, &bin)
     } else {
@@ -188,6 +197,7 @@ fn start_broker(
         .arg("LISTEN_PID=$$; export LISTEN_PID; exec \"$0\" \"$@\"")
         .arg(bin)
         .args(args)
+        .env_remove("WAYLAND_DISPLAY")
         .env("LISTEN_FDS", "1")
         .env("LISTEN_FDNAMES", "dbus.socket")
         .stdin(Stdio::null());
@@ -273,6 +283,14 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
     if let Err(e) = ensure_machine_id(std::path::Path::new(MACHINE_ID)) {
         eprintln!("warn: could not initialise {MACHINE_ID}: {e}");
     }
+    // Before the buses start: activated services inherit the bus's environment.
+    if let Some(spec) = &spec {
+        std::env::set_var("XDG_SESSION_TYPE", "wayland");
+        if let Some(n) = &spec.name {
+            std::env::set_var("XDG_CURRENT_DESKTOP", n);
+            std::env::set_var("XDG_SESSION_DESKTOP", n.to_lowercase());
+        }
+    }
     // Long-running helpers (buses, session services), stopped when the session ends.
     let mut background: Vec<Child> = Vec::new();
     if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
@@ -333,11 +351,6 @@ fn start_session(
         wayland_display: host_display.clone(),
         ..params.clone()
     };
-    std::env::set_var("XDG_SESSION_TYPE", "wayland");
-    if let Some(n) = &spec.name {
-        std::env::set_var("XDG_CURRENT_DESKTOP", n);
-        std::env::set_var("XDG_SESSION_DESKTOP", n.to_lowercase());
-    }
     if std::env::var_os("DBUS_SYSTEM_BUS_ADDRESS").is_none() {
         background.extend(start_system_bus());
     }
@@ -349,6 +362,7 @@ fn start_session(
         }
     }
     let exec = session::fill(&spec.exec, &params);
+    announce_session_display(dir, &host_display);
     Ok(match spec.renderer {
         Renderer::Wayland => {
             let session = spawn(&exec, &host)?;
@@ -385,6 +399,54 @@ fn start_session(
             vec![spawn(&bridge, &host)?, session]
         }
     })
+}
+
+/// Waits (in the background) for the session compositor's own Wayland socket and passes it to the
+/// session bus's activation environment, so D-Bus-activated apps open in the session rather than on
+/// the host compositor. Best effort; gives up after a minute.
+fn announce_session_display(dir: &std::path::Path, host_display: &str) {
+    let dir = dir.to_path_buf();
+    let host = host_display.to_string();
+    let existing: Vec<String> = wayland_sockets(&dir);
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            if let Some(name) = wayland_sockets(&dir)
+                .into_iter()
+                .find(|n| *n != host && !existing.contains(n))
+            {
+                let env = std::collections::HashMap::from([("WAYLAND_DISPLAY", name.as_str())]);
+                let r = zbus::blocking::Connection::session().and_then(|c| {
+                    c.call_method(
+                        Some("org.freedesktop.DBus"),
+                        "/org/freedesktop/DBus",
+                        Some("org.freedesktop.DBus"),
+                        "UpdateActivationEnvironment",
+                        &(env,),
+                    )
+                });
+                if let Err(e) = r {
+                    eprintln!("warn: activation environment: {e}");
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    });
+}
+
+/// Names of the Wayland sockets (`wayland-N`) in `dir`.
+fn wayland_sockets(dir: &std::path::Path) -> Vec<String> {
+    use std::os::unix::fs::FileTypeExt;
+    fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_type().map(|t| t.is_socket()).unwrap_or(false))
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| n.starts_with("wayland-"))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Reaps every child (including orphans re-parented to us) until one of `critical` exits;
@@ -460,6 +522,19 @@ mod tests {
         // live: a second call leaves the working socket alone
         start_journal_sink_at(&p);
         c.send(b"again").unwrap();
+    }
+
+    #[test]
+    fn live_bus_is_shared_not_replaced() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("bus");
+        let _live = UnixListener::bind(&p).unwrap();
+        assert!(start_bus(&p, "user", "DROIDC_TEST_SHARED_BUS").is_none());
+        assert_eq!(
+            std::env::var("DROIDC_TEST_SHARED_BUS").unwrap(),
+            format!("unix:path={}", p.display())
+        );
+        UnixStream::connect(&p).expect("the original listener still owns the socket");
     }
 
     #[test]
