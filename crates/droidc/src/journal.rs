@@ -232,7 +232,16 @@ mod tests {
         // stale: bound then dropped, leaving the file behind with no listener
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         drop(UnixDatagram::bind(&p).unwrap());
-        assert!(UnixDatagram::unbound().unwrap().connect(&p).is_err());
+        // A test forking concurrently holds a copy of the fd until its child execs: wait for the
+        // socket to really be gone instead of asserting it at once.
+        let stale = (0..200).any(|_| {
+            let gone = UnixDatagram::unbound().unwrap().connect(&p).is_err();
+            if !gone {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            gone
+        });
+        assert!(stale, "stale socket still accepts connections");
         start_datagram_at(&p, Arc::default());
         let c = UnixDatagram::unbound().unwrap();
         c.connect(&p).expect("sink must accept connections");
