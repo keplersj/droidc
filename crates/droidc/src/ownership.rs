@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
@@ -91,39 +92,53 @@ pub fn resolve_row(
         ("d", FileType::Directory) => ok(fd, false),
         ("l", FileType::Symlink) => ok(fd, true),
         ("f" | "h", FileType::RegularFile) => ok(fd, false),
-        ("f" | "h", FileType::Symlink) => follow_l2s(&fd, canon_root, l2s_prefix),
+        ("f" | "h", FileType::Symlink) => follow_l2s(&fd, t, canon_root, l2s_prefix),
         _ => Err("type mismatch"),
     }
 }
 
-/// Follow a link2symlink chain (absolute host paths) and accept only an l2s data file inside the
-/// canonical root.
+/// Whether `name` is an l2s entry. Both layouts are accepted whatever `DROIDC_L2S_PREFIX` says
+/// (`sudo`/`su` usually drop it): Termux `.l2s.` and proot-me `.proot.l2s.`.
+fn is_l2s_name(name: &str, prefix: &str) -> bool {
+    [prefix, ".l2s.", ".proot.l2s."]
+        .iter()
+        .any(|p| name.starts_with(p))
+}
+
+/// Follow a link2symlink chain (absolute host paths to an l2s intermediate) and accept only an l2s
+/// data file inside the canonical root. Any other symlink on an `h` row is a hard link to a
+/// symlink (ostree-built images hard-link symlinks too): left alone.
 fn follow_l2s(
     link: &OwnedFd,
+    t: &str,
     canon_root: &Path,
     prefix: &str,
 ) -> std::result::Result<Resolved, &'static str> {
     let target = readlinkat(link, "", Vec::new()).map_err(|_| "readlink failed")?;
-    let target = target.to_string_lossy().into_owned();
-    if !target.starts_with('/') {
-        return Err("relative symlink where a file was recorded");
+    let target = Path::new(std::ffi::OsStr::from_bytes(target.as_bytes())).to_path_buf();
+    let chain = target.is_absolute()
+        && target
+            .file_name()
+            .is_some_and(|n| is_l2s_name(&n.to_string_lossy(), prefix));
+    if !chain {
+        return Err(if t == "h" {
+            "hard link to a symlink"
+        } else {
+            "symlink where a file was recorded"
+        });
     }
-    let fd = rustix::fs::open(
-        target.as_str(),
-        OFlags::PATH | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|_| "l2s chain does not resolve")?;
+    let fd = rustix::fs::open(&target, OFlags::PATH | OFlags::CLOEXEC, Mode::empty())
+        .map_err(|_| "l2s chain does not resolve")?;
     let real = fs::read_link(proc_fd(&fd)).map_err(|_| "l2s chain does not resolve")?;
     let st = fstat(&fd).map_err(|_| "stat failed")?;
     let name_ok = real
         .file_name()
-        .is_some_and(|n| n.to_string_lossy().starts_with(prefix));
+        .is_some_and(|n| is_l2s_name(&n.to_string_lossy(), prefix));
     if !real.starts_with(canon_root)
         || !name_ok
         || FileType::from_raw_mode(st.st_mode) != FileType::RegularFile
     {
-        return Err("not an l2s chain inside the root");
+        return Err("l2s chain leaves the root");
     }
     Ok(Resolved {
         fd,
@@ -365,11 +380,16 @@ mod tests {
         assert_eq!(r("usr/bin/alias", "d").unwrap_err(), "type mismatch");
         assert_eq!(
             r("usr/bin/alias", "f").unwrap_err(),
-            "relative symlink where a file was recorded"
+            "symlink where a file was recorded"
         );
         assert_eq!(
+            r("usr/bin/alias", "h").unwrap_err(),
+            "hard link to a symlink"
+        );
+        // absolute, not l2s-named: never followed
+        assert_eq!(
             r("usr/share", "f").unwrap_err(),
-            "not an l2s chain inside the root"
+            "symlink where a file was recorded"
         );
     }
 
@@ -383,9 +403,17 @@ mod tests {
         symlink(dir.join(".l2s.su0001.0002"), dir.join(".l2s.su0001")).unwrap();
         symlink(dir.join(".l2s.su0001"), dir.join("su")).unwrap();
         symlink(dir.join(".l2s.su0001"), dir.join("sudo")).unwrap();
-        // a chain-looking link to a non-l2s file inside the root is refused
+        // a link to a non-l2s file inside the root is not followed
         fs::write(dir.join("plain"), "x").unwrap();
         symlink(dir.join("plain"), dir.join("fake")).unwrap();
+        // an l2s-named intermediate that ends outside the root (or at a non-l2s file) is refused
+        let outside = tempfile::tempdir().unwrap();
+        let out = fs::canonicalize(outside.path()).unwrap();
+        fs::write(out.join(".l2s.x0001.0001"), "host").unwrap();
+        symlink(out.join(".l2s.x0001.0001"), dir.join(".l2s.x0001")).unwrap();
+        symlink(dir.join(".l2s.x0001"), dir.join("x")).unwrap();
+        symlink(dir.join("plain"), dir.join(".l2s.y0001")).unwrap();
+        symlink(dir.join(".l2s.y0001"), dir.join("y")).unwrap();
         let fd = open_dir(&root.join("rootfs")).unwrap();
         for p in ["usr/bin/su", "usr/bin/sudo"] {
             let r = resolve_row(&fd, p, "h", &root, ".l2s.").unwrap();
@@ -397,9 +425,20 @@ mod tests {
         }
         assert_eq!(
             resolve_row(&fd, "usr/bin/fake", "f", &root, ".l2s.").unwrap_err(),
-            "not an l2s chain inside the root"
+            "symlink where a file was recorded"
         );
-        // wrong prefix (proot-me layout read with the Termux prefix)
-        assert!(resolve_row(&fd, "usr/bin/su", "f", &root, ".proot.l2s.").is_err());
+        for p in ["usr/bin/x", "usr/bin/y"] {
+            assert_eq!(
+                resolve_row(&fd, p, "f", &root, ".l2s.").unwrap_err(),
+                "l2s chain leaves the root",
+                "{p}"
+            );
+        }
+        // the configured prefix doesn't matter: both layouts are recognised (sudo drops env)
+        assert!(
+            resolve_row(&fd, "usr/bin/su", "f", &root, ".proot.l2s.")
+                .unwrap()
+                .via_l2s
+        );
     }
 }

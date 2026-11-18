@@ -286,8 +286,11 @@ setgid, sticky; chown clears them), then xattrs (chown clears `security.capabili
 them for the others). Every row is resolved with `openat2(O_PATH|O_NOFOLLOW, RESOLVE_IN_ROOT)` and
 must match its recorded type, so neither the image nor a guest that ran as root (swapping a
 directory for a symlink to a host path) can make it touch a host file. The exception: an `f`/`h`
-row that link2symlink turned into a chain is followed and accepted only if it ends at a regular file
-named with the l2s prefix inside the canonical root. `f`/`d`/`l` rows are applied first; an `h` row
+row that link2symlink turned into a chain (an absolute link to an l2s-named intermediate) is followed
+and accepted only if it ends at an l2s-named regular file inside the canonical root. Both layouts
+(`.l2s.`, `.proot.l2s.`) are recognised whatever `DROIDC_L2S_PREFIX` says, because `sudo`/`su`
+usually drop it. Any other symlink on an `h` row is a hard link to a symlink (ostree-built images
+have thousands) and is left alone. `f`/`d`/`l` rows are applied first; an `h` row
 only for an inode no `f` row reached (hard-link headers carry their own, often wrong, mode). The
 record gets `"ownership":"image"`; result `{id, ownership, applied, via_l2s, xattr_errors,
 skipped:{reason: n}}` (the `l2s chain does not resolve` count shows a canonical root mismatch).

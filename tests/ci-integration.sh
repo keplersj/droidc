@@ -59,8 +59,9 @@ RC=0; sudo "$D" --root "$ROOT_REAL" enter -- /bin/sh -c 'exit 3' || RC=$?
 echo "== fix-ownership (root), then non-root commands refuse, then --undo"
 F=$(sudo "$D" --root "$ROOT_REAL" --json fix-ownership | tail -n1)
 echo "$F" | jq -c '.data | {applied, via_l2s, xattr_errors, skipped}'
-echo "$F" | jq -e '.ok and .data.applied > 1000' >/dev/null || fail "fix-ownership: $F"
-P=$(sudo "$D" --root "$ROOT_REAL" enter -- stat -c '%u %a' /usr/bin/passwd)
+# sudo drops DROIDC_L2S_PREFIX: link2symlink chains must be followed anyway
+echo "$F" | jq -e '.ok and .data.applied > 1000 and .data.via_l2s > 1000' >/dev/null || fail "fix-ownership: $F"
+P=$(sudo "$D" --root "$ROOT_REAL" enter -- stat -L -c '%u %a' /usr/bin/passwd)
 [ "$P" = "0 4755" ] || fail "passwd after fix-ownership: $P"
 J shell-spec --launcher chroot | jq -e '[.data.launcher.warnings[] | select(test("ownership"))] | length == 0' >/dev/null \
   || fail "ownership warning after fix-ownership"
@@ -98,7 +99,7 @@ echo "== switch --apply-ownership (root, activates the present stream9 deploymen
 A=$(sudo "$D" --root "$ROOT_REAL" --json switch quay.io/centos-bootc/centos-bootc:stream9 --insecure-allow-unsigned --links link2symlink --apply-ownership | tail -n1)
 echo "$A" | jq -e --arg id "$ID2" '.ok and .data.changed and .data.id == $id and .data.ownership.ownership == "image" and .data.deployment.ownership == "image"' >/dev/null \
   || fail "switch --apply-ownership: $A"
-P=$(sudo "$D" --root "$ROOT_REAL" enter -- stat -c '%u %a' /usr/bin/passwd)
+P=$(sudo "$D" --root "$ROOT_REAL" enter -- stat -L -c '%u %a' /usr/bin/passwd)
 [ "$P" = "0 4755" ] || fail "passwd after switch --apply-ownership: $P"
 UP=$(sudo "$D" --root "$ROOT_REAL" --json upgrade | tail -n1)
 echo "$UP" | jq -e '.ok and .data.changed == false and .data.ownership == null and .data.deployment.ownership == "image"' >/dev/null \
