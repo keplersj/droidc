@@ -58,7 +58,11 @@ enum Cmd {
     /// Remove unreferenced deployments and blobs
     Gc,
     /// How to enter the current deployment
-    ShellSpec,
+    ShellSpec {
+        /// proot|chroot (chroot needs real root)
+        #[arg(long, default_value = "proot")]
+        launcher: String,
+    },
     /// Detected platform
     Platform,
     /// (inside the guest) start session services, then run a command or the graphical session
@@ -249,7 +253,11 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
         Cmd::Rollback => Ok(("rollback", deploy::rollback(&root, em)?)),
         Cmd::Status => Ok(("status", status::status(&root)?)),
         Cmd::Gc => Ok(("gc", deploy::gc(&root, em)?)),
-        Cmd::ShellSpec => Ok(("shell-spec", status::shell_spec(&root)?)),
+        Cmd::ShellSpec { launcher } => {
+            let l = status::Launcher::parse(launcher)
+                .ok_or_else(|| Error::invalid(format!("unknown --launcher '{launcher}'")))?;
+            Ok(("shell-spec", status::shell_spec(&root, l)?))
+        }
         Cmd::Platform => Ok(("platform", serde_json::to_value(Platform::detect()?)?)),
         Cmd::Session { action } => Ok(("session", session_cmd(&root, action)?)),
         Cmd::Supervise { .. } | Cmd::Bridge { .. } | Cmd::Login1 | Cmd::Log { .. } => {

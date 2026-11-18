@@ -679,6 +679,7 @@ pub fn gc_locked(root: &Root, em: &Emitter) -> Result<Value> {
 mod tests {
     use super::*;
     use crate::events::testutil::capture;
+    use crate::status::Launcher;
     use crate::unpack::tests::Layer;
     use std::io::Write;
     use std::os::unix::fs::MetadataExt;
@@ -949,8 +950,10 @@ mod tests {
         assert_eq!(s["current"]["id"], "aaaa");
         assert!(s["previous"].is_null());
         assert!(s["staged"].is_null());
-        let sp = crate::status::shell_spec(&root.path).unwrap();
+        let sp = crate::status::shell_spec(&root.path, Launcher::Proot).unwrap();
         assert_eq!(sp["session_label"], "gnome");
+        assert_eq!(sp["launcher"]["kind"], "proot");
+        assert_eq!(sp["launcher"]["link2symlink"], false);
         assert_eq!(sp["cwd"], "/root");
         assert_eq!(sp["binds"][2]["guest"], "/run/droidc/root");
         assert_eq!(sp["systemd"]["binds"][0]["guest"], "/sys/fs/cgroup");
@@ -967,6 +970,28 @@ mod tests {
         std::os::unix::fs::symlink(&root.path, &alias).unwrap();
         let s2 = crate::status::status(&alias).unwrap();
         assert_eq!(s2["current"]["id"], "aaaa");
+    }
+
+    #[test]
+    fn chroot_shell_spec_binds_root_for_link2symlink() {
+        let (_d, root, ld) = setup();
+        do_install(&root, &ld, "aaaa", image("A", "x"), LinkKind::Link2Symlink);
+        let sp = crate::status::shell_spec(&root.path, Launcher::Chroot).unwrap();
+        let l = &sp["launcher"];
+        assert_eq!(l["kind"], "chroot");
+        assert_eq!(l["requires_root"], true);
+        assert!(l["mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["fstype"] == "proc"));
+        let canon = fs::canonicalize(&root.path).unwrap().display().to_string();
+        let binds = sp["binds"].as_array().unwrap();
+        assert_eq!(binds.len(), 4);
+        assert_eq!(binds[3]["host"], canon.as_str());
+        assert_eq!(binds[3]["guest"], canon.as_str());
+        // unpacked without root: ownership warning, plus the link2symlink one
+        assert_eq!(l["warnings"].as_array().unwrap().len(), 2);
     }
 
     #[test]

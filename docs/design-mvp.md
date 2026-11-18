@@ -151,7 +151,7 @@ droidc [--root DIR] [--json] [--dns IPS] <command>
   rollback                      swap current and previous
   status                        current, previous, staged
   gc
-  shell-spec                    how to enter the current deployment (rootfs, binds, env, cwd)
+  shell-spec [--launcher proot|chroot]  how to enter the current deployment (rootfs, binds, env, cwd)
   platform                      detected platform
   supervise -- <cmd...>         (inside the guest) start session services, dbus first, then cmd
   supervise --session [--width W --height H --scale S] [-- cmd...]
@@ -204,14 +204,33 @@ layers) and returns `{"changed":false,"verify_only":true,"id","manifest_digest",
  "env":{"DROIDC_ROOT":"/run/droidc/root","HOME":"/root","PATH":"...","TERM":"xterm-256color","LANG":"C.UTF-8"},
  "cwd":"/root","session_label":"gnome",
  "session":{"name":"GNOME","renderer":"screencast","exec":["gnome-shell","--headless","--virtual-monitor","{width}x{height}"],
-            "services":[["pipewire"],["wireplumber"]],"configured":true,"source":"label|override"}}
+            "services":[["pipewire"],["wireplumber"]],"configured":true,"source":"label|override"},
+ "launcher":{"kind":"proot","requires_root":false,"link2symlink":true}}
 ```
 
 `session.configured` is false (and `renderer`/`exec` null) when neither labels nor an override describe
 a graphical session.
 
 Selkie adds Android binds (`/dev`, `/proc`, `/sys`, fake proc files, `/usr/bin/droidc` → the
-`libdroidc.so` path) and runs `proot`.
+`libdroidc.so` path) and runs `proot` (with `--link2symlink` when `launcher.link2symlink`).
+
+`shell-spec --launcher chroot` is for devices where Selkie has real root (Magisk, KernelSU, Shizuku
+started as root). Selkie chooses; droidc runs as the app uid and cannot tell. `launcher` becomes:
+
+```json
+{"kind":"chroot","requires_root":true,"namespaces":["mount","pid","uts","ipc"],
+ "mounts":[{"fstype":"proc","guest":"/proc"},{"fstype":"sysfs","guest":"/sys"},
+           {"fstype":"cgroup2","guest":"/sys/fs/cgroup"},{"bind":"/dev","guest":"/dev"},
+           {"fstype":"devpts","guest":"/dev/pts","options":"newinstance,ptmxmode=0666"},
+           {"fstype":"tmpfs","guest":"/run","options":"mode=0755"},{"fstype":"tmpfs","guest":"/tmp","options":"mode=1777"}],
+ "warnings":["..."]}
+```
+
+The launcher unshares `namespaces`, mounts `mounts` then `binds` under `rootfs`, chroots and execs.
+A link2symlink deployment gets one more bind, the canonical `<root>` at the same path in the guest,
+so its absolute chains resolve without proot. `warnings` flags a link2symlink deployment and a rootfs
+whose `/usr` is not owned by uid 0 (ownership from `metadata.jsonl.zst` not applied), in which case
+setuid binaries and ownership checks fail.
 
 ## Session label
 
