@@ -9,7 +9,7 @@ use crate::error::{Context, Error, Result};
 use std::fs;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixDatagram, UnixListener};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -61,7 +61,75 @@ fn start_dbus(dir: &std::path::Path, bin: &std::path::Path) -> Result<String> {
     if addr.is_empty() {
         return Err(Error::internal("dbus-daemon printed no address"));
     }
+    // `--fork --print-address` reports the address before the daemon finishes starting; if the
+    // daemon then dies (e.g. SELinux AVC init denied) the socket never appears.
+    std::thread::sleep(Duration::from_millis(250));
+    if !dir.join("bus").exists() {
+        return Err(Error::internal(
+            "dbus-daemon exited after printing its address",
+        ));
+    }
     Ok(addr)
+}
+
+const MACHINE_ID: &str = "/etc/machine-id";
+
+fn is_valid_machine_id(s: &str) -> bool {
+    let s = s.trim();
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()) && s.bytes().any(|b| b != b'0')
+}
+
+/// bootc images ship `/etc/machine-id` empty (or `uninitialized`) and rely on first boot to fill it
+/// in. There is no first boot here, and `sd_id128_get_machine` (dbus-broker-launch, systemd tools)
+/// fails with ENOMEDIUM until it is set. Generate a random id once; it is per-installation state,
+/// so droidc's `/etc` merge keeps it across upgrades. Returns whether it wrote the file.
+fn ensure_machine_id(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    match fs::read_to_string(path) {
+        Ok(cur) if is_valid_machine_id(&cur) => return Ok(false),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut raw = [0u8; 16];
+    fs::File::open("/dev/urandom")?.read_exact(&mut raw)?;
+    let id: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    fs::write(path, format!("{id}\n"))?;
+    Ok(true)
+}
+
+const JOURNAL_SOCKET: &str = "/run/systemd/journal/socket";
+
+/// `dbus-broker-launch` connects a datagram socket to the journal at startup and exits with ENOENT
+/// when `/run/systemd/journal/socket` is missing (no systemd in the guest). Bind a stand-in there
+/// and discard what arrives; a detached thread owns it for the life of the process. Best effort:
+/// does nothing when something already listens there or `/run` is not writable.
+fn start_journal_sink() {
+    start_journal_sink_at(std::path::Path::new(JOURNAL_SOCKET));
+}
+
+fn start_journal_sink_at(path: &std::path::Path) {
+    // A socket file left by a previous session refuses connections; only a live listener is kept.
+    if path.exists() {
+        let live = UnixDatagram::unbound()
+            .and_then(|c| c.connect(path))
+            .is_ok();
+        if live || fs::remove_file(path).is_err() {
+            return;
+        }
+    }
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let Ok(sock) = UnixDatagram::bind(path) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        while sock.recv(&mut buf).is_ok() {}
+    });
 }
 
 /// Socket-activate `dbus-broker-launch --scope user` by hand (systemd --user cannot run under
@@ -119,6 +187,7 @@ fn start_broker(
 
 fn start_session_bus(dir: &std::path::Path) -> Option<Child> {
     if let Some(bin) = find_in_path("dbus-broker-launch") {
+        start_journal_sink();
         match start_broker(dir, &bin, &["--scope", "user"]) {
             Ok((addr, child)) => {
                 std::env::set_var("DBUS_SESSION_BUS_ADDRESS", addr);
@@ -142,6 +211,9 @@ pub fn supervise(cmd: &[String]) -> Result<i32> {
     }
     let dir = runtime_dir()?;
     std::env::set_var("XDG_RUNTIME_DIR", &dir);
+    if let Err(e) = ensure_machine_id(std::path::Path::new(MACHINE_ID)) {
+        eprintln!("warn: could not initialise {MACHINE_ID}: {e}");
+    }
     let broker = if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
         start_session_bus(&dir)
     } else {
@@ -181,6 +253,48 @@ pub fn supervise(cmd: &[String]) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_sink_replaces_stale_socket_and_keeps_live_one() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("journal/socket");
+        // stale: bound then dropped, leaving the file behind with no listener
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        drop(UnixDatagram::bind(&p).unwrap());
+        assert!(UnixDatagram::unbound().unwrap().connect(&p).is_err());
+        start_journal_sink_at(&p);
+        let c = UnixDatagram::unbound().unwrap();
+        c.connect(&p).expect("sink must accept connections");
+        c.send(b"hello").unwrap();
+        // live: a second call leaves the working socket alone
+        start_journal_sink_at(&p);
+        c.send(b"again").unwrap();
+    }
+
+    #[test]
+    fn machine_id_is_filled_once() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("machine-id");
+        for initial in [
+            None,
+            Some(""),
+            Some("uninitialized\n"),
+            Some("0".repeat(32).as_str()),
+        ] {
+            match initial {
+                Some(c) => fs::write(&p, c).unwrap(),
+                None => {
+                    let _ = fs::remove_file(&p);
+                }
+            }
+            assert!(ensure_machine_id(&p).unwrap());
+            let id = fs::read_to_string(&p).unwrap();
+            assert!(is_valid_machine_id(&id), "{id:?}");
+            assert_eq!(id.len(), 33);
+            assert!(!ensure_machine_id(&p).unwrap());
+            assert_eq!(fs::read_to_string(&p).unwrap(), id);
+        }
+    }
 
     #[test]
     fn broker_gets_socket_activation_env() {
