@@ -270,10 +270,13 @@ the exit status is the command's (128+signal if it was killed).
    about each the kernel lacks (Android configs often have no SysV IPC). `--hostname` is dropped
    without a uts namespace (it would rename Android). Make `/` recursively private (nothing reaches
    Android's namespace), re-exec itself as the hidden `__enter-init <plan-json> -- cmd`, and wait.
-4. Init: `PR_SET_PDEATHSIG(SIGKILL)`. With a pid namespace it is PID 1, and when it exits or is
-   killed with `enter`, the kernel kills the whole namespace. Without one it is a
-   `PR_SET_CHILD_SUBREAPER` and SIGKILLs every remaining descendant when cmd exits; if `enter` itself
-   is SIGKILLed, guest processes are left behind, so Android kernels need `CONFIG_PID_NS`.
+4. `enter` first resets SIGTERM and SIGHUP to their default action (an inherited "ignore" from su
+   or a wrapper would survive exec and keep the guest alive when Selkie stops a session). Init with
+   a pid namespace: PID 1 with `PR_SET_PDEATHSIG(SIGKILL)`; when it exits or dies with `enter`, the
+   kernel kills the whole namespace. Without one (the Android emulator's kernel has no pid or ipc
+   namespace): a `PR_SET_CHILD_SUBREAPER` that reaps with a 50 ms `WNOHANG` poll and also watches its
+   parent; when cmd exits or `enter` goes away (SIGTERM, SIGHUP, even SIGKILL) it SIGKILLs every
+   remaining descendant and exits.
 5. Mounts, symlinks, binds; hostname; `chroot`, `chdir(cwd)` (else `/`); run cmd with exactly the
    spec env; reap all children until cmd exits.
 

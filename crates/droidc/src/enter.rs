@@ -42,6 +42,9 @@ pub struct Plan {
     /// The namespaces the parent actually got (set after unshare).
     #[serde(default)]
     pub namespaces: Vec<String>,
+    /// The `enter` process: without a pid namespace the init watches for it to go away.
+    #[serde(default)]
+    pub parent: Option<i32>,
 }
 
 impl Plan {
@@ -100,6 +103,7 @@ pub fn plan(root_path: &Path, opts: &EnterOpts) -> Result<(Plan, Vec<String>)> {
             cwd: spec.cwd,
             hostname: opts.hostname.clone(),
             namespaces: Vec::new(),
+            parent: None,
         },
         warnings,
     ))
@@ -114,6 +118,13 @@ pub fn enter(root_path: &Path, opts: &EnterOpts, cmd: &[String]) -> Result<i32> 
         return Err(Error::invalid(
             "enter needs root (run it through su); without root use shell-spec and proot",
         ));
+    }
+    // Selkie stops a session with SIGTERM (or the terminal's SIGHUP); an "ignore" inherited from
+    // whatever launched us (su, `unshare --fork`, ...) would survive exec and keep the guest alive.
+    // Reset both, for us and, through exec, for the init and the guest command.
+    for sig in [libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: plain signal(2) to the default action; no handler runs.
+        unsafe { libc::signal(sig, libc::SIG_DFL) };
     }
     let (mut plan, warnings) = plan(root_path, opts)?;
     for w in &warnings {
@@ -153,6 +164,7 @@ pub fn enter(root_path: &Path, opts: &EnterOpts, cmd: &[String]) -> Result<i32> 
         MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
     )
     .map_err(|e| sys("make / rprivate", e))?;
+    plan.parent = Some(std::process::id() as i32);
     // With a pid namespace, the first child after unshare(NEWPID) is its PID 1.
     let mut child = Command::new(exe)
         .arg("__enter-init")
@@ -171,13 +183,16 @@ pub fn enter(root_path: &Path, opts: &EnterOpts, cmd: &[String]) -> Result<i32> 
 
 /// The init: PID 1 of the new pid namespace, or a subreaper without one.
 pub fn init(plan_json: &str, cmd: &[String]) -> Result<i32> {
-    rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))
-        .map_err(|e| sys("PR_SET_PDEATHSIG", e))?;
     let plan: Plan = serde_json::from_str(plan_json)?;
     let pid_ns = plan.has_ns("pid");
-    if !pid_ns {
-        // Orphans reparent to us, so we can find and kill them when the command exits. If `enter`
-        // itself is SIGKILLed we die too and they are left behind: Android needs CONFIG_PID_NS.
+    if pid_ns {
+        // When we die the kernel kills the whole namespace, so dying with `enter` is enough.
+        rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))
+            .map_err(|e| sys("PR_SET_PDEATHSIG", e))?;
+    } else {
+        // Nothing kills the guest for us (Android kernels often lack CONFIG_PID_NS). Orphans
+        // reparent to us; we outlive `enter` long enough to kill everything below us, whether the
+        // command exits or `enter` is killed (see `reap_or_orphaned`).
         rustix::process::set_child_subreaper(Some(rustix::process::getpid()))
             .map_err(|e| sys("PR_SET_CHILD_SUBREAPER", e))?;
     }
@@ -224,12 +239,45 @@ pub fn init(plan_json: &str, cmd: &[String]) -> Result<i32> {
                 Error::internal(format!("{}: {e}", cmd[0]))
             }
         })?;
-    let code = crate::supervise::reap_until(child.id() as i32)?;
-    // With a pid namespace, the kernel kills the rest when PID 1 exits.
-    if !pid_ns {
-        kill_descendants();
+    if pid_ns {
+        // When PID 1 exits the kernel kills the rest of the namespace.
+        return crate::supervise::reap_until(child.id() as i32);
     }
-    Ok(code)
+    let parent = plan.parent.unwrap_or(0);
+    let code = reap_or_orphaned(child.id() as i32, || current_parent() == parent);
+    kill_descendants();
+    // `enter` was killed (SIGTERM from Selkie, hangup): report it like a signal death.
+    Ok(code.unwrap_or(128 + 15))
+}
+
+fn current_parent() -> i32 {
+    rustix::process::getppid().map_or(0, |p| p.as_raw_nonzero().get())
+}
+
+/// Reap every child until `pid` exits (its exit code, or 128+signal), or return None as soon as
+/// `parent_alive` turns false. Polls every 50 ms instead of blocking in wait(2), because without a
+/// pid namespace nothing would wake us when `enter` dies.
+pub(crate) fn reap_or_orphaned(pid: i32, parent_alive: impl Fn() -> bool) -> Option<i32> {
+    use rustix::process::{wait, WaitOptions};
+    loop {
+        match wait(WaitOptions::NOHANG) {
+            Ok(Some((p, st))) if p.as_raw_nonzero().get() == pid => {
+                return Some(
+                    st.exit_status()
+                        .or_else(|| st.terminating_signal().map(|s| 128 + s))
+                        .unwrap_or(1),
+                );
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(Errno::INTR) => {}
+            // No children left at all: the command is gone without us seeing it.
+            Err(_) => return Some(1),
+        }
+        if !parent_alive() {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// SIGKILL every process below us (reading the guest's `/proc`, which is in our pid namespace)
@@ -469,6 +517,31 @@ mod tests {
         let (f, d) = parse_options("nosuid,noexec,newinstance,ptmxmode=0666");
         assert_eq!(f, MountFlags::NOSUID | MountFlags::NOEXEC);
         assert_eq!(d, "newinstance,ptmxmode=0666");
+    }
+
+    /// wait(-1) would steal other tests' children (and they ours): run alone in a fresh process.
+    #[test]
+    fn reaping_stops_when_the_parent_goes_away() {
+        const ME: &str = "enter::tests::reaping_stops_when_the_parent_goes_away";
+        if std::env::var_os("DROIDC_ISOLATED_TEST").is_none() {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", ME, "--test-threads=1"])
+                .env("DROIDC_ISOLATED_TEST", "1")
+                .output()
+                .unwrap();
+            let log = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success() && log.contains("1 passed"), "{log}");
+            return;
+        }
+        let mut c = Command::new("sh").args(["-c", "exit 7"]).spawn().unwrap();
+        assert_eq!(reap_or_orphaned(c.id() as i32, || true), Some(7));
+        let _ = c.try_wait();
+        let mut long = Command::new("sleep").arg("30").spawn().unwrap();
+        let t = std::time::Instant::now();
+        assert_eq!(reap_or_orphaned(long.id() as i32, || false), None);
+        assert!(t.elapsed() < std::time::Duration::from_secs(2));
+        long.kill().unwrap();
+        long.wait().unwrap();
     }
 
     #[test]

@@ -56,6 +56,18 @@ RC=0; sudo "$D" --root "$ROOT_REAL" enter -- /bin/sh -c 'exit 3' || RC=$?
 [ "$RC" = 3 ] || fail "enter exit status $RC"
 [ -z "$(findmnt -rn -o TARGET | grep -F "$ROOT_REAL/" || true)" ] || fail "enter leaked mounts"
 
+echo "== killing enter tears the guest down (with a pid namespace, and without one as on Android)"
+guests() { pgrep -fc '^sleep 424[67]$' || true; }
+for nons in "" pid; do
+  sudo env DROIDC_ENTER_NO_NS=$nons "$D" --root "$ROOT_REAL" enter -- /bin/sh -c '(setsid sleep 4246 &); sleep 4247' 2>/dev/null &
+  n=0; for i in $(seq 100); do n=$(guests); [ "$n" -ge 2 ] && break; sleep 0.1; done
+  [ "$n" -ge 2 ] || fail "guest did not start (no ns: ${nons:-none})"
+  sudo pkill -TERM -f -- "^$D --root $ROOT_REAL enter" || fail "no enter process to kill"
+  for i in $(seq 100); do n=$(guests); [ "$n" = 0 ] && break; sleep 0.1; done
+  [ "$n" = 0 ] || fail "killing enter left $n guest processes (no ns: ${nons:-none})"
+  wait || true
+done
+
 echo "== fix-ownership (root), then non-root commands refuse, then --undo"
 F=$(sudo "$D" --root "$ROOT_REAL" --json fix-ownership | tail -n1)
 echo "$F" | jq -c '.data | {applied, via_l2s, xattr_errors, skipped}'
