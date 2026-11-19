@@ -57,6 +57,12 @@ static int fd_under(int fd) {
   return under(buf);
 }
 
+// Debugging aid (CGSHIM_TRACE): a failed call on a /sys path, whether or not it is under the cgroup tree.
+static void trace_sys(const char *op, int d, const char *p, int e) {
+  if (p && !strncmp(p, "/sys", 4) && getenv("CGSHIM_TRACE"))
+    fprintf(stderr, "cgshim: %s(%d) %s: %s\n", op, d, p, strerror(e));
+}
+
 static int all_digits(const char *s, size_t n) {
   if (!n) return 0;
   for (size_t i = 0; i < n; i++)
@@ -157,25 +163,33 @@ int open(const char *p, int f, ...) {
   NEXT(int, "open", (const char *, int, ...));
   va_list a; va_start(a, f); mode_t m = va_arg(a, mode_t); va_end(a);
   int cp; if (proc_cgroup_pid(p, &cp)) { int fd = fake_cgroup_fd(cp); if (fd >= 0) return fd; }
-  return real(p, fix_flags(p, f), m);
+  int r = real(p, fix_flags(p, f), m);
+  if (r < 0) { int e = errno; trace_sys("open", -1, p, e); errno = e; }
+  return r;
 }
 int open64(const char *p, int f, ...) {
   NEXT(int, "open64", (const char *, int, ...));
   va_list a; va_start(a, f); mode_t m = va_arg(a, mode_t); va_end(a);
   int cp; if (proc_cgroup_pid(p, &cp)) { int fd = fake_cgroup_fd(cp); if (fd >= 0) return fd; }
-  return real(p, fix_flags(p, f), m);
+  int r = real(p, fix_flags(p, f), m);
+  if (r < 0) { int e = errno; trace_sys("open64", -1, p, e); errno = e; }
+  return r;
 }
 int openat(int d, const char *p, int f, ...) {
   NEXT(int, "openat", (int, const char *, int, ...));
   va_list a; va_start(a, f); mode_t m = va_arg(a, mode_t); va_end(a);
   int cp; if (proc_cgroup_pid(p, &cp)) { int fd = fake_cgroup_fd(cp); if (fd >= 0) return fd; }
-  return real(d, p, fix_flags(p, f), m);
+  int r = real(d, p, fix_flags(p, f), m);
+  if (r < 0) { int e = errno; trace_sys("openat", d, p, e); errno = e; }
+  return r;
 }
 int openat64(int d, const char *p, int f, ...) {
   NEXT(int, "openat64", (int, const char *, int, ...));
   va_list a; va_start(a, f); mode_t m = va_arg(a, mode_t); va_end(a);
   int cp; if (proc_cgroup_pid(p, &cp)) { int fd = fake_cgroup_fd(cp); if (fd >= 0) return fd; }
-  return real(d, p, fix_flags(p, f), m);
+  int r = real(d, p, fix_flags(p, f), m);
+  if (r < 0) { int e = errno; trace_sys("openat64", d, p, e); errno = e; }
+  return r;
 }
 FILE *fopen(const char *p, const char *m) {
   NEXT(FILE *, "fopen", (const char *, const char *));
@@ -392,7 +406,7 @@ int mkdir(const char *p, mode_t m) {
   NEXT(int, "mkdir", (const char *, mode_t));
   int r = real(p, m);
   if (!r && under(p)) populate(p);
-  if (r && p && under(p) && getenv("CGSHIM_TRACE")) fprintf(stderr, "cgshim: mkdir %s: %s\n", p, strerror(errno));
+  if (r) { int e = errno; trace_sys("mkdir", -1, p, e); errno = e; }
   return r;
 }
 int mkdirat(int d, const char *p, mode_t m) {
@@ -400,10 +414,7 @@ int mkdirat(int d, const char *p, mode_t m) {
   int r = real(d, p, m);
   char full[8192];
   if (!r && abs_under(d, p, full, sizeof full)) populate(full);
-  if (r && getenv("CGSHIM_TRACE") && abs_under(d, p, full, sizeof full)) {
-    int e = errno;
-    fprintf(stderr, "cgshim: mkdirat(%d) %s: %s\n", d, full, strerror(e));
-  }
+  if (r) { int e = errno; trace_sys("mkdirat", d, p, e); errno = e; }
   return r;
 }
 int rmdir(const char *p) {
