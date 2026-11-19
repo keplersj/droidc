@@ -146,7 +146,7 @@ jobs:
           W=$RUNNER_TEMP/sdp; rm -rf $W; mkdir -p $W/tmp $W/run/user/$(id -u) $W/var $W/cgroup
           chmod 700 $W/run/user/$(id -u); cp tests/systemd-probe.sh $W/tmp/probe.sh
           set +e
-          PROOT_NO_SECCOMP=1 timeout 600 proot --kill-on-exit -r "$D/rootfs" -w / \
+          PROOT_NO_SECCOMP=1 timeout 600 proot -r "$D/rootfs" -w / \
             -b /dev -b /proc -b /sys -b $W/cgroup:/sys/fs/cgroup -b "$R:$R" -b "$R:/run/droidc/root" \
             -b $W/tmp:/tmp -b $W/run:/run -b $W/var:/var -b "$B:/usr/bin/droidc" \
             -b $PWD/cgshim.so:/usr/lib/droidc/cgshim.so \

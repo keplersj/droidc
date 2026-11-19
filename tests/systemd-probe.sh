@@ -27,17 +27,22 @@ echo "bus: $DBUS_SESSION_BUS_ADDRESS"
 echo "activatable names: $(busctl --user list --activatable --no-legend 2>/dev/null | wc -l)"
 echo "bus names owned: $(busctl --user list --acquired --no-legend 2>/dev/null | wc -l)"
 
-# the session itself: gnome-session's target, headless-safe units only report what starts
-if [ -e /usr/lib/systemd/user/gnome-session-wayland@.target ]; then
+# the session itself: gnome-session's target (GNOME 50 dropped X11, so the unit is
+# gnome-session@gnome.target; older images use gnome-session-wayland@gnome.target)
+target=
+for t in gnome-session@gnome.target gnome-session-wayland@gnome.target; do
+  if [ -e "/usr/lib/systemd/user/${t%%@*}@.target" ]; then target=$t; break; fi
+done
+if [ -n "$target" ]; then
   t1=$(now)
-  timeout 60 systemctl --user start gnome-session-wayland@gnome.target 2>&1 | tail -3
-  echo "gnome-session-wayland@gnome.target: $(systemctl --user is-active gnome-session-wayland@gnome.target 2>&1) (after $(elapsed "$t1"))"
+  timeout 60 systemctl --user start "$target" 2>&1 | tail -3
+  echo "$target: $(systemctl --user is-active "$target" 2>&1) (after $(elapsed "$t1"))"
   sleep 10
   echo "active gnome units:"
   systemctl --user list-units --state=active --no-legend --plain 'gnome*' 'org.gnome*' 2>&1 | awk '{print $1}' | head -40
   echo "failed units after gnome-session:"
   systemctl --user --failed --no-legend --plain 2>&1 | awk '{print $1, $3, $4}' | head -40
 else
-  echo "gnome-session-wayland@.target: not in this image"
+  echo "no gnome-session target in this image"
 fi
 exit 0
