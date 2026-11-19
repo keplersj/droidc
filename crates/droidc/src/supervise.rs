@@ -303,6 +303,56 @@ fn prefer_dbus_daemon(runtime: &std::path::Path, unit_dir: &std::path::Path) -> 
     link("dbus.service", &daemon_unit) && link("dbus-broker.service", &daemon_unit)
 }
 
+/// The image's own units for the session services droidc runs itself. The graphical session's
+/// `services` (PipeWire and WirePlumber for Selkie) are started by droidc with the environment the host
+/// compositor arrangement needs: PipeWire's access module runs a Flatpak check through
+/// `/proc/<pid>/root`, which Android hides, and restricts every client to nothing unless it uses the
+/// manager socket. The image's socket-activated `pipewire.service` does not give that (Mutter's
+/// screen-cast stream never appears), so under `systemd --user` these units are masked and droidc's
+/// copies run, exactly as without systemd. `pipewire-pulse` needs `pipewire`, so it goes with it.
+fn units_replaced_by_services(services: &[Vec<String>]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut add = |base: &str| {
+        for suffix in ["service", "socket"] {
+            let unit = format!("{base}.{suffix}");
+            if !names.contains(&unit) {
+                names.push(unit);
+            }
+        }
+    };
+    for svc in services {
+        let Some(base) = svc
+            .first()
+            .and_then(|a| std::path::Path::new(a).file_name())
+            .and_then(|n| n.to_str())
+        else {
+            continue;
+        };
+        add(base);
+        if base == "pipewire" {
+            add("pipewire-pulse");
+        }
+    }
+    names
+}
+
+/// Mask `units` for the user manager (`$XDG_RUNTIME_DIR/systemd/user/<unit>` -> `/dev/null`).
+/// Returns how many were masked.
+fn mask_units(runtime: &std::path::Path, units: &[String]) -> usize {
+    let dest = runtime.join("systemd/user");
+    if fs::create_dir_all(&dest).is_err() {
+        return 0;
+    }
+    units
+        .iter()
+        .filter(|u| {
+            let at = dest.join(u);
+            let _ = fs::remove_file(&at);
+            std::os::unix::fs::symlink("/dev/null", &at).is_ok()
+        })
+        .count()
+}
+
 /// Start the user manager with the shim preloaded; its units start the bus and the session. The
 /// host display stays out of its environment, like the buses (see `start_dbus`).
 fn start_systemd_user(
@@ -490,6 +540,9 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
             if !prefer_dbus_daemon(&dir, std::path::Path::new(USER_UNITS)) {
                 eprintln!("warn: no dbus-daemon unit; the image's own bus unit is used");
             }
+            if let Some(spec) = &spec {
+                mask_units(&dir, &units_replaced_by_services(&spec.services));
+            }
             start_systemd_user(std::path::Path::new(SYSTEMD), shim, &dir)
         });
         match started {
@@ -573,13 +626,13 @@ fn start_session(
         wayland_display: host_display.clone(),
         ..params.clone()
     };
-    // With the user manager running these are already up, and the session's own services
-    // (pipewire, wireplumber) are its socket-activated units, not ours to start a second copy of.
+    // With the user manager running the buses are already up. The session's own services are still
+    // started here: the image's units for them are masked (see `units_replaced_by_services`).
     if !user_manager {
         background.extend(start_system_services());
     }
     let host = [("WAYLAND_DISPLAY", Some(host_display.as_str()))];
-    for svc in spec.services.iter().filter(|_| !user_manager) {
+    for svc in &spec.services {
         match spawn(&session::fill(svc, &params), &host) {
             Ok(c) => background.push(c),
             Err(e) => eprintln!("warn: session service {}: {e}", svc[0]),
@@ -848,6 +901,36 @@ mod tests {
             fs::read_to_string(cg.join("cgroup.events")).unwrap(),
             "populated 0\n"
         );
+    }
+
+    #[test]
+    fn session_services_replace_the_images_units() {
+        let svcs = vec![
+            vec!["/usr/bin/pipewire".to_string(), "-c".into(), "x".into()],
+            vec!["wireplumber".to_string()],
+            vec!["/usr/bin/pipewire".to_string()],
+            vec![],
+        ];
+        assert_eq!(
+            units_replaced_by_services(&svcs),
+            [
+                "pipewire.service",
+                "pipewire.socket",
+                "pipewire-pulse.service",
+                "pipewire-pulse.socket",
+                "wireplumber.service",
+                "wireplumber.socket",
+            ]
+        );
+        assert!(units_replaced_by_services(&[]).is_empty());
+        let d = tempfile::tempdir().unwrap();
+        let names = units_replaced_by_services(&svcs);
+        assert_eq!(mask_units(d.path(), &names), 6);
+        assert_eq!(
+            fs::read_link(d.path().join("systemd/user/pipewire.socket")).unwrap(),
+            std::path::PathBuf::from("/dev/null")
+        );
+        assert_eq!(mask_units(d.path(), &names), 6, "idempotent");
     }
 
     #[test]
