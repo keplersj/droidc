@@ -222,6 +222,7 @@ pub enum SystemdMode {
 }
 
 const SYSTEMD: &str = "/usr/lib/systemd/systemd";
+const USER_UNITS: &str = "/usr/lib/systemd/user";
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const DEFAULT_SHIM: &str = "/usr/lib/droidc/cgshim.so";
 const CGROUP2_MAGIC: i64 = 0x6367_7270;
@@ -276,6 +277,29 @@ fn prepare_systemd(run: &std::path::Path, cgroup: &std::path::Path) -> Result<bo
         }
     }
     Ok(true)
+}
+
+/// Unit files the user manager reads from `$XDG_RUNTIME_DIR/systemd/user`, which outrank the image's own
+/// (`/usr/lib/systemd/user`). Images that ship `dbus-broker` as the bus (Bluefin, CentOS bootc) also ship
+/// `dbus-daemon`; `dbus-broker-launch` exits `ENOENT` (launcher.c +1345) here on every start, so with
+/// `dbus-daemon` available the bus unit is pointed at it and the broker's is masked.
+/// Returns whether the override was written.
+fn prefer_dbus_daemon(runtime: &std::path::Path, unit_dir: &std::path::Path) -> bool {
+    let daemon_unit = unit_dir.join("dbus-daemon.service");
+    if !daemon_unit.is_file() || find_in_path("dbus-daemon").is_none() {
+        return false;
+    }
+    let dest = runtime.join("systemd/user");
+    if fs::create_dir_all(&dest).is_err() {
+        return false;
+    }
+    let link = |name: &str, target: &std::path::Path| {
+        let at = dest.join(name);
+        let _ = fs::remove_file(&at);
+        std::os::unix::fs::symlink(target, &at).is_ok()
+    };
+    link("dbus.service", &daemon_unit)
+        && link("dbus-broker.service", std::path::Path::new("/dev/null"))
 }
 
 /// Start the user manager with the shim preloaded; its units start the bus and the session. The
@@ -461,6 +485,9 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
                     )
                     .run(Duration::from_millis(200))
                 });
+            }
+            if !prefer_dbus_daemon(&dir, std::path::Path::new(USER_UNITS)) {
+                eprintln!("warn: no dbus-daemon unit; the image's own bus unit is used");
             }
             start_systemd_user(std::path::Path::new(SYSTEMD), shim, &dir)
         });
@@ -819,6 +846,32 @@ mod tests {
         assert_eq!(
             fs::read_to_string(cg.join("cgroup.events")).unwrap(),
             "populated 0\n"
+        );
+    }
+
+    #[test]
+    fn dbus_daemon_replaces_the_broker_unit_when_present() {
+        let d = tempfile::tempdir().unwrap();
+        let (run, units) = (d.path().join("run"), d.path().join("units"));
+        fs::create_dir_all(&units).unwrap();
+        // no dbus-daemon unit: nothing is written
+        assert!(!prefer_dbus_daemon(&run, &units));
+        assert!(!run.join("systemd/user").exists());
+        fs::write(units.join("dbus-daemon.service"), "").unwrap();
+        if find_in_path("dbus-daemon").is_none() {
+            assert!(!prefer_dbus_daemon(&run, &units), "needs the binary too");
+            return;
+        }
+        assert!(prefer_dbus_daemon(&run, &units));
+        assert!(prefer_dbus_daemon(&run, &units), "idempotent");
+        let dest = run.join("systemd/user");
+        assert_eq!(
+            fs::read_link(dest.join("dbus.service")).unwrap(),
+            units.join("dbus-daemon.service")
+        );
+        assert_eq!(
+            fs::read_link(dest.join("dbus-broker.service")).unwrap(),
+            std::path::PathBuf::from("/dev/null")
         );
     }
 
