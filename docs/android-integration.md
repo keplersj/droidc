@@ -73,6 +73,12 @@ Items 2 to 4 are what makes a session feel native and most are read-only or one-
 
 ## Logcat (implemented)
 
+`droidc log [-p debug|info|warn|error] [-t tag] message...` writes one message from a script, in the
+guest or on the host, whatever `DROIDC_LOGCAT` says. Checked on a Galaxy Tab S10+ (Android 16, SELinux
+enforcing): from the adb shell uid, from Selkie's app uid, and from inside proot, each shows up in
+`adb logcat -v uid` under the right uid with the right priority.
+
+
 `DROIDC_LOGCAT=off|auto|debug|info|warn|error` (default off; `auto` means info). `supervise` binds the
 journal's datagram socket (`sd_journal_send`, the manager's log) and, with `--systemd`, its stdout
 stream socket, and forwards what arrives to `/dev/socket/logdw`, which is how `liblog` itself writes.
@@ -80,5 +86,6 @@ The identifier is the tag; journal `PRIORITY` (and `<N>` prefixes on unit output
 priority; long lines are split. Opt-in because guest logs can hold paths and user names and logcat
 lands in bug reports; logd also throttles floods, so debug level on a busy shell will lose lines.
 `DROIDC_LOGDW` points at another socket for tests. The wire format is logd's ABI to liblog rather than a
-documented API, stable since Android 7, and not yet checked on a device: that needs `/dev/socket/logdw`
-visible in the guest (Selkie binds `/dev`) and SELinux allowing the write (it allows every app domain).
+documented API, stable since Android 7, and checked on the device above (the guest sees `/dev/socket/logdw` through Selkie's `/dev` bind). The
+forwarding of journal and unit output (`DROIDC_LOGCAT` with `supervise`) has so far been run against a
+fake logd only.

@@ -7,7 +7,7 @@ use droidc::link::{LinkKind, DEFAULT_L2S_PREFIX};
 use droidc::platform::Platform;
 use droidc::registry::HttpConfig;
 use droidc::session::{self, Renderer, SessionSpec};
-use droidc::{bridge, login1, status, supervise};
+use droidc::{bridge, logcat, login1, status, supervise};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -103,6 +103,16 @@ enum Cmd {
         /// Seconds to wait for the session compositor's ScreenCast service
         #[arg(long, default_value_t = 120)]
         timeout: u64,
+    },
+    /// Write one message to Android's log (logcat), from the guest or the host
+    Log {
+        /// debug, info, warn or error
+        #[arg(short, long, default_value = "info")]
+        priority: String,
+        #[arg(short, long, default_value = "droidc")]
+        tag: String,
+        #[arg(required = true, trailing_var_arg = true)]
+        message: Vec<String>,
     },
     /// (inside the guest) answer org.freedesktop.login1 on the system bus (stand-in for logind)
     Login1,
@@ -242,7 +252,9 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
         Cmd::ShellSpec => Ok(("shell-spec", status::shell_spec(&root)?)),
         Cmd::Platform => Ok(("platform", serde_json::to_value(Platform::detect()?)?)),
         Cmd::Session { action } => Ok(("session", session_cmd(&root, action)?)),
-        Cmd::Supervise { .. } | Cmd::Bridge { .. } | Cmd::Login1 => unreachable!(),
+        Cmd::Supervise { .. } | Cmd::Bridge { .. } | Cmd::Login1 | Cmd::Log { .. } => {
+            unreachable!()
+        }
     }
 }
 
@@ -299,6 +311,20 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+    if let Cmd::Log {
+        priority,
+        tag,
+        message,
+    } = &cli.cmd
+    {
+        std::process::exit(match logcat::write(priority, tag, &message.join(" ")) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("droidc log: {e}");
+                1
+            }
+        });
     }
     if let Cmd::Login1 = &cli.cmd {
         match login1::run() {

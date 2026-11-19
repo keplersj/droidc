@@ -43,7 +43,7 @@ impl Level {
         }
     }
 
-    fn parse(s: &str) -> Option<Level> {
+    pub fn parse(s: &str) -> Option<Level> {
         match s {
             "debug" => Some(Level::Debug),
             "info" | "auto" | "on" | "1" | "true" => Some(Level::Info),
@@ -86,8 +86,13 @@ impl Logcat {
     /// Send `message` (one entry per line, long lines split) below `tag`. Best effort: logd drops what
     /// it throttles and there is nobody to tell.
     pub fn log(&self, level: Level, tag: &str, message: &str) {
+        let _ = self.try_log(level, tag, message);
+    }
+
+    /// [`Logcat::log`], reporting a failure to reach logd.
+    pub fn try_log(&self, level: Level, tag: &str, message: &str) -> std::io::Result<()> {
         if level < self.min {
-            return;
+            return Ok(());
         }
         let tid = rustix::process::getpid().as_raw_nonzero().get() as u16;
         let now = std::time::SystemTime::now()
@@ -95,17 +100,27 @@ impl Logcat {
             .unwrap_or_default();
         for line in message.lines().filter(|l| !l.trim().is_empty()) {
             for chunk in chunks(line, MAX_MESSAGE) {
-                let _ = self.sock.send(&encode(
+                self.sock.send(&encode(
                     level,
                     tag,
                     chunk,
                     tid,
                     now.as_secs() as u32,
                     now.subsec_nanos(),
-                ));
+                ))?;
             }
         }
+        Ok(())
     }
+}
+
+/// `droidc log`: one message at `priority` (a level name), whatever `DROIDC_LOGCAT` says.
+pub fn write(priority: &str, tag: &str, message: &str) -> Result<(), String> {
+    let level = Level::parse(priority).ok_or_else(|| format!("unknown priority '{priority}'"))?;
+    let path = std::env::var("DROIDC_LOGDW").unwrap_or_else(|_| LOGDW.to_string());
+    let l = Logcat::open(Path::new(&path), Level::Debug).map_err(|e| format!("{path}: {e}"))?;
+    l.try_log(level, tag, message)
+        .map_err(|e| format!("{path}: {e}"))
 }
 
 /// `s` in pieces of at most `max` bytes, cut on character boundaries.
