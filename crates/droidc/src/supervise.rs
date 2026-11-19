@@ -15,7 +15,7 @@ use crate::session::{self, Renderer, SessionSpec};
 use std::fs;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -100,7 +100,7 @@ fn start_bus(socket: &std::path::Path, scope: &str, var: &str) -> Option<Child> 
         start_dbus(socket, &bin)
     } else {
         let bin = find_in_path("dbus-broker-launch")?;
-        start_journal_sink();
+        crate::journal::start(false);
         start_broker(socket, &bin, &["--scope", scope])
     };
     match started {
@@ -139,74 +139,6 @@ fn ensure_machine_id(path: &std::path::Path) -> std::io::Result<bool> {
     let id: String = raw.iter().map(|b| format!("{b:02x}")).collect();
     fs::write(path, format!("{id}\n"))?;
     Ok(true)
-}
-
-const JOURNAL_SOCKET: &str = "/run/systemd/journal/socket";
-
-/// `dbus-broker-launch` connects a datagram socket to the journal at startup and exits with ENOENT
-/// when `/run/systemd/journal/socket` is missing (no systemd in the guest). Bind a stand-in there
-/// and discard what arrives; a detached thread owns it for the life of the process. Best effort:
-/// does nothing when something already listens there or `/run` is not writable.
-fn start_journal_sink() {
-    start_journal_sink_at(std::path::Path::new(JOURNAL_SOCKET));
-}
-
-fn start_journal_sink_at(path: &std::path::Path) {
-    // A socket file left by a previous session refuses connections; only a live listener is kept.
-    if path.exists() {
-        let live = UnixDatagram::unbound()
-            .and_then(|c| c.connect(path))
-            .is_ok();
-        if live || fs::remove_file(path).is_err() {
-            return;
-        }
-    }
-    if let Some(parent) = path.parent() {
-        if fs::create_dir_all(parent).is_err() {
-            return;
-        }
-    }
-    let Ok(sock) = UnixDatagram::bind(path) else {
-        return;
-    };
-    // `DROIDC_JOURNAL=stderr` prints what arrives instead of dropping it: with no journald, this is
-    // the only place the manager's and the units' own messages go (CI logs, debugging).
-    let print = std::env::var("DROIDC_JOURNAL").as_deref() == Ok("stderr");
-    std::thread::spawn(move || {
-        let mut buf = vec![0u8; 65536];
-        while let Ok(n) = sock.recv(&mut buf) {
-            if print {
-                if let Some(line) = journal_line(&buf[..n]) {
-                    eprintln!("journal: {line}");
-                }
-            }
-        }
-    });
-}
-
-/// `IDENT: message` from a native-protocol journal datagram (`KEY=value\n` fields; binary fields are
-/// `KEY\n<u64 LE length><data>\n`).
-fn journal_line(mut d: &[u8]) -> Option<String> {
-    let (mut ident, mut msg) = (None, None);
-    while !d.is_empty() {
-        let nl = d.iter().position(|&b| b == b'\n')?;
-        let line = &d[..nl];
-        let (key, val, used) = if let Some(eq) = line.iter().position(|&b| b == b'=') {
-            (&line[..eq], &line[eq + 1..], nl + 1)
-        } else {
-            let len = u64::from_le_bytes(d.get(nl + 1..nl + 9)?.try_into().ok()?) as usize;
-            (line, d.get(nl + 9..nl + 9 + len)?, nl + 9 + len + 1)
-        };
-        match key {
-            b"MESSAGE" => msg = Some(String::from_utf8_lossy(val).into_owned()),
-            b"SYSLOG_IDENTIFIER" | b"_COMM" if ident.is_none() => {
-                ident = Some(String::from_utf8_lossy(val).into_owned())
-            }
-            _ => {}
-        }
-        d = d.get(used..)?;
-    }
-    Some(format!("{}: {}", ident.unwrap_or_default(), msg?))
 }
 
 /// Socket-activate `dbus-broker-launch --scope user` by hand (without `--systemd`, nothing here runs
@@ -360,7 +292,7 @@ fn start_systemd_user(
     let mut cmd = Command::new(bin);
     // Like the log level, the target only sticks as an argument: the stand-in journal socket would
     // otherwise swallow the manager's own messages.
-    let target = if std::env::var("DROIDC_JOURNAL").as_deref() == Ok("stderr") {
+    let target = if crate::journal::print_enabled() {
         "journal"
     } else {
         "console"
@@ -513,7 +445,7 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
     }
     let mut user_manager = false;
     if let Some(shim) = &shim {
-        start_journal_sink();
+        crate::journal::start(true);
         let started = prepare_systemd(
             std::path::Path::new("/run"),
             std::path::Path::new(CGROUP_ROOT),
@@ -778,36 +710,6 @@ mod tests {
 
     fn child_lock() -> std::sync::MutexGuard<'static, ()> {
         CHILD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    #[test]
-    fn journal_sink_replaces_stale_socket_and_keeps_live_one() {
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("journal/socket");
-        // stale: bound then dropped, leaving the file behind with no listener
-        fs::create_dir_all(p.parent().unwrap()).unwrap();
-        drop(UnixDatagram::bind(&p).unwrap());
-        assert!(UnixDatagram::unbound().unwrap().connect(&p).is_err());
-        start_journal_sink_at(&p);
-        let c = UnixDatagram::unbound().unwrap();
-        c.connect(&p).expect("sink must accept connections");
-        c.send(b"hello").unwrap();
-        // live: a second call leaves the working socket alone
-        start_journal_sink_at(&p);
-        c.send(b"again").unwrap();
-    }
-
-    #[test]
-    fn journal_datagrams_are_decoded() {
-        let mut d = b"PRIORITY=6\nSYSLOG_IDENTIFIER=systemd\nMESSAGE=Started x.\n".to_vec();
-        assert_eq!(journal_line(&d).unwrap(), "systemd: Started x.");
-        // a binary-framed field: KEY\n<len le64>data\n
-        d.extend(b"MULTI\n");
-        d.extend(5u64.to_le_bytes());
-        d.extend(b"a\nb\nc\n");
-        d.extend(b"MESSAGE=after\n");
-        assert_eq!(journal_line(&d).unwrap(), "systemd: after");
-        assert_eq!(journal_line(b"no newline"), None);
     }
 
     #[test]

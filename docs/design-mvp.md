@@ -315,6 +315,9 @@ supervise runs the image's own `/usr/lib/systemd/systemd --user` instead of a ba
   `dbus-daemon` and the session's own services. Not verified on Android yet: see
   [`systemd-on-proot.md`](systemd-on-proot.md).
 
+`DROIDC_JOURNAL=stderr` prints what reaches the stand-in journal sockets; `DROIDC_LOGCAT=auto|debug|info|warn|error`
+forwards it to Android's log ([`android-integration.md`](android-integration.md)).
+
 `--session` also starts `droidc login1`, a stand-in for `systemd-logind` on the system bus (one session,
 one seat, always active; `TakeDevice` and power operations refused), and sets `XDG_SESSION_ID=1` and
 `XDG_SEAT=seat0`.
