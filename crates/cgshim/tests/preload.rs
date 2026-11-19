@@ -5,19 +5,37 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The built shim. `cargo test` does not build a cdylib for an integration test, so build it here (once);
+/// otherwise the tests would load a stale one, or none.
 fn shim() -> PathBuf {
-    // The test binary sits in target/<profile>/deps (older cargo) or target/<profile>/build/<pkg>/<hash>/out
-    // (newer); the cdylib is in target/<profile>. Walk up until it turns up.
-    let exe = std::env::current_exe().unwrap();
-    exe.ancestors()
-        .map(|dir| dir.join("libcgshim.so"))
-        .find(|so| so.is_file())
-        .unwrap_or_else(|| {
-            panic!(
-                "build the cdylib first (cargo build -p cgshim); looked above {}",
-                exe.display()
-            )
+    static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let mut build =
+                Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+            build.args([
+                "build",
+                "-p",
+                "cgshim",
+                "--manifest-path",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+            ]);
+            if !cfg!(debug_assertions) {
+                build.arg("--release");
+            }
+            assert!(
+                build.status().expect("run cargo").success(),
+                "cargo build -p cgshim failed"
+            );
+            // The test binary sits in target/<profile>/deps (older cargo) or target/<profile>/build/<pkg>/<hash>/out
+            // (newer); the cdylib is in target/<profile>. Walk up until it turns up.
+            let exe = std::env::current_exe().unwrap();
+            exe.ancestors()
+                .map(|dir| dir.join("libcgshim.so"))
+                .find(|so| so.is_file())
+                .unwrap_or_else(|| panic!("libcgshim.so not found above {}", exe.display()))
         })
+        .clone()
 }
 
 struct Tree(PathBuf);
@@ -189,4 +207,57 @@ fn directory_listings_still_work_and_dt_lnk_is_hidden_from_callers() {
     std::os::unix::fs::symlink("f", t.0.join("l")).unwrap();
     let (out, _) = t.sh(&format!("ls -1 {}", t.p("")));
     assert_eq!(out.lines().collect::<Vec<_>>(), ["f", "l"]);
+}
+
+/// Child half of the seccomp test: with an unreadable filter pointer the real calls fail with EFAULT, so
+/// success can only mean the shim answered without calling them.
+#[test]
+fn seccomp_helper() {
+    if std::env::var_os("CGSHIM_HELPER_SECCOMP").is_none() {
+        return;
+    }
+    let via_prctl = unsafe { libc::prctl(libc::PR_SET_SECCOMP, 2, std::ptr::null::<u8>(), 0, 0) };
+    let via_syscall = unsafe { libc::syscall(libc::SYS_seccomp, 1, 0, std::ptr::null::<u8>()) };
+    // Strict mode and other prctl options are not touched: an invalid mode still fails.
+    let other = unsafe { libc::prctl(libc::PR_SET_SECCOMP, 99, 0, 0, 0) };
+    println!("SECCOMP {via_prctl} {via_syscall} {other}");
+}
+
+fn seccomp_results(preload: bool) -> (i64, i64, i64) {
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args([
+        "--exact",
+        "seccomp_helper",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env("CGSHIM_HELPER_SECCOMP", "1");
+    if preload {
+        cmd.env("LD_PRELOAD", shim());
+    }
+    let out = cmd.output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let line = text
+        .split_once("SECCOMP ")
+        .unwrap_or_else(|| panic!("{text}"))
+        .1
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    let v: Vec<i64> = line.split(' ').map(|n| n.parse().unwrap()).collect();
+    (v[0], v[1], v[2])
+}
+
+#[test]
+fn installing_a_seccomp_filter_is_reported_as_done_and_nothing_else_changes() {
+    let (p, s, o) = seccomp_results(true);
+    assert_eq!((p, s), (0, 0), "the shim answers for filter installs");
+    assert_eq!(o, -1, "other seccomp modes still reach the kernel");
+    let (p, s, _) = seccomp_results(false);
+    assert_eq!(
+        (p, s),
+        (-1, -1),
+        "without the shim the same calls fail (EFAULT): the test proves something"
+    );
 }

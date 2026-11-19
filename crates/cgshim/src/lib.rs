@@ -17,6 +17,9 @@
 //!   names (proot cannot exec through `/proc/self/fd`);
 //! - `posix_spawn(POSIX_SPAWN_SETCGROUP)` becomes a plain spawn plus a write of the pid to the unit's
 //!   `cgroup.procs`;
+//! - installing a seccomp filter (`prctl(PR_SET_SECCOMP)` or `seccomp(2)`, which is how systemd applies a
+//!   unit's `SystemCallFilter=`) reports success and does nothing: such a filter kills services with
+//!   SIGSYS here and the guest has no sandbox to keep;
 //! - `cgroup.procs` is opened for append, so every pid systemd writes survives;
 //! - `cgroup.events` starts as `populated 1` so a waiter sees a change when droidc's helper flips it.
 //!

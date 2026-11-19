@@ -641,6 +641,18 @@ export_readdir!(readdir, "readdir", libc::dirent);
 export_readdir!(readdir64, "readdir64", libc::dirent64);
 
 const PR_SET_SECUREBITS: c_int = 28;
+const PR_SET_SECCOMP: c_int = 22;
+const SECCOMP_MODE_FILTER: c_ulong = 2;
+const SECCOMP_SET_MODE_FILTER: c_ulong = 1;
+
+/// A unit's `SystemCallFilter=`, `MemoryDenyWriteExecute=` and the like are installed as seccomp filters
+/// by the executor. Under proot on Android they only do harm: a syscall that the unit's filter does not
+/// list, or that proot rewrites, kills the service with SIGSYS (PipeWire, on the API 34 emulator), and
+/// there is no sandbox here to keep: the guest already runs inside the app's. So a filter install
+/// reports success and installs nothing. Strict mode and everything else pass through.
+fn seccomp_filter_install(option: c_int, mode: c_ulong) -> bool {
+    option == PR_SET_SECCOMP && mode == SECCOMP_MODE_FILTER
+}
 
 /// The executor calls `prctl(PR_SET_SECUREBITS)` for every service, which an app uid (no
 /// `CAP_SETPCAP`) is refused with EPERM: the unit then fails with 213/SECUREBITS before it starts.
@@ -664,6 +676,10 @@ pub unsafe extern "C" fn prctl(
         set_errno(libc::ENOSYS);
         return -1;
     };
+    if seccomp_filter_install(option, a2) {
+        trace(format_args!("prctl(PR_SET_SECCOMP, FILTER) skipped"));
+        return 0;
+    }
     // SAFETY: the real function, with the caller's arguments.
     let r = unsafe { real(option, a2, a3, a4, a5) };
     if r < 0 && errno() == libc::EPERM && option == PR_SET_SECUREBITS {
@@ -673,6 +689,43 @@ pub unsafe extern "C" fn prctl(
         return 0;
     }
     r
+}
+
+/// libseccomp (which systemd dlopens) installs a filter with `syscall(__NR_seccomp, ...)`, not `prctl`.
+/// Every other call passes through untouched.
+///
+/// # Safety
+/// Called as libc's `syscall`; the arguments are passed through untouched.
+#[allow(unknown_lints, invalid_runtime_symbol_definitions)]
+#[no_mangle]
+pub unsafe extern "C" fn syscall(
+    number: libc::c_long,
+    a1: libc::c_long,
+    a2: libc::c_long,
+    a3: libc::c_long,
+    a4: libc::c_long,
+    a5: libc::c_long,
+    a6: libc::c_long,
+) -> libc::c_long {
+    if number == libc::SYS_seccomp && a1 as c_ulong == SECCOMP_SET_MODE_FILTER {
+        trace(format_args!("seccomp(SET_MODE_FILTER) skipped"));
+        return 0;
+    }
+    type SyscallFn = unsafe extern "C" fn(
+        libc::c_long,
+        libc::c_long,
+        libc::c_long,
+        libc::c_long,
+        libc::c_long,
+        libc::c_long,
+        libc::c_long,
+    ) -> libc::c_long;
+    let Some(real) = real!("syscall", SyscallFn) else {
+        set_errno(libc::ENOSYS);
+        return -1;
+    };
+    // SAFETY: the real function, with the caller's arguments (unused ones are whatever the caller left).
+    unsafe { real(number, a1, a2, a3, a4, a5, a6) }
 }
 
 /// Debugging aid, silent unless `CGSHIM_TRACE` is set: say which unix socket a failed `connect` wanted.
