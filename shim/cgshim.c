@@ -126,6 +126,7 @@ static int fake_cgroup_fd(int pid) {
   if (!find_cgroup(ROOT, pid, path, sizeof path, 0) || !path[0]) strcpy(path, "/");
   char body[4200];
   int len = snprintf(body, sizeof body, "0::%s\n", path);
+  if (getenv("CGSHIM_TRACE")) fprintf(stderr, "cgshim: /proc/%d/cgroup -> %s", pid, body);
   int fd = syscall(SYS_memfd_create, "cgroup", 0);
   if (fd < 0) return -1;
   if (write(fd, body, len) != len) { close(fd); return -1; }
@@ -391,6 +392,7 @@ int mkdir(const char *p, mode_t m) {
   NEXT(int, "mkdir", (const char *, mode_t));
   int r = real(p, m);
   if (!r && under(p)) populate(p);
+  if (r && p && under(p) && getenv("CGSHIM_TRACE")) fprintf(stderr, "cgshim: mkdir %s: %s\n", p, strerror(errno));
   return r;
 }
 int mkdirat(int d, const char *p, mode_t m) {
@@ -398,6 +400,10 @@ int mkdirat(int d, const char *p, mode_t m) {
   int r = real(d, p, m);
   char full[8192];
   if (!r && abs_under(d, p, full, sizeof full)) populate(full);
+  if (r && getenv("CGSHIM_TRACE") && abs_under(d, p, full, sizeof full)) {
+    int e = errno;
+    fprintf(stderr, "cgshim: mkdirat(%d) %s: %s\n", d, full, strerror(e));
+  }
   return r;
 }
 int rmdir(const char *p) {
