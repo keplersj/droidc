@@ -953,6 +953,11 @@ mod tests {
         assert_eq!(sp["session_label"], "gnome");
         assert_eq!(sp["cwd"], "/root");
         assert_eq!(sp["binds"][2]["guest"], "/run/droidc/root");
+        assert_eq!(sp["systemd"]["binds"][0]["guest"], "/sys/fs/cgroup");
+        assert!(sp["systemd"]["binds"][0]["host"]
+            .as_str()
+            .unwrap()
+            .ends_with("/root/cgroup"));
         assert!(sp["rootfs"]
             .as_str()
             .unwrap()

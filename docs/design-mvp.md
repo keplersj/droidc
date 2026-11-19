@@ -200,6 +200,7 @@ layers) and returns `{"changed":false,"verify_only":true,"id","manifest_digest",
 
 ```json
 {"rootfs":"<root>/current/rootfs","binds":[{"host":"<root>/var","guest":"/var"},{"host":"<root>/home","guest":"/home"},{"host":"<root>","guest":"/run/droidc/root"}],
+ "systemd":{"binds":[{"host":"<root>/cgroup","guest":"/sys/fs/cgroup"}],"shim":"/usr/lib/droidc/cgshim.so"},
  "env":{"DROIDC_ROOT":"/run/droidc/root","HOME":"/root","PATH":"...","TERM":"xterm-256color","LANG":"C.UTF-8"},
  "cwd":"/root","session_label":"gnome",
  "session":{"name":"GNOME","renderer":"screencast","exec":["gnome-shell","--headless","--virtual-monitor","{width}x{height}"],
@@ -284,10 +285,39 @@ image for `screencast`: `gst-launch-1.0` with the PipeWire plugin, `pw-link`, an
 `droidc supervise -- cmd...` runs inside the guest: creates `XDG_RUNTIME_DIR` (0700) if needed, starts
 a session bus and exports `DBUS_SESSION_BUS_ADDRESS`, runs `cmd` as a child, reaps all children and
 exits with the command's status (the command always runs, even if no bus could be started).
-`systemd --user` cannot run under proot. The bus is `dbus-daemon --nofork` (session configuration)
+It marks itself a child subreaper first: under proot the guest has no PID 1, so orphaned daemons
+would otherwise go to the host's init and never be seen to exit. The bus is `dbus-daemon --nofork` (session configuration)
 when the image has it (Bluefin LTS does), kept as a child so it stops with the supervisor. Images with
 only `dbus-broker` (CentOS Stream 10 bootc) get socket activation done by droidc: bind+listen
 `$XDG_RUNTIME_DIR/bus`, spawn `dbus-broker-launch --scope user` with that socket as fd 3 and
 `LISTEN_FDS=1`, `LISTEN_FDNAMES=dbus.socket`, `LISTEN_PID=<broker pid>` (set by a tiny `sh -c ... exec`
 wrapper so the pid matches). dbus-broker forwards D-Bus activation to systemd, so on such images
 activatable services don't start.
+
+### `--systemd=off|auto|on` (opt-in while it is proven)
+
+bootc images are systemd images, and GNOME depends on `systemd --user` (session services,
+`org.freedesktop.systemd1` for dbus-broker activation and app scopes). With `--systemd=on`,
+supervise runs the image's own `/usr/lib/systemd/systemd --user` instead of a bare bus:
+
+- `/usr/lib/droidc/cgshim.so` (`DROIDC_CGSHIM`; `shim/cgshim.c`, built against glibc for the guest's
+  arch) is preloaded into it. systemd refuses to start without a writable cgroup2 tree, and an app
+  has none; the shim makes the plain directory bound at `/sys/fs/cgroup` (`shell-spec` `systemd.binds`,
+  bind it after `/sys`) look like cgroup2 (statfs magic, `/proc/<pid>/cgroup`, the `cgroup.*` files on
+  `mkdir`, `rmdir`, append-mode `cgroup.procs`) and makes systemd 257's `posix_spawn(SETCGROUP)` a
+  plain spawn followed by a `cgroup.procs` write.
+- supervise creates `/run/systemd/system` (systemd's `sd_booted()` test), a journal socket stand-in,
+  and runs `cgroups.rs`: a poller that does what the kernel would, keeping `cgroup.procs` and
+  `cgroup.events` (`populated`) current and honouring `cgroup.kill`. Membership comes from the pids
+  systemd appends, forks, and `INVOCATION_ID` for orphans. Without it a finished unit never ends.
+- The session bus is then `dbus.socket`/`dbus-broker` started by systemd itself, so activation works.
+- `auto` uses it when the image has systemd and the shim exists; `off` (default) keeps
+  `dbus-daemon` and the session's own services. Not verified on Android yet: see
+  [`systemd-on-proot.md`](systemd-on-proot.md).
+
+`DROIDC_JOURNAL=stderr` prints what reaches the stand-in journal sockets; `DROIDC_LOGCAT=auto|debug|info|warn|error`
+forwards it to Android's log ([`android-integration.md`](android-integration.md)).
+
+`--session` also starts `droidc login1`, a stand-in for `systemd-logind` on the system bus (one session,
+one seat, always active; `TakeDevice` and power operations refused), and sets `XDG_SESSION_ID=1` and
+`XDG_SEAT=seat0`.

@@ -47,6 +47,7 @@ droidc --root ~/droidc switch quay.io/centos-bootc/centos-bootc:stream10 --insec
 droidc switch <ref> --verify-only      # resolve + verify signature, download no layers
 droidc upgrade | rollback | status | gc | shell-spec | platform
 droidc supervise -- bash -l            # inside the guest
+droidc supervise --systemd=on -- bash -l   # run the image's own systemd --user (cgroup shim, see docs/systemd-on-proot.md)
 droidc supervise --session --width 1920 --height 1200   # inside the guest: the graphical session
 droidc session set --renderer screencast --exec '["gnome-shell","--headless","--virtual-monitor","{width}x{height}"]' \
   --services '[["pipewire"],["wireplumber"]]' --name GNOME   # for images without session labels

@@ -50,6 +50,12 @@ pub fn shell_spec(root_path: &Path) -> Result<Value> {
             {"host": format!("{r}/home"), "guest": "/home"},
             {"host": r, "guest": "/run/droidc/root"},
         ],
+        // Only for `supervise --systemd`: the cgroup stand-in must be bound after `/sys`, and the
+        // LD_PRELOAD library (built for the guest's glibc) placed at `shim`.
+        "systemd": {
+            "binds": [{"host": format!("{r}/cgroup"), "guest": "/sys/fs/cgroup"}],
+            "shim": "/usr/lib/droidc/cgshim.so",
+        },
         "env": {
             "DROIDC_ROOT": "/run/droidc/root",
             "HOME": "/root",

@@ -57,6 +57,10 @@ impl Root {
     pub fn var(&self) -> PathBuf {
         self.path.join("var")
     }
+    /// Stands in for `/sys/fs/cgroup` when the guest runs `supervise --systemd` (see `shim/cgshim.c`).
+    pub fn cgroup(&self) -> PathBuf {
+        self.path.join("cgroup")
+    }
     pub fn home(&self) -> PathBuf {
         self.path.join("home")
     }
@@ -78,6 +82,7 @@ impl Root {
             self.deployments(),
             self.staging(),
             self.var(),
+            self.cgroup(),
             self.home().join("root"),
         ] {
             fs::create_dir_all(&d).context(d.display())?;

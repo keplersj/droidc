@@ -7,7 +7,7 @@ use droidc::link::{LinkKind, DEFAULT_L2S_PREFIX};
 use droidc::platform::Platform;
 use droidc::registry::HttpConfig;
 use droidc::session::{self, Renderer, SessionSpec};
-use droidc::{bridge, status, supervise};
+use droidc::{bridge, logcat, login1, status, supervise};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -75,6 +75,10 @@ enum Cmd {
         /// Session scale factor (`{scale}`)
         #[arg(long, default_value_t = 1.0)]
         scale: f64,
+        /// Run the image's `systemd --user` on the cgroup shim (DROIDC_CGSHIM, default
+        /// /usr/lib/droidc/cgshim.so) instead of a bare dbus-daemon
+        #[arg(long, value_enum, default_value_t = supervise::SystemdMode::Off)]
+        systemd: supervise::SystemdMode,
         /// Command to run. With --session it is optional and replaces the screencast bridge (or runs as an
         /// extra client of a nested session); the session ends when it exits
         #[arg(
@@ -100,6 +104,18 @@ enum Cmd {
         #[arg(long, default_value_t = 120)]
         timeout: u64,
     },
+    /// Write one message to Android's log (logcat), from the guest or the host
+    Log {
+        /// debug, info, warn or error
+        #[arg(short, long, default_value = "info")]
+        priority: String,
+        #[arg(short, long, default_value = "droidc")]
+        tag: String,
+        #[arg(required = true, trailing_var_arg = true)]
+        message: Vec<String>,
+    },
+    /// (inside the guest) answer org.freedesktop.login1 on the system bus (stand-in for logind)
+    Login1,
     /// Show or override how the graphical session starts
     Session {
         #[command(subcommand)]
@@ -236,7 +252,9 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
         Cmd::ShellSpec => Ok(("shell-spec", status::shell_spec(&root)?)),
         Cmd::Platform => Ok(("platform", serde_json::to_value(Platform::detect()?)?)),
         Cmd::Session { action } => Ok(("session", session_cmd(&root, action)?)),
-        Cmd::Supervise { .. } | Cmd::Bridge { .. } => unreachable!(),
+        Cmd::Supervise { .. } | Cmd::Bridge { .. } | Cmd::Login1 | Cmd::Log { .. } => {
+            unreachable!()
+        }
     }
 }
 
@@ -247,6 +265,7 @@ fn main() {
         width,
         height,
         scale,
+        systemd,
         cmd,
     } = &cli.cmd
     {
@@ -260,6 +279,7 @@ fn main() {
                     ..Default::default()
                 },
             }),
+            systemd: *systemd,
         };
         match supervise::supervise_with(cmd, &opts) {
             Ok(code) => std::process::exit(code),
@@ -288,6 +308,29 @@ fn main() {
             Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("droidc bridge: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Cmd::Log {
+        priority,
+        tag,
+        message,
+    } = &cli.cmd
+    {
+        std::process::exit(match logcat::write(priority, tag, &message.join(" ")) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("droidc log: {e}");
+                1
+            }
+        });
+    }
+    if let Cmd::Login1 = &cli.cmd {
+        match login1::run() {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("droidc login1: {e}");
                 std::process::exit(1);
             }
         }

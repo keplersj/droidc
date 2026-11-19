@@ -3,11 +3,22 @@ name: measure-bluefin
 # Measures a real Bluefin LTS arm64 deployment on an arm64 runner: download size, unpack time,
 # size on disk and hard-link count with the Android link strategy (link2symlink), signature
 # verification, a smoke run of os-release / flatpak inside the deployment, and its GNOME session
-# headless (supervise --session + bridge --dump-frame) in an unprivileged bwrap sandbox.
+# headless (supervise --session + bridge --dump-frame) in an unprivileged bwrap sandbox, an inventory
+# of what that session needs from systemd, and how far the image's own `systemd --user` gets on the
+# cgroup shim (bwrap and proot; report only until there is a baseline).
 # Runs when this file changes or by hand.
 on:
   push:
-    paths: [".github/workflows/measure-bluefin.yml", "crates/droidc/src/supervise.rs", "crates/droidc/src/bridge.rs", "crates/droidc/src/session.rs"]
+    paths:
+      - ".github/workflows/measure-bluefin.yml"
+      - "crates/droidc/src/supervise.rs"
+      - "crates/droidc/src/bridge.rs"
+      - "crates/droidc/src/session.rs"
+      - "crates/droidc/src/login1.rs"
+      - "crates/droidc/src/cgroups.rs"
+      - "shim/**"
+      - "tests/systemd-probe.sh"
+      - "tests/inventory-image.sh"
   workflow_dispatch:
     inputs:
       ref:
@@ -66,6 +77,14 @@ jobs:
           done
           { echo '```'; cat smoke.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           sudo umount "$D/rootfs$R"
+      - name: Inventory of the GNOME session's systemd needs
+        run: |
+          D=$(readlink -f "$R/current")
+          sudo mkdir -p "$D/rootfs$R" && sudo mount --bind "$R" "$D/rootfs$R"
+          sudo chroot "$D/rootfs" /bin/sh -s < tests/inventory-image.sh > inventory.md 2>&1 || true
+          sudo umount "$D/rootfs$R"
+          { echo "### Inventory: what GNOME needs from systemd"; cat inventory.md; } >> "$GITHUB_STEP_SUMMARY"
+          wc -l inventory.md
       - name: GNOME session headless (supervise --session, bridge --dump-frame, unprivileged bwrap)
         run: |
           sudo apt-get update -qq && sudo apt-get install -y bubblewrap python3-pil >/dev/null
@@ -97,6 +116,51 @@ jobs:
           cp $W/tmp/gnome.png gnome.png
           python3 -c "from PIL import Image; im=Image.open('gnome.png').convert('RGB'); n=len(set(im.resize((160,100)).getdata())); print('distinct colors', n); assert n > 50, 'uniform frame'"
           echo "- GNOME headless frame: captured (see artifact gnome-frame)" >> "$GITHUB_STEP_SUMMARY"
+      - name: systemd --user on the cgroup shim (bwrap, report only)
+        continue-on-error: true
+        run: |
+          python3 -m ziglang cc -target aarch64-linux-gnu.2.28 -shared -fPIC -O2 -Wall -o cgshim.so shim/cgshim.c -ldl
+          B=$PWD/target/aarch64-unknown-linux-musl/release/droidc
+          D=$(readlink -f "$R/current")
+          W=$RUNNER_TEMP/sd; rm -rf $W; mkdir -p $W/tmp $W/run/user/$(id -u) $W/var $W/cgroup
+          chmod 700 $W/run/user/$(id -u); cp tests/systemd-probe.sh $W/tmp/probe.sh
+          { cat "$D/rootfs/etc/passwd"; echo "selkie:x:$(id -u):$(id -g):Selkie:/root:/bin/bash"; } > $W/passwd
+          { cat "$D/rootfs/etc/group"; echo "selkie:x:$(id -g):"; } > $W/group
+          set +e
+          timeout 300 bwrap --bind "$D/rootfs" / --bind "$R" "$R" \
+            --bind $W/tmp /tmp --bind $W/run /run --bind "$R" /run/droidc/root --bind $W/var /var \
+            --ro-bind $W/passwd /etc/passwd --ro-bind $W/group /etc/group --ro-bind "$B" /usr/bin/droidc \
+            --dev /dev --proc /proc --ro-bind /sys /sys --bind $W/cgroup /sys/fs/cgroup \
+            --ro-bind cgshim.so /usr/lib/droidc/cgshim.so --unshare-pid --die-with-parent --clearenv \
+            --setenv HOME /root --setenv PATH /usr/bin:/usr/sbin --setenv DROIDC_ROOT /run/droidc/root \
+            --setenv DROIDC_SYSTEMD_STDIO inherit \
+            /usr/bin/droidc supervise --systemd=on -- sh /tmp/probe.sh > systemd-bwrap.log 2>&1
+          echo "exit=$?"
+          { echo "### systemd --user on the cgroup shim (bwrap)"; echo '```'; cat systemd-bwrap.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: systemd --user on the cgroup shim (proot, report only)
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y proot >/dev/null
+          B=$PWD/target/aarch64-unknown-linux-musl/release/droidc
+          D=$(readlink -f "$R/current")
+          W=$RUNNER_TEMP/sdp; rm -rf $W; mkdir -p $W/tmp $W/run/user/$(id -u) $W/var $W/cgroup
+          chmod 700 $W/run/user/$(id -u); cp tests/systemd-probe.sh $W/tmp/probe.sh
+          set +e
+          PROOT_NO_SECCOMP=1 timeout 600 proot -r "$D/rootfs" -w / \
+            -b /dev -b /proc -b /sys -b $W/cgroup:/sys/fs/cgroup -b "$R:$R" -b "$R:/run/droidc/root" \
+            -b $W/tmp:/tmp -b $W/run:/run -b $W/var:/var -b "$B:/usr/bin/droidc" \
+            -b $PWD/cgshim.so:/usr/lib/droidc/cgshim.so \
+            /usr/bin/env -i HOME=/root PATH=/usr/bin:/usr/sbin DROIDC_ROOT=/run/droidc/root DROIDC_SYSTEMD_STDIO=inherit \
+            /usr/bin/droidc supervise --systemd=on -- sh /tmp/probe.sh > systemd-proot.log 2>&1
+          echo "exit=$?"
+          { echo "### systemd --user on the cgroup shim (proot)"; echo '```'; cat systemd-proot.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: systemd-user
+          path: |
+            systemd-bwrap.log
+            systemd-proot.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -104,3 +168,8 @@ jobs:
           path: |
             gnome.png
             session.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: inventory
+          path: inventory.md
