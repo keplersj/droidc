@@ -50,6 +50,21 @@ jobs:
         with:
           name: droidc-${{ matrix.arch }}-linux-musl
           path: dist/droidc-${{ matrix.arch }}-linux-musl
+      # LD_PRELOAD library for the guest's systemd --user (see shim/cgshim.c). The guest is glibc,
+      # so this is not the musl build above; target glibc 2.28 so any bootc image's libc is newer.
+      - name: Build the cgroup shim (glibc)
+        run: |
+          so=dist/cgshim-${{ matrix.arch }}.so
+          python3 -m ziglang cc -target ${{ matrix.arch }}-linux-gnu.2.28 -shared -fPIC -O2 -Wall \
+            -o "$so" shim/cgshim.c -ldl
+          file "$so"
+          file "$so" | grep -q 'shared object'
+          # nothing newer than glibc 2.28 may be required
+          ! objdump -T "$so" | grep -E 'GLIBC_2\.(29|[3-9][0-9])'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cgshim-${{ matrix.arch }}
+          path: dist/cgshim-${{ matrix.arch }}.so
 
   # Host-side Android build (bionic, NDK r27c, API 26): shipped by Selkie as libdroidc.so.
   # The musl build above is the guest-side binary (libdroidc-guest.so).

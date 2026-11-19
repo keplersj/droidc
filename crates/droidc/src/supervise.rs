@@ -2,7 +2,8 @@
 //!
 //! Makes sure `XDG_RUNTIME_DIR` exists (0700), starts a D-Bus session bus and exports
 //! `DBUS_SESSION_BUS_ADDRESS`, runs `cmd` as a child and reaps every child (including orphans
-//! re-parented to us) until it exits, then exits with its status.
+//! re-parented to us) until it exits, then exits with its status. Under proot the guest has no PID 1,
+//! so orphans only come to us because we mark ourselves a child subreaper first.
 //!
 //! With `--session` it also starts the deployment's graphical session (see `session.rs`): a system
 //! bus, the session's services, its compositor, and for `screencast` sessions `droidc bridge`.
@@ -14,9 +15,7 @@ use crate::session::{self, Renderer, SessionSpec};
 use std::fs;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
-#[cfg(test)]
-use std::os::unix::net::UnixStream;
-use std::os::unix::net::{UnixDatagram, UnixListener};
+use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -170,14 +169,48 @@ fn start_journal_sink_at(path: &std::path::Path) {
     let Ok(sock) = UnixDatagram::bind(path) else {
         return;
     };
+    // `DROIDC_JOURNAL=stderr` prints what arrives instead of dropping it: with no journald, this is
+    // the only place the manager's and the units' own messages go (CI logs, debugging).
+    let print = std::env::var("DROIDC_JOURNAL").as_deref() == Ok("stderr");
     std::thread::spawn(move || {
-        let mut buf = [0u8; 8192];
-        while sock.recv(&mut buf).is_ok() {}
+        let mut buf = vec![0u8; 65536];
+        while let Ok(n) = sock.recv(&mut buf) {
+            if print {
+                if let Some(line) = journal_line(&buf[..n]) {
+                    eprintln!("journal: {line}");
+                }
+            }
+        }
     });
 }
 
-/// Socket-activate `dbus-broker-launch --scope user` by hand (systemd --user cannot run under
-/// proot): bind+listen `<dir>/bus`, pass it as fd 3 with `LISTEN_FDS=1`, `LISTEN_PID=<child pid>`.
+/// `IDENT: message` from a native-protocol journal datagram (`KEY=value\n` fields; binary fields are
+/// `KEY\n<u64 LE length><data>\n`).
+fn journal_line(mut d: &[u8]) -> Option<String> {
+    let (mut ident, mut msg) = (None, None);
+    while !d.is_empty() {
+        let nl = d.iter().position(|&b| b == b'\n')?;
+        let line = &d[..nl];
+        let (key, val, used) = if let Some(eq) = line.iter().position(|&b| b == b'=') {
+            (&line[..eq], &line[eq + 1..], nl + 1)
+        } else {
+            let len = u64::from_le_bytes(d.get(nl + 1..nl + 9)?.try_into().ok()?) as usize;
+            (line, d.get(nl + 9..nl + 9 + len)?, nl + 9 + len + 1)
+        };
+        match key {
+            b"MESSAGE" => msg = Some(String::from_utf8_lossy(val).into_owned()),
+            b"SYSLOG_IDENTIFIER" | b"_COMM" if ident.is_none() => {
+                ident = Some(String::from_utf8_lossy(val).into_owned())
+            }
+            _ => {}
+        }
+        d = d.get(used..)?;
+    }
+    Some(format!("{}: {}", ident.unwrap_or_default(), msg?))
+}
+
+/// Socket-activate `dbus-broker-launch --scope user` by hand (without `--systemd`, nothing here runs
+/// the systemd user manager it expects): bind+listen `<dir>/bus`, pass it as fd 3 with `LISTEN_FDS=1`, `LISTEN_PID=<child pid>`.
 /// Returns the bus address and the running broker.
 fn start_broker(
     path: &std::path::Path,
@@ -240,6 +273,130 @@ fn start_session_bus(dir: &std::path::Path) -> Option<Child> {
 #[derive(Debug, Default)]
 pub struct Opts {
     pub session: Option<SessionOpts>,
+    pub systemd: SystemdMode,
+}
+
+/// Whether the image's own `systemd --user` runs the session services (on the cgroup shim, see
+/// `shim/cgshim.c`) instead of a bare `dbus-daemon`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum SystemdMode {
+    /// Never: `dbus-daemon` and the session's own services (the default while this is proven)
+    #[default]
+    Off,
+    /// When the image has systemd and the shim is installed; otherwise as `off`
+    Auto,
+    /// Always; fail when systemd or the shim is missing
+    On,
+}
+
+const SYSTEMD: &str = "/usr/lib/systemd/systemd";
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+const DEFAULT_SHIM: &str = "/usr/lib/droidc/cgshim.so";
+const CGROUP2_MAGIC: i64 = 0x6367_7270;
+/// The cgroup files systemd opens in the root of the tree (real cgroupfs has them itself).
+const CGROUP_ROOT_FILES: [&str; 5] = [
+    "cgroup.procs",
+    "cgroup.controllers",
+    "cgroup.subtree_control",
+    "cgroup.events",
+    "cgroup.type",
+];
+
+/// The shim to preload into `systemd --user`, when `mode` and the guest allow it.
+fn resolve_systemd(
+    mode: SystemdMode,
+    systemd: &std::path::Path,
+    shim: &std::path::Path,
+) -> Result<Option<PathBuf>> {
+    let present = systemd.is_file() && shim.is_file();
+    match (mode, present) {
+        (SystemdMode::Off, _) => Ok(None),
+        (SystemdMode::Auto, false) => Ok(None),
+        (_, true) => Ok(Some(shim.to_path_buf())),
+        (SystemdMode::On, false) => Err(Error::not_found(format!(
+            "--systemd=on needs {} and the cgroup shim {} (DROIDC_CGSHIM)",
+            systemd.display(),
+            shim.display()
+        ))),
+    }
+}
+
+/// What `systemd --user` insists on before it starts: `/run/systemd/system` (its `sd_booted()`
+/// test) and a cgroup tree it can write. Without a real cgroup2 mount the tree is a plain directory
+/// that needs the root `cgroup.*` files a kernel would provide.
+/// Returns whether the tree is the fake one (a real cgroup2 mount needs no accounting).
+fn prepare_systemd(run: &std::path::Path, cgroup: &std::path::Path) -> Result<bool> {
+    let sys = run.join("systemd/system");
+    fs::create_dir_all(&sys).context(sys.display())?;
+    // `f_type`'s width and signedness differ by target (x86_64 glibc i64, aarch64 musl u32, ...).
+    #[allow(clippy::unnecessary_cast)]
+    let real = rustix::fs::statfs(cgroup)
+        .map(|s| s.f_type as i64 == CGROUP2_MAGIC)
+        .unwrap_or(false);
+    if real {
+        return Ok(false);
+    }
+    fs::create_dir_all(cgroup).context(cgroup.display())?;
+    for f in CGROUP_ROOT_FILES {
+        let p = cgroup.join(f);
+        if !p.exists() {
+            fs::write(&p, "").context(p.display())?;
+        }
+    }
+    Ok(true)
+}
+
+/// Start the user manager with the shim preloaded; its units start the bus and the session. The
+/// host display stays out of its environment, like the buses (see `start_dbus`).
+fn start_systemd_user(
+    bin: &std::path::Path,
+    shim: &std::path::Path,
+    dir: &std::path::Path,
+) -> Result<Child> {
+    let preload = match std::env::var("LD_PRELOAD") {
+        Ok(p) if !p.is_empty() => format!("{}:{p}", shim.display()),
+        _ => shim.display().to_string(),
+    };
+    let mut cmd = Command::new(bin);
+    // Like the log level, the target only sticks as an argument: the stand-in journal socket would
+    // otherwise swallow the manager's own messages.
+    let target = if std::env::var("DROIDC_JOURNAL").as_deref() == Ok("stderr") {
+        "journal"
+    } else {
+        "console"
+    };
+    cmd.args(["--user", &format!("--log-target={target}")]);
+    // Without journald the units' output is discarded; `DROIDC_SYSTEMD_STDIO=inherit` sends it to our
+    // stdout instead (CI logs, debugging).
+    if std::env::var("DROIDC_SYSTEMD_STDIO").as_deref() == Ok("inherit") {
+        cmd.args([
+            "--default-standard-output=inherit",
+            "--default-standard-error=inherit",
+        ]);
+    }
+    if let Ok(level) = std::env::var("DROIDC_SYSTEMD_LOG_LEVEL") {
+        // The manager ignores SYSTEMD_LOG_LEVEL for its own messages; only the argument counts.
+        cmd.arg(format!("--log-level={level}"));
+    }
+    cmd.env("LD_PRELOAD", preload)
+        .env("XDG_RUNTIME_DIR", dir)
+        .env("SYSTEMD_LOG_TARGET", target)
+        .env_remove("WAYLAND_DISPLAY")
+        .stdin(Stdio::null())
+        .spawn()
+        .context(bin.display())
+}
+
+/// Wait until something accepts connections on `socket`.
+fn wait_for_socket(socket: &std::path::Path, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if UnixStream::connect(socket).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
 }
 
 #[derive(Debug)]
@@ -261,6 +418,49 @@ fn start_system_bus() -> Option<Child> {
     )
 }
 
+/// Orphaned descendants (double-forked daemons) are re-parented to the nearest subreaper, else to
+/// the host's init, where we would never reap them or see them exit. Best effort.
+fn become_subreaper() {
+    if let Err(e) = rustix::process::set_child_subreaper(Some(rustix::process::getpid())) {
+        eprintln!("warn: could not become a child subreaper: {e}");
+    }
+}
+
+/// `droidc login1` (this binary; `DROIDC_LOGIN1` replaces it in tests): the logind stand-in on the
+/// system bus. It leaves a real logind in charge if one owns the name.
+fn start_login1() -> Option<Child> {
+    let argv = match std::env::var("DROIDC_LOGIN1") {
+        Ok(b) => vec![b],
+        Err(_) => vec![
+            std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "droidc".into()),
+            "login1".into(),
+        ],
+    };
+    match spawn(&argv, &[]) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("warn: login1: {e}");
+            None
+        }
+    }
+}
+
+/// The system bus (unless one is given) and the logind stand-in on it.
+fn start_system_services() -> Vec<Child> {
+    let mut out = Vec::new();
+    if std::env::var_os("DBUS_SYSTEM_BUS_ADDRESS").is_none() {
+        out.extend(start_system_bus());
+    }
+    // logind answers on that bus; without one (a dbus-broker-only image has no dbus-daemon to run a
+    // system bus on, and dbus-broker's system scope needs systemd and root) there is nothing to serve.
+    if std::env::var_os("DBUS_SYSTEM_BUS_ADDRESS").is_some() {
+        out.extend(start_login1());
+    }
+    out
+}
+
 pub fn supervise(cmd: &[String]) -> Result<i32> {
     supervise_with(cmd, &Opts::default())
 }
@@ -278,12 +478,25 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
     if spec.is_none() && cmd.is_empty() {
         return Err(Error::invalid("supervise needs a command after --"));
     }
+    become_subreaper();
     let dir = runtime_dir()?;
     std::env::set_var("XDG_RUNTIME_DIR", &dir);
     if let Err(e) = ensure_machine_id(std::path::Path::new(MACHINE_ID)) {
         eprintln!("warn: could not initialise {MACHINE_ID}: {e}");
     }
+    let shim = resolve_systemd(
+        opts.systemd,
+        std::path::Path::new(SYSTEMD),
+        &std::env::var_os("DROIDC_CGSHIM")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_SHIM)),
+    )?;
     // Before the buses start: activated services inherit the bus's environment.
+    if spec.is_some() || shim.is_some() {
+        // The one session/seat the login1 stand-in serves; mutter and libsystemd look them up by id.
+        std::env::set_var("XDG_SESSION_ID", "1");
+        std::env::set_var("XDG_SEAT", "seat0");
+    }
     if let Some(spec) = &spec {
         std::env::set_var("XDG_SESSION_TYPE", "wayland");
         if let Some(n) = &spec.name {
@@ -293,12 +506,60 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
     }
     // Long-running helpers (buses, session services), stopped when the session ends.
     let mut background: Vec<Child> = Vec::new();
-    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+    if shim.is_some() {
+        // What the user manager's units expect on the system bus: a bus, and logind answering on it
+        // (`systemd --user` itself logs "Failed to connect to system bus" without one).
+        background.extend(start_system_services());
+    }
+    let mut user_manager = false;
+    if let Some(shim) = &shim {
+        start_journal_sink();
+        let started = prepare_systemd(
+            std::path::Path::new("/run"),
+            std::path::Path::new(CGROUP_ROOT),
+        )
+        .and_then(|fake| {
+            if fake {
+                // Before the manager starts: it consults the tree from its first unit on.
+                let me = std::process::id() as i32;
+                std::thread::spawn(move || {
+                    crate::cgroups::Cgroups::new(
+                        CGROUP_ROOT,
+                        crate::cgroups::Scope::Descendants(me),
+                    )
+                    .run(Duration::from_millis(200))
+                });
+            }
+            start_systemd_user(std::path::Path::new(SYSTEMD), shim, &dir)
+        });
+        match started {
+            Ok(child) => {
+                background.push(child);
+                user_manager = true;
+                // The image's `dbus.socket` user unit listens here; real systemd activates the bus.
+                let bus = dir.join("bus");
+                if !wait_for_socket(&bus, Duration::from_secs(30)) {
+                    eprintln!("warn: systemd --user did not open {} in 30s", bus.display());
+                }
+                if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+                    std::env::set_var(
+                        "DBUS_SESSION_BUS_ADDRESS",
+                        format!("unix:path={}", bus.display()),
+                    );
+                }
+            }
+            Err(e) if opts.systemd == SystemdMode::On => return Err(e),
+            Err(e) => eprintln!("warn: systemd --user not started, using dbus-daemon: {e}"),
+        }
+    }
+    if !user_manager && std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
         background.extend(start_session_bus(&dir));
     }
     // The first of these to exit ends the supervisor; the first one's status wins ties.
     let critical = match (&spec, &opts.session) {
-        (Some(spec), Some(so)) => start_session(spec, &so.params, &dir, cmd, &mut background)?,
+        (Some(spec), Some(so)) => {
+            start_session(spec, &so.params, &dir, cmd, user_manager, &mut background)?
+        }
         _ => vec![spawn(cmd, &[])?],
     };
     let code = wait_for_any(&critical)?;
@@ -334,6 +595,7 @@ fn start_session(
     params: &session::Params,
     dir: &std::path::Path,
     cmd: &[String],
+    user_manager: bool,
     background: &mut Vec<Child>,
 ) -> Result<Vec<Child>> {
     // The host compositor (Selkie) listens on $XDG_RUNTIME_DIR/<display>.
@@ -351,11 +613,13 @@ fn start_session(
         wayland_display: host_display.clone(),
         ..params.clone()
     };
-    if std::env::var_os("DBUS_SYSTEM_BUS_ADDRESS").is_none() {
-        background.extend(start_system_bus());
+    // With the user manager running these are already up, and the session's own services
+    // (pipewire, wireplumber) are its socket-activated units, not ours to start a second copy of.
+    if !user_manager {
+        background.extend(start_system_services());
     }
     let host = [("WAYLAND_DISPLAY", Some(host_display.as_str()))];
-    for svc in &spec.services {
+    for svc in spec.services.iter().filter(|_| !user_manager) {
         match spawn(&session::fill(svc, &params), &host) {
             Ok(c) => background.push(c),
             Err(e) => eprintln!("warn: session service {}: {e}", svc[0]),
@@ -503,9 +767,18 @@ fn stop_all(pids: &[u32], grace: Duration) {
     }
 }
 
+/// `wait` in [`wait_for_any`] reaps any child of the process, so tests that run a supervisor must not
+/// overlap with tests that spawn and wait for their own children.
+#[cfg(test)]
+pub(crate) static CHILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn child_lock() -> std::sync::MutexGuard<'static, ()> {
+        CHILD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn journal_sink_replaces_stale_socket_and_keeps_live_one() {
@@ -522,6 +795,19 @@ mod tests {
         // live: a second call leaves the working socket alone
         start_journal_sink_at(&p);
         c.send(b"again").unwrap();
+    }
+
+    #[test]
+    fn journal_datagrams_are_decoded() {
+        let mut d = b"PRIORITY=6\nSYSLOG_IDENTIFIER=systemd\nMESSAGE=Started x.\n".to_vec();
+        assert_eq!(journal_line(&d).unwrap(), "systemd: Started x.");
+        // a binary-framed field: KEY\n<len le64>data\n
+        d.extend(b"MULTI\n");
+        d.extend(5u64.to_le_bytes());
+        d.extend(b"a\nb\nc\n");
+        d.extend(b"MESSAGE=after\n");
+        assert_eq!(journal_line(&d).unwrap(), "systemd: after");
+        assert_eq!(journal_line(b"no newline"), None);
     }
 
     #[test]
@@ -564,6 +850,7 @@ mod tests {
 
     #[test]
     fn broker_gets_socket_activation_env() {
+        let _lock = child_lock();
         let d = tempfile::tempdir().unwrap();
         let out = d.path().join("out");
         let script = d.path().join("fake-broker");
@@ -594,6 +881,87 @@ mod tests {
         assert!(start_broker(&d.path().join("bus"), &bad, &[]).is_err());
     }
 
+    #[test]
+    fn systemd_mode_resolution() {
+        let d = tempfile::tempdir().unwrap();
+        let (sd, shim) = (d.path().join("systemd"), d.path().join("cgshim.so"));
+        let none = |m| resolve_systemd(m, &sd, &shim).unwrap();
+        assert_eq!(none(SystemdMode::Off), None);
+        assert_eq!(none(SystemdMode::Auto), None);
+        assert_eq!(
+            resolve_systemd(SystemdMode::On, &sd, &shim)
+                .unwrap_err()
+                .kind,
+            crate::error::ErrorKind::NotFound
+        );
+        fs::write(&sd, "").unwrap();
+        assert_eq!(none(SystemdMode::Auto), None, "systemd alone is not enough");
+        fs::write(&shim, "").unwrap();
+        assert_eq!(none(SystemdMode::Off), None);
+        assert_eq!(none(SystemdMode::Auto), Some(shim.clone()));
+        assert_eq!(none(SystemdMode::On), Some(shim));
+    }
+
+    #[test]
+    fn systemd_prerequisites_are_created_once() {
+        let d = tempfile::tempdir().unwrap();
+        let (run, cg) = (d.path().join("run"), d.path().join("cgroup"));
+        assert!(prepare_systemd(&run, &cg).unwrap());
+        assert!(run.join("systemd/system").is_dir());
+        for f in CGROUP_ROOT_FILES {
+            assert!(cg.join(f).is_file(), "{f}");
+        }
+        // existing content is not clobbered
+        fs::write(cg.join("cgroup.events"), "populated 0\n").unwrap();
+        prepare_systemd(&run, &cg).unwrap();
+        assert_eq!(
+            fs::read_to_string(cg.join("cgroup.events")).unwrap(),
+            "populated 0\n"
+        );
+    }
+
+    #[test]
+    fn user_manager_gets_the_shim_and_no_host_display() {
+        let _lock = child_lock();
+        let d = tempfile::tempdir().unwrap();
+        let out = d.path().join("out");
+        let fake = script(
+            d.path(),
+            "systemd",
+            &format!(
+                "echo \"$* $LD_PRELOAD $XDG_RUNTIME_DIR ${{WAYLAND_DISPLAY-unset}}\" > {}; exec sleep 5",
+                out.display()
+            ),
+        );
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+        let mut child = start_systemd_user(
+            std::path::Path::new(&fake),
+            std::path::Path::new("/x/cgshim.so"),
+            d.path(),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let got = fs::read_to_string(&out).unwrap();
+        assert_eq!(
+            got.trim(),
+            format!(
+                "--user --log-target=console /x/cgshim.so {} unset",
+                d.path().display()
+            )
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn waits_for_a_socket_to_accept() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("bus");
+        assert!(!wait_for_socket(&p, Duration::from_millis(200)));
+        let _l = UnixListener::bind(&p).unwrap();
+        assert!(wait_for_socket(&p, Duration::from_millis(200)));
+    }
+
     fn script(dir: &std::path::Path, name: &str, body: &str) -> String {
         let p = dir.join(name);
         fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -612,12 +980,14 @@ mod tests {
                     ..Default::default()
                 },
             }),
+            ..Default::default()
         }
     }
 
     /// One test: `wait` reaps any child of the process, so supervisor runs must not overlap.
     #[test]
     fn graphical_sessions() {
+        let _lock = child_lock();
         let d = tempfile::tempdir().unwrap();
         let run = d.path().join("run");
         fs::create_dir_all(&run).unwrap();
@@ -690,6 +1060,18 @@ mod tests {
             ),
         );
         std::env::set_var("DROIDC_BRIDGE", &bridge);
+        // the real login1 would run the test binary; a stub that records its environment instead
+        std::env::set_var(
+            "DROIDC_LOGIN1",
+            script(
+                d.path(),
+                "login1",
+                &format!(
+                    "echo \"$XDG_SESSION_ID $XDG_SEAT\" > {}; exec sleep 30",
+                    o("login1.out")
+                ),
+            ),
+        );
         let opts = session_opts(
             d.path(),
             SessionSpec {
@@ -706,6 +1088,10 @@ mod tests {
         assert!(fs::read_to_string(o("comp.out"))
             .unwrap()
             .contains(" unset wayland Test"));
+        assert_eq!(
+            fs::read_to_string(o("login1.out")).unwrap().trim(),
+            "1 seat0"
+        );
         // a given command replaces the bridge
         let opts = session_opts(
             d.path(),
@@ -720,6 +1106,7 @@ mod tests {
             9
         );
         std::env::remove_var("DROIDC_BRIDGE");
+        std::env::remove_var("DROIDC_LOGIN1");
 
         // --session without a configured session is not-found
         let empty = tempfile::tempdir().unwrap();
@@ -728,6 +1115,7 @@ mod tests {
                 root: empty.path().to_path_buf(),
                 params: Default::default(),
             }),
+            ..Default::default()
         };
         assert_eq!(
             supervise_with(&[], &opts).unwrap_err().kind,
