@@ -282,7 +282,7 @@ fn prepare_systemd(run: &std::path::Path, cgroup: &std::path::Path) -> Result<bo
 /// Unit files the user manager reads from `$XDG_RUNTIME_DIR/systemd/user`, which outrank the image's own
 /// (`/usr/lib/systemd/user`). Images that ship `dbus-broker` as the bus (Bluefin, CentOS bootc) also ship
 /// `dbus-daemon`; `dbus-broker-launch` exits `ENOENT` (launcher.c +1345) here on every start, so with
-/// `dbus-daemon` available the bus unit is pointed at it and the broker's is masked.
+/// `dbus-daemon` available both names of the bus unit are made aliases of `dbus-daemon.service`.
 /// Returns whether the override was written.
 fn prefer_dbus_daemon(runtime: &std::path::Path, unit_dir: &std::path::Path) -> bool {
     let daemon_unit = unit_dir.join("dbus-daemon.service");
@@ -298,8 +298,9 @@ fn prefer_dbus_daemon(runtime: &std::path::Path, unit_dir: &std::path::Path) -> 
         let _ = fs::remove_file(&at);
         std::os::unix::fs::symlink(target, &at).is_ok()
     };
-    link("dbus.service", &daemon_unit)
-        && link("dbus-broker.service", std::path::Path::new("/dev/null"))
+    // Both names: the image's dbus.socket says `Service=dbus-broker.service`, so masking that one makes
+    // the socket refuse to start. A symlink to a unit file of another name is an alias of it.
+    link("dbus.service", &daemon_unit) && link("dbus-broker.service", &daemon_unit)
 }
 
 /// Start the user manager with the shim preloaded; its units start the bus and the session. The
@@ -871,7 +872,8 @@ mod tests {
         );
         assert_eq!(
             fs::read_link(dest.join("dbus-broker.service")).unwrap(),
-            std::path::PathBuf::from("/dev/null")
+            units.join("dbus-daemon.service"),
+            "dbus.socket names the broker unit, so it must resolve to the daemon"
         );
     }
 
