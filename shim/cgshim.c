@@ -380,7 +380,7 @@ static void populate(const char *dir) {
   char b[4096];
   for (size_t i = 0; i < NFILES; i++) {
     snprintf(b, sizeof b, "%s/%s", dir, FILES[i]);
-    int fd = creat(b, 0644);
+    int fd = open(b, O_WRONLY | O_CREAT | O_TRUNC, 0644);  // not creat(): a legacy syscall, ENOSYS under proot on x86_64 Android
     if (fd < 0) {
       if (getenv("CGSHIM_TRACE")) fprintf(stderr, "cgshim: populate %s: %s\n", b, strerror(errno));
       continue;
@@ -394,7 +394,7 @@ static void unpopulate(const char *dir) {
   char b[4096];
   for (size_t i = 0; i < NFILES; i++) {
     snprintf(b, sizeof b, "%s/%s", dir, FILES[i]);
-    unlink(b);
+    unlinkat(AT_FDCWD, b, 0);
   }
 }
 
