@@ -6,16 +6,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn shim() -> PathBuf {
-    // target/<profile>/deps/preload-<hash> -> target/<profile>/libcgshim.so
+    // The test binary sits in target/<profile>/deps (older cargo) or target/<profile>/build/<pkg>/<hash>/out
+    // (newer); the cdylib is in target/<profile>. Walk up until it turns up.
     let exe = std::env::current_exe().unwrap();
-    let profile = exe.parent().unwrap().parent().unwrap();
-    let so = profile.join("libcgshim.so");
-    assert!(
-        so.is_file(),
-        "build the cdylib first (cargo build -p cgshim): {}",
-        so.display()
-    );
-    so
+    exe.ancestors()
+        .map(|dir| dir.join("libcgshim.so"))
+        .find(|so| so.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "build the cdylib first (cargo build -p cgshim); looked above {}",
+                exe.display()
+            )
+        })
 }
 
 struct Tree(PathBuf);

@@ -212,6 +212,11 @@ macro_rules! export_open {
     ($sym:ident, $name:literal) => {
         /// # Safety
         /// Called as libc's `open`; `path` is a NUL-terminated string.
+        // Stable Rust cannot define a variadic function, so this takes the mode as a fixed argument (see
+        // the module docs). rustc's `invalid_runtime_symbol_definitions` flags that for the symbols std
+        // itself calls; on x86_64 and aarch64 Linux a variadic call passes the same registers, which the
+        // preload tests exercise. The lint is newer than some toolchains, hence `unknown_lints`.
+        #[allow(unknown_lints, invalid_runtime_symbol_definitions)]
         #[no_mangle]
         pub unsafe extern "C" fn $sym(path: *const c_char, flags: c_int, mode: mode_t) -> c_int {
             let Some(real) = real!($name, OpenFn) else {
@@ -229,6 +234,11 @@ macro_rules! export_openat {
     ($sym:ident, $name:literal) => {
         /// # Safety
         /// Called as libc's `openat`; `path` is a NUL-terminated string.
+        // Stable Rust cannot define a variadic function, so this takes the mode as a fixed argument (see
+        // the module docs). rustc's `invalid_runtime_symbol_definitions` flags that for the symbols std
+        // itself calls; on x86_64 and aarch64 Linux a variadic call passes the same registers, which the
+        // preload tests exercise. The lint is newer than some toolchains, hence `unknown_lints`.
+        #[allow(unknown_lints, invalid_runtime_symbol_definitions)]
         #[no_mangle]
         pub unsafe extern "C" fn $sym(
             dirfd: c_int,
@@ -638,6 +648,7 @@ const PR_SET_SECUREBITS: c_int = 28;
 ///
 /// # Safety
 /// Called as libc's `prctl`; the arguments are passed through untouched.
+#[allow(unknown_lints, invalid_runtime_symbol_definitions)]
 #[no_mangle]
 pub unsafe extern "C" fn prctl(
     option: c_int,
