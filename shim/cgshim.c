@@ -8,6 +8,11 @@
 //     the tree's cgroup.procs, so GetUnitByPID and sd_pid_get_unit work);
 //   - mkdir under /sys/fs/cgroup also creates the cgroup.* files real cgroupfs makes on its own;
 //   - rmdir removes those files first (real cgroupfs lets a "populated" tree directory go);
+//   - readdir() reports DT_UNKNOWN for DT_LNK (proot's link2symlink files are symlinks to getdents only);
+//   - prctl(PR_SET_SECUREBITS) that an app uid is refused reports success (the executor sets it for
+//     every service);
+//   - posix_spawn("/proc/self/fd/N"), how systemd 257 starts the executor, runs the file the fd names
+//     instead (proot cannot execve through /proc/self/fd);
 //   - posix_spawn(POSIX_SPAWN_SETCGROUP), which systemd 257 uses for every unit, is turned into a
 //     plain spawn plus a write of the new pid to the unit's cgroup.procs;
 //   - cgroup.procs is opened for append, so every pid systemd writes survives;
@@ -21,6 +26,8 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <spawn.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -221,6 +228,31 @@ static void attach(const char *cgroup, pid_t pid) {
   close(fd);
 }
 
+// systemd 257 starts every service with posix_spawn("/proc/self/fd/N") on an fd of its executor
+// (a plain file, or a sealed memfd copy). proot cannot execve through /proc/self/fd: its loader dies
+// with status 182 before the program runs, so every unit fails. Run the file the fd names instead;
+// for a memfd, the executor's usual path.
+static const char *exec_path(const char *path, char *buf, size_t n) {
+  if (!path || strncmp(path, "/proc/self/fd/", 14)) return path;
+  char target[1024];
+  ssize_t k = readlink(path, target, sizeof target - 1);
+  if (k <= 0) return path;
+  target[k] = 0;
+  if (getenv("CGSHIM_TRACE")) fprintf(stderr, "cgshim: spawn %s -> %s\n", path, target);
+  if (!strncmp(target, "/memfd:", 7)) {
+    if (!strstr(target, "executor")) return path;
+    const char *real = getenv("CGSHIM_EXECUTOR");
+    snprintf(buf, n, "%s", real && *real ? real : "/usr/lib/systemd/systemd-executor");
+  } else if (target[0] == '/') {
+    char *deleted = strstr(target, " (deleted)");
+    if (deleted) return path;
+    snprintf(buf, n, "%s", target);
+  } else {
+    return path;
+  }
+  return access(buf, X_OK) == 0 ? buf : path;
+}
+
 int posix_spawnattr_setcgroup_np(posix_spawnattr_t *attr, int cgroup) {
   char link[64], buf[1024];
   snprintf(link, sizeof link, "/proc/self/fd/%d", cgroup);
@@ -241,7 +273,8 @@ int posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *
                 const posix_spawnattr_t *attr, char *const argv[], char *const envp[]) {
   NEXT(int, "posix_spawn", (pid_t *, const char *, const posix_spawn_file_actions_t *,
                             const posix_spawnattr_t *, char *const[], char *const[]));
-  int r = real(pid, path, fa, attr, argv, envp);
+  char fixed[512];
+  int r = real(pid, exec_path(path, fixed, sizeof fixed), fa, attr, argv, envp);
   const char *cg = recall_cgroup(attr);
   if (!r && cg && pid) attach(cg, *pid);
   return r;
@@ -250,7 +283,8 @@ int pidfd_spawn(int *pidfd, const char *path, const posix_spawn_file_actions_t *
                 const posix_spawnattr_t *attr, char *const argv[], char *const envp[]) {
   NEXT(int, "pidfd_spawn", (int *, const char *, const posix_spawn_file_actions_t *,
                             const posix_spawnattr_t *, char *const[], char *const[]));
-  int r = real(pidfd, path, fa, attr, argv, envp);
+  char fixed[512];
+  int r = real(pidfd, exec_path(path, fixed, sizeof fixed), fa, attr, argv, envp);
   const char *cg = recall_cgroup(attr);
   if (!r && cg && pidfd) {
     char f[64], line[256];
@@ -261,6 +295,57 @@ int pidfd_spawn(int *pidfd, const char *path, const posix_spawn_file_actions_t *
       if (sscanf(line, "Pid: %d", &p) == 1) { attach(cg, p); break; }
     }
     if (fp) fclose(fp);
+  }
+  return r;
+}
+
+// proot's link2symlink (how hard links are emulated where Android forbids them) makes lstat() and
+// readlink() treat such a file as regular, but getdents still reports the underlying symlink as
+// DT_LNK. systemd takes DT_LNK at its word, readlink()s every unit file, gets EINVAL and loads no
+// units at all. DT_UNKNOWN makes callers stat() instead, which gives the consistent answer.
+struct dirent *readdir(DIR *d) {
+  NEXT(struct dirent *, "readdir", (DIR *));
+  struct dirent *e = real(d);
+  if (e && e->d_type == DT_LNK) e->d_type = DT_UNKNOWN;
+  return e;
+}
+struct dirent64 *readdir64(DIR *d) {
+  NEXT(struct dirent64 *, "readdir64", (DIR *));
+  struct dirent64 *e = real(d);
+  if (e && e->d_type == DT_LNK) e->d_type = DT_UNKNOWN;
+  return e;
+}
+
+// The executor calls prctl(PR_SET_SECUREBITS) for every service, which an app uid (no CAP_SETPCAP)
+// is refused with EPERM: the unit then fails with status 213/SECUREBITS before it starts. There are
+// no capabilities here to lock down, so say it worked.
+#ifndef PR_SET_SECUREBITS
+#define PR_SET_SECUREBITS 28
+#endif
+int prctl(int option, ...) {
+  NEXT(int, "prctl", (int, ...));
+  va_list a;
+  va_start(a, option);
+  unsigned long a2 = va_arg(a, unsigned long), a3 = va_arg(a, unsigned long),
+                a4 = va_arg(a, unsigned long), a5 = va_arg(a, unsigned long);
+  va_end(a);
+  int r = real(option, a2, a3, a4, a5);
+  if (r < 0 && errno == EPERM && option == PR_SET_SECUREBITS) {
+    if (getenv("CGSHIM_TRACE")) fprintf(stderr, "cgshim: PR_SET_SECUREBITS %#lx refused, pretending\n", a2);
+    return 0;
+  }
+  return r;
+}
+
+// Debugging aid, silent unless CGSHIM_TRACE is set: say which unix socket a failed connect() wanted.
+int connect(int fd, const struct sockaddr *addr, socklen_t len) {
+  NEXT(int, "connect", (int, const struct sockaddr *, socklen_t));
+  int r = real(fd, addr, len);
+  if (r < 0 && addr && addr->sa_family == AF_UNIX && getenv("CGSHIM_TRACE")) {
+    int e = errno;
+    const struct sockaddr_un *u = (const struct sockaddr_un *)addr;
+    fprintf(stderr, "cgshim: connect(%.*s) failed: %s\n", (int)(len > 2 ? len - 2 : 0), u->sun_path[0] ? u->sun_path : u->sun_path + 1, strerror(e));
+    errno = e;
   }
   return r;
 }

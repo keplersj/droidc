@@ -17,10 +17,15 @@ systemd-run --user --unit=probe-sleep -p Type=simple sleep 1 >/dev/null 2>&1
 sleep 3
 echo "transient unit after exit: $(systemctl --user is-active probe-sleep 2>&1)"
 
-# a double-forked daemon is found and killed with its unit (KillMode=control-group)
+# a double-forked daemon is found and killed with its unit (KillMode=control-group); allow a few
+# seconds, the accounting polls (and ptrace makes everything slower)
 systemd-run --user --unit=probe-fork sh -c '(sleep 60 &) ; sleep 1' >/dev/null 2>&1
-sleep 4
-if ps -eo args | grep -q '^sleep 60'; then echo "double-forked daemon: SURVIVED"; else echo "double-forked daemon: killed with its unit"; fi
+survived=yes
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  sleep 1
+  if ! ps -eo args | grep -q '^sleep 60'; then survived=no; break; fi
+done
+if [ "$survived" = yes ]; then echo "double-forked daemon: SURVIVED"; else echo "double-forked daemon: killed with its unit"; fi
 
 # the session bus is systemd's: activatable names come from the units' D-Bus service files
 echo "bus: $DBUS_SESSION_BUS_ADDRESS"

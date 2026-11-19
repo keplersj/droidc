@@ -79,9 +79,50 @@ bwrap with a tmpfs-style directory over `/sys/fs/cgroup` (still **not** proot or
   the stand-in journal socket, and `DROIDC_SYSTEMD_LOG_LEVEL`/`DROIDC_SYSTEMD_STDIO=inherit` raise the log
   level and keep unit output; that is how the spawn failure above was found.
 
-Not yet known (CI steps added, unrun): how far the real Bluefin image's `systemd --user` and
-`gnome-session` get; whether it works under proot (ptrace, `/proc/self/fd` readlink for the shim's
-`fstatfs` check, memfd) as opposed to bwrap; startup time. Decide A vs B from those numbers.
+### On the tablet (Galaxy Tab S10+, Android 16, SELinux enforcing)
+
+Run as Selkie's own uid (`run-as io.github.keplersj.selkie`, a debuggable build) with Selkie's exact proot
+command line (`libproot.so`, `--link2symlink`, the same binds and fake `/proc` files) against its
+real Bluefin LTS deployment (GNOME 50, systemd 257, aarch64). Four things broke that no earlier test
+could show, all fixed in `shim/cgshim.c` and each found by reading the manager's own log
+(`DROIDC_JOURNAL=stderr`):
+
+1. **No unit loaded**: `Failed to read symlink ... Invalid argument` for every unit file. Under
+   link2symlink `lstat`/`readlink` say "regular file" but `getdents` still reports the underlying symlink
+   (`DT_LNK`), and systemd believes `d_type`. `readdir` now reports `DT_UNKNOWN` for `DT_LNK`.
+2. **Every service died with status 182**: systemd 257 starts the executor with
+   `posix_spawn("/proc/self/fd/N")`, and proot's loader cannot exec through `/proc/self/fd` (it exits 182
+   before the program runs). The shim execs the file the fd names.
+3. **`213/SECUREBITS`**: the executor calls `prctl(PR_SET_SECUREBITS)`, which an app uid is refused.
+   The shim reports success (there are no capabilities to lock down).
+4. A stale `/run/user/UID` from an earlier killed run makes the generator fail with `File exists`;
+   a persistent `/run` bind needs clearing at session start.
+
+After those: `systemd --user` reaches **`running` in 1.3 s with no failed units and 56 activatable bus
+names**; `systemd-run --user` works and finished units go `inactive`; the image's own `xdg-user-dirs`,
+`dconf` and Bluefin's wallpaper scripts ran. `gnome-session@gnome.target` stayed inactive for 60 s: no
+compositor was running and `ublue-user-setup` needs a setuid `pkexec`, so that proves nothing about GNOME
+itself yet.
+
+**Process accounting is the weak spot under proot.** A double-forked daemon is killed with its unit in
+some runs and escapes in others (about half of 5 runs of a 1 s unit). Each tick of `cgroups.rs` takes
+~300 ms there, because every `/proc` read is a ptrace stop, so an orphan that appears and whose unit ends
+within a few ticks is never attributed. Two flaws that made it worse are fixed (a new cgroup was
+reported empty before its first process was attached; emptiness now has to last two ticks, and a pid's
+`INVOCATION_ID` is read once). What remains is latency, not logic. Ideas: read
+`/proc/<manager>/task/*/children` instead of scanning every pid (orphans become the manager's children),
+or have proot report forks.
+
+Still failing on the tablet: **`dbus-broker-launch` exits `ENOENT`** (`launcher.c +1345`) after scanning the
+service files, with no failing path in proot's trace or in the shim's `connect()` trace. Bluefin LTS also
+ships `dbus-daemon`, and with `dbus.service` pointed at `dbus-daemon.service` (an override in
+`XDG_CONFIG_HOME`, `dbus-broker.service` masked) everything above worked, including activation through
+systemd. So for now: images with `dbus-daemon` run it under systemd; dbus-broker-only images
+(CentOS bootc) need this chased down. The `Failed to acquire watch file descriptor` and `/proc/swaps`
+messages are Android denying things systemd treats as optional.
+
+Not yet known: GNOME itself (needs Selkie's compositor), startup time under load, and the same run with
+the CI's Ubuntu proot (it has no `--kill-on-exit`; the probe step now omits it).
 
 ## What GNOME needs (cited unless noted)
 

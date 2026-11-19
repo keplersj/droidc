@@ -48,6 +48,15 @@ pub struct Cgroups {
     invocations: HashMap<String, PathBuf>,
     /// Last `populated` value written per directory.
     populated: HashMap<PathBuf, bool>,
+    /// Directories that have held a process, so a fresh one is not reported empty before its first
+    /// process is attached (the kernel only fires an event on a change).
+    ever_populated: HashSet<PathBuf>,
+    /// Directories that looked empty on the previous tick: a process forked just now may not be
+    /// attributed yet, so emptiness has to last two ticks.
+    looked_empty: HashSet<PathBuf>,
+    /// `INVOCATION_ID` of processes that have one, read once (a syscall is slow under proot). A process
+    /// without one is read again: during `exec` its environment is not yet the final one.
+    env_ids: HashMap<i32, String>,
 }
 
 fn read_proc(pid: i32) -> Option<Proc> {
@@ -68,6 +77,15 @@ fn invocation_id(pid: i32) -> Option<String> {
     env.split(|&b| b == 0)
         .find_map(|kv| kv.strip_prefix(b"INVOCATION_ID="))
         .map(|v| String::from_utf8_lossy(v).into_owned())
+}
+
+fn cached_invocation_id(cache: &mut HashMap<i32, String>, pid: i32) -> Option<String> {
+    if let Some(id) = cache.get(&pid) {
+        return Some(id.clone());
+    }
+    let id = invocation_id(pid)?;
+    cache.insert(pid, id.clone());
+    Some(id)
 }
 
 fn all_pids() -> Vec<i32> {
@@ -104,6 +122,9 @@ impl Cgroups {
             seen: HashMap::new(),
             invocations: HashMap::new(),
             populated: HashMap::new(),
+            ever_populated: HashSet::new(),
+            looked_empty: HashSet::new(),
+            env_ids: HashMap::new(),
         }
     }
 
@@ -116,6 +137,20 @@ impl Cgroups {
     }
 
     pub fn tick(&mut self) {
+        let started = std::time::Instant::now();
+        self.tick_inner();
+        if std::env::var_os("DROIDC_CG_DEBUG").is_some() {
+            eprintln!(
+                "cg: tick {}ms owners={} invocations={} cgroups={}",
+                started.elapsed().as_millis(),
+                self.owner.len(),
+                self.invocations.len(),
+                self.populated.len()
+            );
+        }
+    }
+
+    fn tick_inner(&mut self) {
         let procs: HashMap<i32, Proc> = all_pids()
             .into_iter()
             .filter_map(|p| read_proc(p).map(|i| (p, i)))
@@ -159,7 +194,11 @@ impl Cgroups {
                 .collect();
             let seen = self.seen.entry(d.clone()).or_default();
             for &pid in now.difference(&seen.clone()) {
-                if procs.contains_key(&pid) {
+                let known = procs.contains_key(&pid);
+                if std::env::var_os("DROIDC_CG_DEBUG").is_some() {
+                    eprintln!("cg: {} lists pid {pid} (in /proc: {known})", d.display());
+                }
+                if known {
                     self.owner.insert(pid, d.clone());
                 }
             }
@@ -192,9 +231,10 @@ impl Cgroups {
     fn assign(&mut self, procs: &HashMap<i32, Proc>) -> HashMap<i32, PathBuf> {
         // Only a service's processes carry an id of its own. A scope's (or the manager's, in
         // init.scope) environment is whatever its caller had, which names some other unit.
+        self.env_ids.retain(|p, _| procs.contains_key(p));
         for (pid, dir) in &self.owner {
             if dir.extension().is_some_and(|e| e == "service") {
-                if let Some(id) = invocation_id(*pid) {
+                if let Some(id) = cached_invocation_id(&mut self.env_ids, *pid) {
                     self.invocations.insert(id, dir.clone());
                 }
             }
@@ -257,11 +297,26 @@ impl Cgroups {
     }
 
     fn write_events(&mut self, dirs: &[PathBuf], members: &HashMap<i32, PathBuf>) {
+        let mut empty_now = HashSet::new();
         for d in dirs {
             if d == &self.root {
                 continue;
             }
-            let populated = members.values().any(|m| m.starts_with(d));
+            let mut populated = members.values().any(|m| m.starts_with(d));
+            if populated {
+                self.ever_populated.insert(d.clone());
+                self.looked_empty.remove(d);
+            } else if !self.ever_populated.contains(d) {
+                continue; // never held a process yet: nothing to report
+            } else if self.populated.get(d) != Some(&false) {
+                // newly empty: believe it only once it stayed empty for a whole tick
+                if self.looked_empty.contains(d) {
+                    empty_now.insert(d.clone());
+                } else {
+                    self.looked_empty.insert(d.clone());
+                    populated = true;
+                }
+            }
             if self.populated.get(d) == Some(&populated) {
                 continue;
             }
@@ -283,7 +338,12 @@ impl Cgroups {
                 self.populated.insert(d.clone(), populated);
             }
         }
+        for d in empty_now {
+            self.looked_empty.remove(&d);
+        }
         self.populated.retain(|d, _| dirs.contains(d));
+        self.ever_populated.retain(|d| dirs.contains(d));
+        self.looked_empty.retain(|d| dirs.contains(d));
     }
 }
 
@@ -335,6 +395,25 @@ mod tests {
     }
 
     #[test]
+    fn a_new_cgroup_is_not_reported_empty_before_its_first_process() {
+        let _lock = crate::supervise::CHILD_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let r = tempfile::tempdir().unwrap();
+        let a = cgroup(r.path(), "a.slice");
+        let mut cg = Cgroups::new(r.path(), Scope::Any);
+        for _ in 0..3 {
+            cg.tick();
+        }
+        assert!(populated(&a), "still the initial 'populated 1'");
+        let c = sleeper(None);
+        append(&a, c.id());
+        cg.tick();
+        assert!(populated(&a));
+        reap(c);
+    }
+
+    #[test]
     fn populated_follows_the_processes() {
         let _lock = crate::supervise::CHILD_LOCK
             .lock()
@@ -351,6 +430,8 @@ mod tests {
             format!("{}\n", c.id())
         );
         reap(c);
+        cg.tick();
+        assert!(populated(&a), "one empty tick is not believed");
         cg.tick();
         assert!(!populated(&a));
         assert_eq!(fs::read_to_string(a.join("cgroup.procs")).unwrap(), "");
@@ -381,8 +462,13 @@ mod tests {
         fs::write(parent.join("app-x.scope/cgroup.kill"), "1").unwrap();
         std::thread::sleep(Duration::from_millis(300));
         reap(sh);
-        cg.tick();
-        cg.tick();
+        for _ in 0..20 {
+            cg.tick();
+            if !populated(&child) && !populated(&parent) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         assert!(!populated(&child) && !populated(&parent));
     }
 
@@ -488,6 +574,7 @@ mod tests {
         append(&a, c.id());
         cg.tick();
         append(&b, c.id());
+        cg.tick();
         cg.tick();
         assert!(!populated(&a) && populated(&b));
         reap(c);
