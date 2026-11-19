@@ -63,6 +63,8 @@ static void trace_sys(const char *op, int d, const char *p, int e) {
     fprintf(stderr, "cgshim: %s(%d) %s: %s\n", op, d, p, strerror(e));
 }
 
+static int repair_cgroup_file(int d, const char *p);
+
 static int all_digits(const char *s, size_t n) {
   if (!n) return 0;
   for (size_t i = 0; i < n; i++)
@@ -164,6 +166,7 @@ int open(const char *p, int f, ...) {
   va_list a; va_start(a, f); mode_t m = va_arg(a, mode_t); va_end(a);
   int cp; if (proc_cgroup_pid(p, &cp)) { int fd = fake_cgroup_fd(cp); if (fd >= 0) return fd; }
   int r = real(p, fix_flags(p, f), m);
+  if (r < 0 && errno == ENOENT && repair_cgroup_file(AT_FDCWD, p)) r = real(p, fix_flags(p, f), m);
   if (r < 0) { int e = errno; trace_sys("open", -1, p, e); errno = e; }
   return r;
 }
@@ -172,6 +175,7 @@ int open64(const char *p, int f, ...) {
   va_list a; va_start(a, f); mode_t m = va_arg(a, mode_t); va_end(a);
   int cp; if (proc_cgroup_pid(p, &cp)) { int fd = fake_cgroup_fd(cp); if (fd >= 0) return fd; }
   int r = real(p, fix_flags(p, f), m);
+  if (r < 0 && errno == ENOENT && repair_cgroup_file(AT_FDCWD, p)) r = real(p, fix_flags(p, f), m);
   if (r < 0) { int e = errno; trace_sys("open64", -1, p, e); errno = e; }
   return r;
 }
@@ -180,6 +184,7 @@ int openat(int d, const char *p, int f, ...) {
   va_list a; va_start(a, f); mode_t m = va_arg(a, mode_t); va_end(a);
   int cp; if (proc_cgroup_pid(p, &cp)) { int fd = fake_cgroup_fd(cp); if (fd >= 0) return fd; }
   int r = real(d, p, fix_flags(p, f), m);
+  if (r < 0 && errno == ENOENT && repair_cgroup_file(d, p)) r = real(d, p, fix_flags(p, f), m);
   if (r < 0) { int e = errno; trace_sys("openat", d, p, e); errno = e; }
   return r;
 }
@@ -188,6 +193,7 @@ int openat64(int d, const char *p, int f, ...) {
   va_list a; va_start(a, f); mode_t m = va_arg(a, mode_t); va_end(a);
   int cp; if (proc_cgroup_pid(p, &cp)) { int fd = fake_cgroup_fd(cp); if (fd >= 0) return fd; }
   int r = real(d, p, fix_flags(p, f), m);
+  if (r < 0 && errno == ENOENT && repair_cgroup_file(d, p)) r = real(d, p, fix_flags(p, f), m);
   if (r < 0) { int e = errno; trace_sys("openat64", d, p, e); errno = e; }
   return r;
 }
@@ -375,7 +381,10 @@ static void populate(const char *dir) {
   for (size_t i = 0; i < NFILES; i++) {
     snprintf(b, sizeof b, "%s/%s", dir, FILES[i]);
     int fd = creat(b, 0644);
-    if (fd < 0) continue;
+    if (fd < 0) {
+      if (getenv("CGSHIM_TRACE")) fprintf(stderr, "cgshim: populate %s: %s\n", b, strerror(errno));
+      continue;
+    }
     if (!strcmp(FILES[i], "cgroup.events")) (void)!write(fd, "populated 1\nfrozen 0\n", 21);
     close(fd);
   }
@@ -399,6 +408,22 @@ static int abs_under(int d, const char *p, char *out, size_t n) {
   if (k < 0) return 0;
   base[k] = 0;
   snprintf(out, n, "%s/%s", base, p);
+  return 1;
+}
+
+// A cgroup directory that exists without its cgroup.* files (made when the shim was not looking, or left
+// by an earlier run) makes systemd's attach fail with ENOENT. When an open of such a file fails that way,
+// create the files and say whether the caller should try again.
+static int repair_cgroup_file(int d, const char *p) {
+  char full[8192];
+  if (!abs_under(d, p, full, sizeof full)) return 0;
+  char *slash = strrchr(full, '/');
+  if (!slash || strncmp(slash + 1, "cgroup.", 7)) return 0;
+  *slash = 0;
+  struct stat st;
+  if (stat(full, &st) || !S_ISDIR(st.st_mode)) return 0;
+  populate(full);
+  if (getenv("CGSHIM_TRACE")) fprintf(stderr, "cgshim: repaired %s\n", full);
   return 1;
 }
 
