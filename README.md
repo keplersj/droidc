@@ -47,6 +47,9 @@ droidc --root ~/droidc switch quay.io/centos-bootc/centos-bootc:stream10 --insec
 droidc switch <ref> --verify-only      # resolve + verify signature, download no layers
 droidc upgrade | rollback | status | gc | shell-spec | platform
 droidc supervise -- bash -l            # inside the guest
+droidc supervise --session --width 1920 --height 1200   # inside the guest: the graphical session
+droidc session set --renderer screencast --exec '["gnome-shell","--headless","--virtual-monitor","{width}x{height}"]' \
+  --services '[["pipewire"],["wireplumber"]]' --name GNOME   # for images without session labels
 ```
 
 `--root`/`DROIDC_ROOT`, `--dns`/`DROIDC_DNS` (comma separated IPs; else `/etc/resolv.conf`, else
@@ -69,6 +72,9 @@ Try a deployment under proot: `proot -r <root>/current/rootfs -w / /usr/bin/cat 
   hash-while-streaming resumable downloads (see the module comment in `registry.rs`).
 - `tar` layer parsing, `flate2` gzip (pure-Rust backend), `zstd` zstd layers and the metadata file.
 - `rustix` uname, statvfs, flock, wait, dup2 without libc.
+- `zbus` (blocking) D-Bus client for `droidc bridge` (Mutter ScreenCast/RemoteDesktop).
+- `wayland-client` (pure Rust backend) + `wayland-protocols` (xdg-shell): `droidc bridge` as a
+  Wayland client of the host compositor.
 - `droidc-verify` (workspace crate) offline cosign verification (keyless and key).
 - dev: `tempfile`.
 
@@ -76,7 +82,8 @@ Try a deployment under proot: `proot -r <root>/current/rootfs -w / /usr/bin/cat 
 
 `registry` (OCI client), `unpack` (layers, whiteouts, drop rules, metadata), `link` (hardlink /
 link2symlink / copy / auto), `etcmerge` (3-way /etc), `deploy` (staging, PENDING, recovery, switch,
-upgrade, rollback, gc), `status` (status, shell-spec), `supervise`, `events` (NDJSON), `platform`,
+upgrade, rollback, gc), `status` (status, shell-spec), `supervise` (in-guest supervisor, graphical session), `session` (session labels and override),
+`bridge` (headless compositor → host compositor), `events` (NDJSON), `platform`,
 `verify_glue` (single seam to `droidc-verify`).
 
 License: MIT.

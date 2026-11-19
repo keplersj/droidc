@@ -2,10 +2,12 @@ use clap::{Parser, Subcommand};
 use droidc::deploy::{self, SwitchOpts};
 use droidc::error::{Error, Result};
 use droidc::events::Emitter;
+use droidc::layout::Root;
 use droidc::link::{LinkKind, DEFAULT_L2S_PREFIX};
 use droidc::platform::Platform;
 use droidc::registry::HttpConfig;
-use droidc::{status, supervise};
+use droidc::session::{self, Renderer, SessionSpec};
+use droidc::{bridge, status, supervise};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -59,11 +61,73 @@ enum Cmd {
     ShellSpec,
     /// Detected platform
     Platform,
-    /// (inside the guest) start session services, then run a command
+    /// (inside the guest) start session services, then run a command or the graphical session
     Supervise {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        /// Start the deployment's graphical session (see `droidc session`)
+        #[arg(long)]
+        session: bool,
+        /// Session width in pixels (`{width}`)
+        #[arg(long, default_value_t = 1280)]
+        width: u32,
+        /// Session height in pixels (`{height}`)
+        #[arg(long, default_value_t = 800)]
+        height: u32,
+        /// Session scale factor (`{scale}`)
+        #[arg(long, default_value_t = 1.0)]
+        scale: f64,
+        /// Command to run. With --session it is optional and replaces the screencast bridge (or runs as an
+        /// extra client of a nested session); the session ends when it exits
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            required_unless_present = "session"
+        )]
         cmd: Vec<String>,
     },
+    /// (inside the guest) show a headless session compositor on the host compositor
+    Bridge {
+        #[arg(long, default_value_t = 1280)]
+        width: u32,
+        #[arg(long, default_value_t = 800)]
+        height: u32,
+        /// Monitor to record
+        #[arg(long, default_value = "Meta-0")]
+        connector: String,
+        /// Write one frame as PNG and exit (no host compositor needed)
+        #[arg(long)]
+        dump_frame: Option<PathBuf>,
+        /// Seconds to wait for the session compositor's ScreenCast service
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+    },
+    /// Show or override how the graphical session starts
+    Session {
+        #[command(subcommand)]
+        action: SessionCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionCmd {
+    /// The resolved session (override, else image labels)
+    Show,
+    /// Write `<root>/session.json`, which takes precedence over the image labels
+    Set {
+        /// wayland|screencast
+        #[arg(long)]
+        renderer: String,
+        /// Session command as a JSON array, e.g. '["gamescope","-W","{width}","-H","{height}"]'
+        #[arg(long)]
+        exec: String,
+        /// Commands started first, as a JSON array of arrays, e.g. '[["pipewire"]]'
+        #[arg(long)]
+        services: Option<String>,
+        /// Display name (exported as XDG_CURRENT_DESKTOP)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Remove the override
+    Clear,
 }
 
 fn default_root() -> PathBuf {
@@ -102,6 +166,47 @@ fn human(cmd: &str, d: &Value) {
     }
 }
 
+fn session_cmd(root: &std::path::Path, action: &SessionCmd) -> Result<Value> {
+    let r = Root::new(root);
+    match action {
+        SessionCmd::Show => {}
+        SessionCmd::Set {
+            renderer,
+            exec,
+            services,
+            name,
+        } => {
+            let spec = SessionSpec {
+                name: name.clone(),
+                renderer: Renderer::parse(renderer).ok_or_else(|| {
+                    Error::invalid(format!(
+                        "unknown --renderer '{renderer}' (wayland|screencast)"
+                    ))
+                })?,
+                exec: session::parse_argv(exec)
+                    .map_err(|e| Error::invalid(format!("--exec: {e}")))?,
+                services: match services {
+                    Some(s) => session::parse_services(s)
+                        .map_err(|e| Error::invalid(format!("--services: {e}")))?,
+                    None => Vec::new(),
+                },
+            };
+            session::write_override(&r, &spec)?;
+        }
+        SessionCmd::Clear => {
+            session::clear_override(&r)?;
+        }
+    }
+    let label = r
+        .current_id()
+        .and_then(|id| r.read_record(&id).ok())
+        .and_then(|d| d.session_label);
+    Ok(session::describe(
+        &session::resolve(root)?,
+        label.as_deref(),
+    ))
+}
+
 fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
     let root = cli.root.clone().unwrap_or_else(default_root);
     let http = HttpConfig::from_env(cli.dns.clone());
@@ -130,18 +235,60 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
         Cmd::Gc => Ok(("gc", deploy::gc(&root, em)?)),
         Cmd::ShellSpec => Ok(("shell-spec", status::shell_spec(&root)?)),
         Cmd::Platform => Ok(("platform", serde_json::to_value(Platform::detect()?)?)),
-        Cmd::Supervise { .. } => unreachable!(),
+        Cmd::Session { action } => Ok(("session", session_cmd(&root, action)?)),
+        Cmd::Supervise { .. } | Cmd::Bridge { .. } => unreachable!(),
     }
 }
 
 fn main() {
     let cli = Cli::parse();
-    if let Cmd::Supervise { cmd } = &cli.cmd {
-        match supervise::supervise(cmd) {
+    if let Cmd::Supervise {
+        session,
+        width,
+        height,
+        scale,
+        cmd,
+    } = &cli.cmd
+    {
+        let opts = supervise::Opts {
+            session: session.then(|| supervise::SessionOpts {
+                root: cli.root.clone().unwrap_or_else(default_root),
+                params: session::Params {
+                    width: *width,
+                    height: *height,
+                    scale: *scale,
+                    ..Default::default()
+                },
+            }),
+        };
+        match supervise::supervise_with(cmd, &opts) {
             Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("droidc supervise: {e}");
                 std::process::exit(127);
+            }
+        }
+    }
+    if let Cmd::Bridge {
+        width,
+        height,
+        connector,
+        dump_frame,
+        timeout,
+    } = &cli.cmd
+    {
+        let opts = bridge::Opts {
+            width: *width,
+            height: *height,
+            connector: connector.clone(),
+            dump_frame: dump_frame.clone(),
+            timeout: std::time::Duration::from_secs(*timeout),
+        };
+        match bridge::run(&opts) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("droidc bridge: {e}");
+                std::process::exit(1);
             }
         }
     }

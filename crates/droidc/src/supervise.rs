@@ -1,14 +1,21 @@
-//! `droidc supervise -- cmd...`: the seed of the in-guest session supervisor.
+//! `droidc supervise [--session] -- cmd...`: the in-guest session supervisor (no systemd).
 //!
-//! MVP behaviour: make sure `XDG_RUNTIME_DIR` exists (0700), start a D-Bus session bus when
-//! `dbus-daemon` is installed in the guest and export `DBUS_SESSION_BUS_ADDRESS`, run `cmd` as a
-//! child and reap every child (including orphans re-parented to us) until `cmd` exits, then exit
-//! with its status. Later versions add the other session services here.
+//! Makes sure `XDG_RUNTIME_DIR` exists (0700), starts a D-Bus session bus and exports
+//! `DBUS_SESSION_BUS_ADDRESS`, runs `cmd` as a child and reaps every child (including orphans
+//! re-parented to us) until it exits, then exits with its status.
+//!
+//! With `--session` it also starts the deployment's graphical session (see `session.rs`): a system
+//! bus, the session's services, its compositor, and for `screencast` sessions `droidc bridge`.
+//! The session ends when the compositor or the bridge (or the given command) exits; everything
+//! else started here is stopped then.
 
 use crate::error::{Context, Error, Result};
+use crate::session::{self, Renderer, SessionSpec};
 use std::fs;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
+#[cfg(test)]
+use std::os::unix::net::UnixStream;
 use std::os::unix::net::{UnixDatagram, UnixListener};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -40,36 +47,73 @@ fn runtime_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Start a session bus; returns its address.
-fn start_dbus(dir: &std::path::Path, bin: &std::path::Path) -> Result<String> {
-    let out = Command::new(bin)
-        .arg("--session")
-        .arg(format!("--address=unix:path={}/bus", dir.display()))
-        .arg("--fork")
-        .arg("--print-address")
+/// Start `dbus-daemon` with the session configuration listening on `socket` (also used for the
+/// system bus: the system configuration switches to the `dbus` user, which an app uid can't).
+/// Runs in the foreground so it is our child and stops with the session; returns its address.
+fn start_dbus(socket: &std::path::Path, bin: &std::path::Path) -> Result<(String, Child)> {
+    use std::io::BufRead;
+    let _ = fs::remove_file(socket);
+    if let Some(parent) = socket.parent() {
+        fs::create_dir_all(parent).context(parent.display())?;
+    }
+    let mut child = Command::new(bin)
+        .env_remove("WAYLAND_DISPLAY")
+        .arg("--config-file=/usr/share/dbus-1/session.conf")
+        .arg(format!("--address=unix:path={}", socket.display()))
+        .arg("--nofork")
+        .arg("--print-address=1")
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .output()
-        .context("dbus-daemon")?;
-    if !out.status.success() {
+        .spawn()
+        .context(bin.display())?;
+    let mut addr = String::new();
+    let read = std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut addr);
+    let addr = addr.trim().to_string();
+    if read.is_err() || addr.is_empty() {
+        let _ = child.kill();
+        let st = child.wait()?;
         return Err(Error::internal(format!(
-            "dbus-daemon exited with {}",
-            out.status
+            "dbus-daemon exited with {st} before printing its address"
         )));
     }
-    let addr = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if addr.is_empty() {
-        return Err(Error::internal("dbus-daemon printed no address"));
-    }
-    // `--fork --print-address` reports the address before the daemon finishes starting; if the
-    // daemon then dies (e.g. SELinux AVC init denied) the socket never appears.
+    // The address is printed before the daemon finishes starting; if it then dies (e.g. SELinux
+    // AVC init denied) the socket never accepts connections.
     std::thread::sleep(Duration::from_millis(250));
-    if !dir.join("bus").exists() {
-        return Err(Error::internal(
-            "dbus-daemon exited after printing its address",
-        ));
+    if let Some(st) = child.try_wait()? {
+        return Err(Error::internal(format!(
+            "dbus-daemon exited with {st} after printing its address"
+        )));
     }
-    Ok(addr)
+    Ok((addr, child))
+}
+
+/// A bus on `socket`, exported as `var`. `dbus-daemon` first: it activates `.service` files itself,
+/// while `dbus-broker-launch` hands activation to systemd, which can't run here. Best effort.
+fn start_bus(socket: &std::path::Path, scope: &str, var: &str) -> Option<Child> {
+    // Another supervisor (a terminal next to the desktop) may own a live bus here: share it rather
+    // than replacing the socket under its clients.
+    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+        std::env::set_var(var, format!("unix:path={}", socket.display()));
+        return None;
+    }
+    let started = if let Some(bin) = find_in_path("dbus-daemon") {
+        start_dbus(socket, &bin)
+    } else {
+        let bin = find_in_path("dbus-broker-launch")?;
+        start_journal_sink();
+        start_broker(socket, &bin, &["--scope", scope])
+    };
+    match started {
+        Ok((addr, child)) => {
+            std::env::set_var(var, addr);
+            Some(child)
+        }
+        Err(e) => {
+            eprintln!("warn: could not start the {scope} bus: {e}");
+            None
+        }
+    }
 }
 
 const MACHINE_ID: &str = "/etc/machine-id";
@@ -136,13 +180,15 @@ fn start_journal_sink_at(path: &std::path::Path) {
 /// proot): bind+listen `<dir>/bus`, pass it as fd 3 with `LISTEN_FDS=1`, `LISTEN_PID=<child pid>`.
 /// Returns the bus address and the running broker.
 fn start_broker(
-    dir: &std::path::Path,
+    path: &std::path::Path,
     bin: &std::path::Path,
     args: &[&str],
 ) -> Result<(String, Child)> {
-    let path = dir.join("bus");
-    let _ = fs::remove_file(&path);
-    let listener = UnixListener::bind(&path).context(path.display())?;
+    let _ = fs::remove_file(path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context(parent.display())?;
+    }
+    let listener = UnixListener::bind(path).context(path.display())?;
     let fd = listener.as_raw_fd();
     // `sh` sets LISTEN_PID to its own pid and execs the broker (same pid): no setenv between
     // fork and exec, which could deadlock in a multithreaded process.
@@ -151,6 +197,7 @@ fn start_broker(
         .arg("LISTEN_PID=$$; export LISTEN_PID; exec \"$0\" \"$@\"")
         .arg(bin)
         .args(args)
+        .env_remove("WAYLAND_DISPLAY")
         .env("LISTEN_FDS", "1")
         .env("LISTEN_FDNAMES", "dbus.socket")
         .stdin(Stdio::null());
@@ -176,7 +223,7 @@ fn start_broker(
     // If it dies right away (no systemd environment), report failure.
     std::thread::sleep(Duration::from_millis(250));
     if let Some(st) = child.try_wait()? {
-        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path);
         return Err(Error::internal(format!(
             "{} exited with {st}",
             bin.display()
@@ -186,27 +233,49 @@ fn start_broker(
 }
 
 fn start_session_bus(dir: &std::path::Path) -> Option<Child> {
-    if let Some(bin) = find_in_path("dbus-broker-launch") {
-        start_journal_sink();
-        match start_broker(dir, &bin, &["--scope", "user"]) {
-            Ok((addr, child)) => {
-                std::env::set_var("DBUS_SESSION_BUS_ADDRESS", addr);
-                return Some(child);
-            }
-            Err(e) => eprintln!("warn: dbus-broker-launch failed: {e}"),
-        }
-    }
-    if let Some(bin) = find_in_path("dbus-daemon") {
-        match start_dbus(dir, &bin) {
-            Ok(a) => std::env::set_var("DBUS_SESSION_BUS_ADDRESS", a),
-            Err(e) => eprintln!("warn: could not start session bus: {e}"),
-        }
-    }
-    None
+    start_bus(&dir.join("bus"), "user", "DBUS_SESSION_BUS_ADDRESS")
+}
+
+/// Options for [`supervise_with`]. `session: None` is the plain `supervise -- cmd` behaviour.
+#[derive(Debug, Default)]
+pub struct Opts {
+    pub session: Option<SessionOpts>,
+}
+
+#[derive(Debug)]
+pub struct SessionOpts {
+    /// droidc root (inside the guest `DROIDC_ROOT`, i.e. `/run/droidc/root`).
+    pub root: PathBuf,
+    pub params: session::Params,
+}
+
+pub const SYSTEM_BUS_SOCKET: &str = "/run/dbus/system_bus_socket";
+
+/// A system bus for the session. Nothing system-wide runs on it, so most names are unknown, but
+/// clients that need a connection get one: gnome-shell 50 aborts at startup without it.
+fn start_system_bus() -> Option<Child> {
+    start_bus(
+        std::path::Path::new(SYSTEM_BUS_SOCKET),
+        "system",
+        "DBUS_SYSTEM_BUS_ADDRESS",
+    )
 }
 
 pub fn supervise(cmd: &[String]) -> Result<i32> {
-    if cmd.is_empty() {
+    supervise_with(cmd, &Opts::default())
+}
+
+pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
+    let spec = match &opts.session {
+        Some(so) => Some(session::resolve(&so.root)?.map(|(s, _)| s).ok_or_else(|| {
+            Error::not_found(
+                "no graphical session: the image sets no containers.droidc.session.* labels \
+                         and there is no override (droidc session set)",
+            )
+        })?),
+        None => None,
+    };
+    if spec.is_none() && cmd.is_empty() {
         return Err(Error::invalid("supervise needs a command after --"));
     }
     let dir = runtime_dir()?;
@@ -214,28 +283,183 @@ pub fn supervise(cmd: &[String]) -> Result<i32> {
     if let Err(e) = ensure_machine_id(std::path::Path::new(MACHINE_ID)) {
         eprintln!("warn: could not initialise {MACHINE_ID}: {e}");
     }
-    let broker = if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
-        start_session_bus(&dir)
-    } else {
-        None
-    };
-    let child = Command::new(&cmd[0]).args(&cmd[1..]).spawn().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            Error::not_found(format!("{}: command not found", cmd[0]))
-        } else {
-            Error::internal(format!("{}: {e}", cmd[0]))
+    // Before the buses start: activated services inherit the bus's environment.
+    if let Some(spec) = &spec {
+        std::env::set_var("XDG_SESSION_TYPE", "wayland");
+        if let Some(n) = &spec.name {
+            std::env::set_var("XDG_CURRENT_DESKTOP", n);
+            std::env::set_var("XDG_SESSION_DESKTOP", n.to_lowercase());
         }
-    })?;
-    let pid = child.id() as i32;
+    }
+    // Long-running helpers (buses, session services), stopped when the session ends.
+    let mut background: Vec<Child> = Vec::new();
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+        background.extend(start_session_bus(&dir));
+    }
+    // The first of these to exit ends the supervisor; the first one's status wins ties.
+    let critical = match (&spec, &opts.session) {
+        (Some(spec), Some(so)) => start_session(spec, &so.params, &dir, cmd, &mut background)?,
+        _ => vec![spawn(cmd, &[])?],
+    };
+    let code = wait_for_any(&critical)?;
+    let mut all: Vec<u32> = critical.iter().map(Child::id).collect();
+    all.extend(background.iter().map(Child::id));
+    stop_all(&all, Duration::from_secs(3));
+    Ok(code)
+}
+
+/// Spawns `argv` with `env` changes (`None` removes the variable).
+fn spawn(argv: &[String], env: &[(&str, Option<&str>)]) -> Result<Child> {
+    let mut c = Command::new(&argv[0]);
+    c.args(&argv[1..]);
+    for (k, v) in env {
+        match v {
+            Some(v) => c.env(k, v),
+            None => c.env_remove(k),
+        };
+    }
+    c.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Error::not_found(format!("{}: command not found", argv[0]))
+        } else {
+            Error::internal(format!("{}: {e}", argv[0]))
+        }
+    })
+}
+
+/// Starts the graphical session described by `spec`; returns the critical children, the one whose
+/// exit status the supervisor reports first.
+fn start_session(
+    spec: &SessionSpec,
+    params: &session::Params,
+    dir: &std::path::Path,
+    cmd: &[String],
+    background: &mut Vec<Child>,
+) -> Result<Vec<Child>> {
+    // The host compositor (Selkie) listens on $XDG_RUNTIME_DIR/<display>.
+    let host_display = std::env::var("WAYLAND_DISPLAY")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| params.wayland_display.clone());
+    if !dir.join(&host_display).exists() {
+        eprintln!(
+            "warn: no host compositor socket at {}",
+            dir.join(&host_display).display()
+        );
+    }
+    let params = session::Params {
+        wayland_display: host_display.clone(),
+        ..params.clone()
+    };
+    if std::env::var_os("DBUS_SYSTEM_BUS_ADDRESS").is_none() {
+        background.extend(start_system_bus());
+    }
+    let host = [("WAYLAND_DISPLAY", Some(host_display.as_str()))];
+    for svc in &spec.services {
+        match spawn(&session::fill(svc, &params), &host) {
+            Ok(c) => background.push(c),
+            Err(e) => eprintln!("warn: session service {}: {e}", svc[0]),
+        }
+    }
+    let exec = session::fill(&spec.exec, &params);
+    announce_session_display(dir, &host_display);
+    Ok(match spec.renderer {
+        Renderer::Wayland => {
+            let session = spawn(&exec, &host)?;
+            if cmd.is_empty() {
+                vec![session]
+            } else {
+                vec![spawn(cmd, &host)?, session]
+            }
+        }
+        Renderer::Screencast => {
+            // Headless: the session compositor must not try to nest in the host compositor.
+            let session = spawn(&exec, &[("WAYLAND_DISPLAY", None)])?;
+            let bridge = if cmd.is_empty() {
+                // `droidc bridge` (this binary); DROIDC_BRIDGE replaces it in tests.
+                let mut argv = match std::env::var("DROIDC_BRIDGE") {
+                    Ok(b) => vec![b],
+                    Err(_) => vec![
+                        std::env::current_exe()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|_| "droidc".into()),
+                        "bridge".into(),
+                    ],
+                };
+                argv.extend([
+                    "--width".into(),
+                    params.width.to_string(),
+                    "--height".into(),
+                    params.height.to_string(),
+                ]);
+                argv
+            } else {
+                cmd.to_vec()
+            };
+            vec![spawn(&bridge, &host)?, session]
+        }
+    })
+}
+
+/// Waits (in the background) for the session compositor's own Wayland socket and passes it to the
+/// session bus's activation environment, so D-Bus-activated apps open in the session rather than on
+/// the host compositor. Best effort; gives up after a minute.
+fn announce_session_display(dir: &std::path::Path, host_display: &str) {
+    let dir = dir.to_path_buf();
+    let host = host_display.to_string();
+    let existing: Vec<String> = wayland_sockets(&dir);
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            if let Some(name) = wayland_sockets(&dir)
+                .into_iter()
+                .find(|n| *n != host && !existing.contains(n))
+            {
+                let env = std::collections::HashMap::from([("WAYLAND_DISPLAY", name.as_str())]);
+                let r = zbus::blocking::Connection::session().and_then(|c| {
+                    c.call_method(
+                        Some("org.freedesktop.DBus"),
+                        "/org/freedesktop/DBus",
+                        Some("org.freedesktop.DBus"),
+                        "UpdateActivationEnvironment",
+                        &(env,),
+                    )
+                });
+                if let Err(e) = r {
+                    eprintln!("warn: activation environment: {e}");
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    });
+}
+
+/// Names of the Wayland sockets (`wayland-N`) in `dir`.
+fn wayland_sockets(dir: &std::path::Path) -> Vec<String> {
+    use std::os::unix::fs::FileTypeExt;
+    fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_type().map(|t| t.is_socket()).unwrap_or(false))
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| n.starts_with("wayland-"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Reaps every child (including orphans re-parented to us) until one of `critical` exits;
+/// returns its exit code (128 + signal when killed).
+fn wait_for_any(critical: &[Child]) -> Result<i32> {
+    let pids: Vec<i32> = critical.iter().map(|c| c.id() as i32).collect();
     loop {
         match rustix::process::wait(rustix::process::WaitOptions::empty()) {
             Ok(Some((p, st))) => {
-                if p.as_raw_nonzero().get() == pid {
-                    if let Some(b) = &broker {
-                        let _ = rustix::process::kill_process(
-                            rustix::process::Pid::from_raw(b.id() as i32).unwrap(),
-                            rustix::process::Signal::TERM,
-                        );
+                let p = p.as_raw_nonzero().get();
+                if let Some(i) = pids.iter().position(|&c| c == p) {
+                    if i > 0 {
+                        eprintln!("droidc supervise: {} exited", critical_name(i));
                     }
                     return Ok(st
                         .exit_status()
@@ -247,6 +471,35 @@ pub fn supervise(cmd: &[String]) -> Result<i32> {
             Err(e) if e == rustix::io::Errno::INTR => {}
             Err(e) => return Err(Error::internal(format!("wait: {e}"))),
         }
+    }
+}
+
+fn critical_name(i: usize) -> &'static str {
+    if i == 1 {
+        "the session compositor"
+    } else {
+        "a session process"
+    }
+}
+
+/// TERM every pid, reap them for up to `grace`, then KILL what is left.
+fn stop_all(pids: &[u32], grace: Duration) {
+    use rustix::process::{kill_process, waitpid, Pid, Signal, WaitOptions};
+    let mut left: Vec<Pid> = pids
+        .iter()
+        .filter_map(|&p| Pid::from_raw(p as i32))
+        .collect();
+    for p in &left {
+        let _ = kill_process(*p, Signal::TERM);
+    }
+    let deadline = std::time::Instant::now() + grace;
+    while !left.is_empty() && std::time::Instant::now() < deadline {
+        left.retain(|p| matches!(waitpid(Some(*p), WaitOptions::NOHANG), Ok(None)));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for p in &left {
+        let _ = kill_process(*p, Signal::KILL);
+        let _ = waitpid(Some(*p), WaitOptions::empty());
     }
 }
 
@@ -269,6 +522,19 @@ mod tests {
         // live: a second call leaves the working socket alone
         start_journal_sink_at(&p);
         c.send(b"again").unwrap();
+    }
+
+    #[test]
+    fn live_bus_is_shared_not_replaced() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("bus");
+        let _live = UnixListener::bind(&p).unwrap();
+        assert!(start_bus(&p, "user", "DROIDC_TEST_SHARED_BUS").is_none());
+        assert_eq!(
+            std::env::var("DROIDC_TEST_SHARED_BUS").unwrap(),
+            format!("unix:path={}", p.display())
+        );
+        UnixStream::connect(&p).expect("the original listener still owns the socket");
     }
 
     #[test]
@@ -310,7 +576,7 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        let (addr, mut child) = start_broker(d.path(), &script, &[]).unwrap();
+        let (addr, mut child) = start_broker(&d.path().join("bus"), &script, &[]).unwrap();
         assert_eq!(addr, format!("unix:path={}/bus", d.path().display()));
         std::thread::sleep(Duration::from_millis(300));
         let got = fs::read_to_string(&out).unwrap();
@@ -325,13 +591,150 @@ mod tests {
         let bad = d.path().join("bad");
         fs::write(&bad, "#!/bin/sh\nexit 1\n").unwrap();
         fs::set_permissions(&bad, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(start_broker(d.path(), &bad, &[]).is_err());
+        assert!(start_broker(&d.path().join("bus"), &bad, &[]).is_err());
     }
 
+    fn script(dir: &std::path::Path, name: &str, body: &str) -> String {
+        let p = dir.join(name);
+        fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        p.display().to_string()
+    }
+
+    fn session_opts(root: &std::path::Path, spec: SessionSpec) -> Opts {
+        session::write_override(&crate::layout::Root::new(root), &spec).unwrap();
+        Opts {
+            session: Some(SessionOpts {
+                root: root.to_path_buf(),
+                params: session::Params {
+                    width: 640,
+                    height: 480,
+                    ..Default::default()
+                },
+            }),
+        }
+    }
+
+    /// One test: `wait` reaps any child of the process, so supervisor runs must not overlap.
     #[test]
-    fn exit_status_is_propagated() {
-        std::env::set_var("XDG_RUNTIME_DIR", tempfile::tempdir().unwrap().keep());
-        std::env::set_var("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent"); // skip dbus
+    fn graphical_sessions() {
+        let d = tempfile::tempdir().unwrap();
+        let run = d.path().join("run");
+        fs::create_dir_all(&run).unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &run);
+        std::env::set_var("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent");
+        std::env::set_var("DBUS_SYSTEM_BUS_ADDRESS", "unix:path=/nonexistent");
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+        let o = |n: &str| d.path().join(n).display().to_string();
+        let svc = script(
+            d.path(),
+            "svc",
+            &format!("echo up > {}; exec sleep 30", o("svc.out")),
+        );
+        let comp = script(
+            d.path(),
+            "comp",
+            &format!(
+                "echo \"$* ${{WAYLAND_DISPLAY:-unset}} $XDG_SESSION_TYPE $XDG_CURRENT_DESKTOP\" > {}; exec sleep 30",
+                o("comp.out")
+            ),
+        );
+
+        // nested: the session compositor gets the host display; a given command ends the session
+        let spec = SessionSpec {
+            name: Some("Test".into()),
+            renderer: Renderer::Wayland,
+            exec: vec![
+                comp.clone(),
+                "--display={wayland_display}".into(),
+                "{width}x{height}".into(),
+            ],
+            services: vec![vec![svc.clone()]],
+        };
+        let opts = session_opts(d.path(), spec.clone());
+        let t0 = std::time::Instant::now();
+        let code = supervise_with(
+            &["sh".into(), "-c".into(), "sleep 0.5; exit 5".into()],
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(code, 5);
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "children must be stopped, not waited for"
+        );
+        assert_eq!(
+            fs::read_to_string(o("comp.out")).unwrap().trim(),
+            "--display=wayland-0 640x480 wayland-0 wayland Test"
+        );
+        assert_eq!(fs::read_to_string(o("svc.out")).unwrap().trim(), "up");
+
+        // nested, no command: the compositor's own exit ends the session
+        let quick = script(d.path(), "quick", "exit 4");
+        let opts = session_opts(
+            d.path(),
+            SessionSpec {
+                exec: vec![quick.clone()],
+                ..spec.clone()
+            },
+        );
+        assert_eq!(supervise_with(&[], &opts).unwrap(), 4);
+
+        // screencast: compositor without WAYLAND_DISPLAY, then the bridge with the host display
+        let bridge = script(
+            d.path(),
+            "bridge",
+            &format!(
+                "echo \"$* $WAYLAND_DISPLAY\" > {}; sleep 0.5; exit 3",
+                o("bridge.out")
+            ),
+        );
+        std::env::set_var("DROIDC_BRIDGE", &bridge);
+        let opts = session_opts(
+            d.path(),
+            SessionSpec {
+                renderer: Renderer::Screencast,
+                services: vec![],
+                ..spec.clone()
+            },
+        );
+        assert_eq!(supervise_with(&[], &opts).unwrap(), 3);
+        assert_eq!(
+            fs::read_to_string(o("bridge.out")).unwrap().trim(),
+            "--width 640 --height 480 wayland-0"
+        );
+        assert!(fs::read_to_string(o("comp.out"))
+            .unwrap()
+            .contains(" unset wayland Test"));
+        // a given command replaces the bridge
+        let opts = session_opts(
+            d.path(),
+            SessionSpec {
+                renderer: Renderer::Screencast,
+                services: vec![],
+                ..spec.clone()
+            },
+        );
+        assert_eq!(
+            supervise_with(&["sh".into(), "-c".into(), "exit 9".into()], &opts).unwrap(),
+            9
+        );
+        std::env::remove_var("DROIDC_BRIDGE");
+
+        // --session without a configured session is not-found
+        let empty = tempfile::tempdir().unwrap();
+        let opts = Opts {
+            session: Some(SessionOpts {
+                root: empty.path().to_path_buf(),
+                params: Default::default(),
+            }),
+        };
+        assert_eq!(
+            supervise_with(&[], &opts).unwrap_err().kind,
+            crate::error::ErrorKind::NotFound
+        );
+
+        // plain mode still works
         assert_eq!(
             supervise(&["sh".into(), "-c".into(), "exit 7".into()]).unwrap(),
             7

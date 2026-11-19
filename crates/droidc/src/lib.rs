@@ -1,4 +1,5 @@
 //! droidc engine library.
+pub mod bridge;
 pub mod deploy;
 pub mod error;
 pub mod etcmerge;
@@ -9,6 +10,7 @@ pub mod link;
 pub mod platform;
 pub mod record;
 pub mod registry;
+pub mod session;
 pub mod status;
 pub mod supervise;
 pub mod unpack;
