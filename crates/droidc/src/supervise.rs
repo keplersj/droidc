@@ -398,6 +398,22 @@ fn probe_preload(shim: &std::path::Path, prog: &str, args: &[&str], tries: u32) 
     }
 }
 
+/// The user manager has no gnome-session to bring `graphical-session.target` up, and the portal
+/// (`xdg-desktop-portal.service`) requires it: without it every GTK app waits out a D-Bus timeout asking
+/// for portal settings (a minute and a half for a window) and Ptyxis cannot start its agent. This unit
+/// pulls the target in once started (it is refused as a manual start itself, not as a dependency).
+const GRAPHICAL_TARGET: &str = "droidc-graphical-session.target";
+
+fn graphical_target_unit() -> &'static str {
+    "[Unit]\nDescription=droidc graphical session\nWants=graphical-session.target\nBefore=graphical-session.target\n"
+}
+
+fn write_graphical_target(runtime: &std::path::Path) -> bool {
+    let dest = runtime.join("systemd/user");
+    fs::create_dir_all(&dest).is_ok()
+        && fs::write(dest.join(GRAPHICAL_TARGET), graphical_target_unit()).is_ok()
+}
+
 /// Unit files the user manager reads from `$XDG_RUNTIME_DIR/systemd/user`, which outrank the image's own
 /// (`/usr/lib/systemd/user`). Images that ship `dbus-broker` as the bus (Bluefin, CentOS bootc) also ship
 /// `dbus-daemon`; `dbus-broker-launch` exits `ENOENT` (launcher.c +1345) here on every start, so with
@@ -750,6 +766,9 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
             if let Some(spec) = &spec {
                 mask_units(&dir, &units_replaced_by_services(&spec.services));
             }
+            if !write_graphical_target(&dir) {
+                eprintln!("warn: could not write {GRAPHICAL_TARGET}");
+            }
             start_systemd_user_with_shim(std::path::Path::new(SYSTEMD), shim, &dir, 4)
         });
         match started {
@@ -846,7 +865,7 @@ fn start_session(
         }
     }
     let exec = session::fill(&spec.exec, &params);
-    announce_session_display(dir, &host_display);
+    announce_session_display(dir, &host_display, user_manager);
     Ok(match spec.renderer {
         Renderer::Wayland => {
             let session = spawn(&exec, &host)?;
@@ -888,7 +907,7 @@ fn start_session(
 /// Waits (in the background) for the session compositor's own Wayland socket and passes it to the
 /// session bus's activation environment, so D-Bus-activated apps open in the session rather than on
 /// the host compositor. Best effort; gives up after a minute.
-fn announce_session_display(dir: &std::path::Path, host_display: &str) {
+fn announce_session_display(dir: &std::path::Path, host_display: &str, user_manager: bool) {
     let dir = dir.to_path_buf();
     let host = host_display.to_string();
     let existing: Vec<String> = wayland_sockets(&dir);
@@ -912,11 +931,53 @@ fn announce_session_display(dir: &std::path::Path, host_display: &str) {
                 if let Err(e) = r {
                     eprintln!("warn: activation environment: {e}");
                 }
+                if user_manager {
+                    activate_graphical_session(name.as_str());
+                }
                 return;
             }
             std::thread::sleep(Duration::from_millis(250));
         }
     });
+}
+
+/// Tells the user manager which display the session has (units it activates, the portal among them, are
+/// started with the manager's environment, not the bus's) and starts the graphical session target.
+fn activate_graphical_session(display: &str) {
+    let mut env = vec![
+        format!("WAYLAND_DISPLAY={display}"),
+        "XDG_SESSION_TYPE=wayland".to_string(),
+    ];
+    for k in ["XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP"] {
+        if let Ok(v) = std::env::var(k) {
+            env.push(format!("{k}={v}"));
+        }
+    }
+    let r = zbus::blocking::Connection::session().and_then(|c| {
+        let manager = |method: &str| {
+            (
+                Some("org.freedesktop.systemd1"),
+                "/org/freedesktop/systemd1",
+                Some("org.freedesktop.systemd1.Manager"),
+                method.to_string(),
+            )
+        };
+        let (dest, path, iface, m) = manager("SetEnvironment");
+        c.call_method(dest, path, iface, m.as_str(), &(env,))?;
+        let (dest, path, iface, m) = manager("StartUnit");
+        c.call_method(
+            dest,
+            path,
+            iface,
+            m.as_str(),
+            &(GRAPHICAL_TARGET, "replace"),
+        )
+        .map(|_| ())
+    });
+    match r {
+        Ok(()) => eprintln!("note: started {GRAPHICAL_TARGET} with WAYLAND_DISPLAY={display}"),
+        Err(e) => eprintln!("warn: starting {GRAPHICAL_TARGET}: {e}"),
+    }
 }
 
 /// Names of the Wayland sockets (`wayland-N`) in `dir`.
@@ -1108,6 +1169,16 @@ mod tests {
             fs::read_to_string(cg.join("cgroup.events")).unwrap(),
             "populated 0\n"
         );
+    }
+
+    #[test]
+    fn graphical_target_unit_is_written_and_pulls_the_target_in() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(write_graphical_target(d.path()));
+        let body =
+            fs::read_to_string(d.path().join("systemd/user").join(GRAPHICAL_TARGET)).unwrap();
+        assert!(body.contains("Wants=graphical-session.target"));
+        assert!(body.contains("Before=graphical-session.target"));
     }
 
     #[test]
