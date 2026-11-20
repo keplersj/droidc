@@ -279,6 +279,42 @@ fn prepare_systemd(run: &std::path::Path, cgroup: &std::path::Path) -> Result<bo
     Ok(true)
 }
 
+/// A socket left by an earlier session. `wait_for_socket` would take a bus that is still answering (a
+/// session being torn down) for the new one, and the bridge then dies with "Connection reset by peer"
+/// when it goes. Wait up to `wait` for a listener to go away, and remove the socket file once nothing
+/// answers. False when something still listens at the end: another live session's bus, left alone.
+fn retire_stale_socket(path: &std::path::Path, wait: Duration) -> bool {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match UnixStream::connect(path) {
+            Ok(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100))
+            }
+            Ok(_) => return false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => {
+                let _ = fs::remove_file(path);
+                return true;
+            }
+        }
+    }
+}
+
+/// What an earlier user manager left under `$XDG_RUNTIME_DIR` that the next one must not trust: its
+/// generated units (a second run logs "Failed to create unit file ... File exists" for each) and its
+/// transient units. `systemd/user` (the overrides droidc writes) and `systemd/system` are kept.
+fn clear_stale_manager_state(runtime: &std::path::Path) {
+    let base = runtime.join("systemd");
+    for d in [
+        "generator",
+        "generator.early",
+        "generator.late",
+        "transient",
+    ] {
+        let _ = fs::remove_dir_all(base.join(d));
+    }
+}
+
 /// Unit files the user manager reads from `$XDG_RUNTIME_DIR/systemd/user`, which outrank the image's own
 /// (`/usr/lib/systemd/user`). Images that ship `dbus-broker` as the bus (Bluefin, CentOS bootc) also ship
 /// `dbus-daemon`; `dbus-broker-launch` exits `ENOENT` (launcher.c +1345) here on every start, so with
@@ -521,6 +557,14 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
     let mut user_manager = false;
     if let Some(shim) = &shim {
         crate::journal::start(true);
+        // A desktop closed and reopened leaves the previous session's bus and generated units behind.
+        if !retire_stale_socket(&dir.join("bus"), Duration::from_secs(5)) {
+            eprintln!(
+                "warn: something still listens on {}",
+                dir.join("bus").display()
+            );
+        }
+        clear_stale_manager_state(&dir);
         let started = prepare_systemd(
             std::path::Path::new("/run"),
             std::path::Path::new(CGROUP_ROOT),
@@ -901,6 +945,49 @@ mod tests {
             fs::read_to_string(cg.join("cgroup.events")).unwrap(),
             "populated 0\n"
         );
+    }
+
+    #[test]
+    fn stale_sockets_are_retired_and_live_ones_are_not() {
+        let d = tempfile::tempdir().unwrap();
+        let sock = d.path().join("bus");
+        // nothing there: fine
+        assert!(retire_stale_socket(&sock, Duration::from_millis(200)));
+        // a socket file nobody listens on (the listener was dropped): removed
+        drop(UnixListener::bind(&sock).unwrap());
+        assert!(sock.exists());
+        assert!(retire_stale_socket(&sock, Duration::from_millis(200)));
+        assert!(!sock.exists());
+        // a live listener is waited on and then left alone
+        let live = UnixListener::bind(&sock).unwrap();
+        assert!(!retire_stale_socket(&sock, Duration::from_millis(300)));
+        assert!(sock.exists());
+        // ... and is retired once it goes away while we wait
+        let t = std::thread::spawn({
+            let sock = sock.clone();
+            move || retire_stale_socket(&sock, Duration::from_secs(5))
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        drop(live);
+        assert!(t.join().unwrap());
+        assert!(!sock.exists());
+    }
+
+    #[test]
+    fn stale_manager_state_is_cleared_but_the_overrides_stay() {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path().join("systemd");
+        for sub in ["generator.late", "generator", "transient", "user", "system"] {
+            fs::create_dir_all(base.join(sub)).unwrap();
+            fs::write(base.join(sub).join("x"), "").unwrap();
+        }
+        clear_stale_manager_state(d.path());
+        for gone in ["generator.late", "generator", "transient"] {
+            assert!(!base.join(gone).exists(), "{gone}");
+        }
+        for kept in ["user", "system"] {
+            assert!(base.join(kept).join("x").exists(), "{kept}");
+        }
     }
 
     #[test]
