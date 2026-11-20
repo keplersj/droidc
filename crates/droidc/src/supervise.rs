@@ -504,6 +504,12 @@ fn start_systemd_user(
         // The manager ignores SYSTEMD_LOG_LEVEL for its own messages; only the argument counts.
         cmd.arg(format!("--log-level={level}"));
     }
+    // Under CGSHIM_TRACE every process the manager starts writes the dynamic loader's trace to
+    // /tmp/lddebug.<pid>, to see which one cannot preload the shim and why (the services inherit these).
+    if std::env::var_os("CGSHIM_TRACE").is_some() {
+        cmd.env("LD_DEBUG", "files,libs")
+            .env("LD_DEBUG_OUTPUT", "/tmp/lddebug");
+    }
     cmd.env("LD_PRELOAD", preload)
         .env("XDG_RUNTIME_DIR", dir)
         .env("SYSTEMD_LOG_TARGET", target)
