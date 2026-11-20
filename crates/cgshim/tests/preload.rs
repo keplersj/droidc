@@ -159,19 +159,80 @@ fn mkdir_makes_the_cgroup_files_and_rmdir_removes_them() {
     assert_eq!(ev, "populated 1\nfrozen 0\n");
 }
 
+/// Child half of the repair test: `open` (libc, as systemd does) the path in `CGSHIM_HELPER_OPEN` and print
+/// the descriptor, errno and what could be read. Not `cat`: coreutils may be a Rust rewrite that never
+/// reaches the libc symbols the shim intercepts.
+#[test]
+fn open_helper() {
+    let Some(path) = std::env::var_os("CGSHIM_HELPER_OPEN") else {
+        return;
+    };
+    let c = std::ffi::CString::new(path.as_encoded_bytes()).unwrap();
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY) };
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    let mut buf = [0u8; 64];
+    let n = if fd >= 0 {
+        unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) }
+    } else {
+        0
+    };
+    let text = String::from_utf8_lossy(&buf[..n.max(0) as usize]).into_owned();
+    println!(
+        "OPEN {} {} {:?}",
+        (fd >= 0) as i32,
+        if fd >= 0 { 0 } else { errno },
+        text
+    );
+}
+
+/// (opened, errno, content, stderr) of a libc `open` of `path` with the shim loaded.
+fn open_result(t: &Tree, path: &str) -> (bool, i32, String, String) {
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "open_helper", "--nocapture", "--test-threads=1"])
+        .env("LD_PRELOAD", shim())
+        .env("CGSHIM_ROOT", &t.0)
+        .env("CGSHIM_TRACE", "1")
+        .env("CGSHIM_HELPER_OPEN", path)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let line = text
+        .split_once("OPEN ")
+        .unwrap_or_else(|| panic!("{text}"))
+        .1
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    let mut it = line.splitn(3, ' ');
+    let opened = it.next().unwrap() == "1";
+    let errno = it.next().unwrap().parse().unwrap();
+    let content: String = unquote(it.next().unwrap());
+    (
+        opened,
+        errno,
+        content,
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Undo `{:?}` for the short ASCII strings the helper prints (`\n` escapes only).
+fn unquote(s: &str) -> String {
+    s.trim_matches('"').replace("\\n", "\n")
+}
+
 #[test]
 fn a_directory_without_its_files_is_repaired_on_first_open() {
     let t = Tree::new("repair");
     std::fs::create_dir(t.0.join("init.scope")).unwrap(); // made where the shim was not looking
-    let (out, err) = t.sh(&format!("cat {}", t.p("init.scope/cgroup.events")));
-    assert_eq!(out, "populated 1\nfrozen 0\n", "{err}");
+    let (opened, errno, content, err) = open_result(&t, &t.p("init.scope/cgroup.events"));
+    assert!(opened, "errno {errno}: {err}");
+    assert_eq!(content, "populated 1\nfrozen 0\n", "{err}");
     assert!(err.contains("repaired"), "{err}");
     // a file in a directory that does not exist is still an error
-    let (out, _) = t.sh(&format!(
-        "cat {} 2>&1 || echo failed",
-        t.p("nope/cgroup.events")
-    ));
-    assert!(out.contains("failed"), "{out}");
+    let (opened, errno, _, _) = open_result(&t, &t.p("nope/cgroup.events"));
+    assert!(!opened);
+    assert_eq!(errno, libc::ENOENT);
 }
 
 #[test]
