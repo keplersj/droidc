@@ -540,8 +540,20 @@ fn start_systemd_user_with_shim(
     if !shim.is_file() {
         return start_systemd_user(bin, shim, dir);
     }
+    eprintln!(
+        "note: starting systemd --user with {} (up to {attempts} tries)",
+        shim.display()
+    );
     for attempt in 1..attempts {
-        let mut child = start_systemd_user(bin, shim, dir)?;
+        // From the second try on, preload a plain copy in the runtime dir: if the bind-mounted file
+        // is what the loader trips over, the copy is not.
+        let copy = dir.join("cgshim.so");
+        let using = if attempt > 1 && fs::copy(shim, &copy).is_ok() {
+            copy.as_path()
+        } else {
+            shim
+        };
+        let mut child = start_systemd_user(bin, using, dir)?;
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         let mut readable = false;
         loop {
