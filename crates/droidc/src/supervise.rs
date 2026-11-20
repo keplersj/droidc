@@ -315,6 +315,33 @@ fn clear_stale_manager_state(runtime: &std::path::Path) {
     }
 }
 
+/// Why `ld.so` might not be able to preload the shim: it only says "cannot open shared object file".
+/// Opens it the same way and reports the OS error, with the process's open descriptors and their limit
+/// (a leak across sessions would show here). Printed only when the open fails, or under `CGSHIM_TRACE`.
+fn explain_shim_access(shim: &std::path::Path) {
+    let opened = fs::File::open(shim);
+    if opened.is_ok() && std::env::var_os("CGSHIM_TRACE").is_none() {
+        return;
+    }
+    let fds = fs::read_dir("/proc/self/fd")
+        .map(|d| d.count())
+        .unwrap_or(0);
+    let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    let dir = shim.parent().map(|p| fs::read_dir(p).map(|d| d.count()));
+    match opened {
+        Ok(_) => eprintln!(
+            "note: shim {} opens (fds={fds}, nofile={:?})",
+            shim.display(),
+            limit.current
+        ),
+        Err(e) => eprintln!(
+            "warn: cannot open the shim {}: {e} (fds={fds}, nofile={:?}, dir entries={dir:?})",
+            shim.display(),
+            limit.current
+        ),
+    }
+}
+
 /// Unit files the user manager reads from `$XDG_RUNTIME_DIR/systemd/user`, which outrank the image's own
 /// (`/usr/lib/systemd/user`). Images that ship `dbus-broker` as the bus (Bluefin, CentOS bootc) also ship
 /// `dbus-daemon`; `dbus-broker-launch` exits `ENOENT` (launcher.c +1345) here on every start, so with
@@ -558,6 +585,7 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
     if let Some(shim) = &shim {
         crate::journal::start(true);
         // A desktop closed and reopened leaves the previous session's bus and generated units behind.
+        explain_shim_access(shim);
         if !retire_stale_socket(&dir.join("bus"), Duration::from_secs(5)) {
             eprintln!(
                 "warn: something still listens on {}",
