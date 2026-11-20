@@ -545,10 +545,11 @@ fn start_systemd_user_with_shim(
         shim.display()
     );
     for attempt in 1..attempts {
-        // From the second try on, preload a plain copy in the runtime dir: if the bind-mounted file
-        // is what the loader trips over, the copy is not.
+        // Preload a plain copy in the runtime dir rather than the bind-mounted file: from the second
+        // session of an app run on, the loader failed to open the bind-mounted path for the manager's
+        // children ("cannot be preloaded"), and the copy is a file like any other.
         let copy = dir.join("cgshim.so");
-        let using = if attempt > 1 && fs::copy(shim, &copy).is_ok() {
+        let using = if fs::copy(shim, &copy).is_ok() {
             copy.as_path()
         } else {
             shim
