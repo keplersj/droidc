@@ -1,5 +1,5 @@
 //! `LD_PRELOAD` shim that lets a real `systemd --user` run where the kernel gives it no cgroup
-//! filesystem (Android apps under proot). It replaces `shim/cgshim.c`.
+//! filesystem (Android apps under proot). It replaces the C shim this crate was ported from.
 //!
 //! systemd refuses to start without a cgroup2 hierarchy it can write. Under proot on Android there
 //! is none, so droidc binds a plain directory at `/sys/fs/cgroup` and this library makes systemd

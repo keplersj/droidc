@@ -209,7 +209,7 @@ pub struct Opts {
 }
 
 /// Whether the image's own `systemd --user` runs the session services (on the cgroup shim, see
-/// `shim/cgshim.c`) instead of a bare `dbus-daemon`.
+/// `crates/cgshim`) instead of a bare `dbus-daemon`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum SystemdMode {
     /// Never: `dbus-daemon` and the session's own services (the default while this is proven)

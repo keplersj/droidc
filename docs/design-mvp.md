@@ -300,7 +300,7 @@ bootc images are systemd images, and GNOME depends on `systemd --user` (session 
 `org.freedesktop.systemd1` for dbus-broker activation and app scopes). With `--systemd=on`,
 supervise runs the image's own `/usr/lib/systemd/systemd --user` instead of a bare bus:
 
-- `/usr/lib/droidc/cgshim.so` (`DROIDC_CGSHIM`; `shim/cgshim.c`, built against glibc for the guest's
+- `/usr/lib/droidc/cgshim.so` (`DROIDC_CGSHIM`; `crates/cgshim`, built against glibc for the guest's
   arch) is preloaded into it. systemd refuses to start without a writable cgroup2 tree, and an app
   has none; the shim makes the plain directory bound at `/sys/fs/cgroup` (`shell-spec` `systemd.binds`,
   bind it after `/sys`) look like cgroup2 (statfs magic, `/proc/<pid>/cgroup`, the `cgroup.*` files on

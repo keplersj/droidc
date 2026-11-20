@@ -20,7 +20,7 @@ not checked against the binary) or **inferred**. Nothing here was run on Android
    builtin manager is "completely unused and untested" and being removed), and systemd-userdb (GDM).
    Bluefin LTS ships GNOME 48 and can be built for 49/50 (cited, docs.projectbluefin.io), so any
    plan that relies on gnome-session's builtin mode is a stopgap.
-3. **Real `systemd --user` runs on a small cgroup shim** (`shim/cgshim.c`; verified on systemd 249 and on CentOS Stream 10's 257, not yet on proot, see Results). Real
+3. **Real `systemd --user` runs on a small cgroup shim** (`crates/cgshim`; verified on systemd 249 and on CentOS Stream 10's 257, not yet on proot, see Results). Real
    `systemctl`, `systemd-run --user` (`StartTransientUnit`) and `is-system-running` worked against it.
    That makes "shim cgroups, run real systemd for the user session" the cheapest route to full
    `org.freedesktop.systemd1` fidelity. It is unproven on Android/proot, where more than cgroups is
@@ -43,7 +43,7 @@ re-parented orphans was false under proot). Now:
 | `droidc login1` (logind stand-in, system bus) | done; `login1.rs`, tested against a private `dbus-daemon` |
 | Journal socket stand-in in systemd mode | done |
 | Image inventory | `tests/inventory-image.sh` + a `measure-bluefin` step (not yet run in CI) |
-| cgroup shim + real `systemd --user` | `shim/cgshim.c` + `supervise --systemd=on` (off by default) |
+| cgroup shim + real `systemd --user` | `crates/cgshim` + `supervise --systemd=on` (off by default) |
 | cgroup accounting helper | `cgroups.rs` |
 | Probes under bwrap and proot | `tests/systemd-probe.sh` + two report-only `measure-bluefin` steps (not yet run) |
 
@@ -84,7 +84,7 @@ bwrap with a tmpfs-style directory over `/sys/fs/cgroup` (still **not** proot or
 Run as Selkie's own uid (`run-as io.github.keplersj.selkie`, a debuggable build) with Selkie's exact proot
 command line (`libproot.so`, `--link2symlink`, the same binds and fake `/proc` files) against its
 real Bluefin LTS deployment (GNOME 50, systemd 257, aarch64). Four things broke that no earlier test
-could show, all fixed in `shim/cgshim.c` and each found by reading the manager's own log
+could show, all fixed in `crates/cgshim` and each found by reading the manager's own log
 (`DROIDC_JOURNAL=stderr`):
 
 1. **No unit loaded**: `Failed to read symlink ... Invalid argument` for every unit file. Under
@@ -248,3 +248,32 @@ question only.
 - [rustysd feature comparison](https://github.com/KillingSpark/rustysd/blob/master/feature-comparison.md)
 - [docker-systemctl-replacement](https://github.com/gdraheim/docker-systemctl-replacement)
 - [Chimera Linux GNOME](https://chimera-linux.org/docs/configuration/gnome)
+
+### On the CI emulator (API 34, x86_64, Selkie's proot): a full GNOME session
+
+Selkie's `Emulator GUI` job runs Bluefin LTS's GNOME under `droidc supervise --session --systemd auto` and
+passes: first frame in about 10 s, keyboard input, the Activities overview, a GTK app. Getting there
+took five fixes, each found from the manager's own log (`DROIDC_JOURNAL=stderr`, `CGSHIM_TRACE=1`):
+
+1. **`creat()` is ENOSYS under proot on x86_64** (a legacy syscall; arm64 has none, which is why the tablet
+   never saw it). The shim made every cgroup directory empty, and systemd failed with `Failed to create
+   /init.scope control group`. The shim creates the `cgroup.*` files with `open(O_CREAT)`, and repairs a
+   directory that lacks them when an open fails with ENOENT.
+2. **`/sys/fs/cgroup` must be a plain directory.** Android's cgroup2 mount is read-only to an app, so Selkie
+   binds an app-owned directory over it; droidc then builds the fake tree.
+3. **`dbus-broker-launch` exits ENOENT** (launcher.c +1345) on every start. `supervise` writes
+   `$XDG_RUNTIME_DIR/systemd/user/dbus.service` and `dbus-broker.service` as symlinks to
+   `dbus-daemon.service` when the image has it. Both names: the image's `dbus.socket` says
+   `Service=dbus-broker.service`, and masking that one makes the socket refuse to start.
+4. **systemd's seccomp filters kill services with SIGSYS** (`pipewire.service`'s `SystemCallFilter=`). The
+   shim reports `prctl(PR_SET_SECCOMP, FILTER)` and `seccomp(SET_MODE_FILTER)` as done and installs
+   nothing; the guest already runs inside the app's sandbox.
+5. **The image's socket-activated PipeWire left Mutter's screen-cast stream missing** (`no
+   PipeWireStreamAdded for the recorded monitor`; PipeWire's Flatpak access check cannot read
+   `/proc/<pid>/root` and restricts every client). Under `--systemd` the session's own `services` are still
+   started by droidc, as without systemd, and the image's `pipewire`, `pipewire-pulse` and `wireplumber`
+   units are masked. This one is a diagnosis from the log and the earlier non-systemd runs, not proven by
+   a PipeWire debug log.
+
+Still open: `xdg-desktop-portal.service` fails on a dependency (GTK apps wait out portal timeouts); nothing
+here ran on a real device since these changes; the aarch64 shim is built but unexercised under proot.

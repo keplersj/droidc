@@ -4,7 +4,7 @@
 # reproduce Android's missing namespaces, seccomp or proot).  Usage: sh run.sh
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
-gcc -shared -fPIC -O1 -o "$here/cgshim.so" "$here/../../../shim/cgshim.c" -ldl
+(cd "$here/../../.." && cargo build --release -p cgshim) && cp "$here/../../../target/release/libcgshim.so" "$here/cgshim.so"
 exec unshare -Urm --pid --fork --mount-proc sh -c '
   mount -t tmpfs none /sys/fs/cgroup        # a plain tmpfs where cgroup2 would be
   mount -t tmpfs none /run
