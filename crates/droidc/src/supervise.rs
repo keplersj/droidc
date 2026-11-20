@@ -342,6 +342,46 @@ fn explain_shim_access(shim: &std::path::Path) {
     }
 }
 
+/// Runs `true` with the shim preloaded and `LD_DEBUG=files` the way `systemd --user` is started, and prints
+/// what `ld.so` says, to see why a preload fails when droidc itself can open the file. Up to `tries` times,
+/// stopping at the first clean run, so a transient failure shows as one. Only under `CGSHIM_TRACE`.
+fn probe_preload(shim: &std::path::Path, tries: u32) {
+    if std::env::var_os("CGSHIM_TRACE").is_none() {
+        return;
+    }
+    for n in 1..=tries {
+        let out = Command::new("true")
+            .env("LD_PRELOAD", shim)
+            .env("LD_DEBUG", "files")
+            .stdin(Stdio::null())
+            .output();
+        match out {
+            Ok(o) => {
+                let text = String::from_utf8_lossy(&o.stderr);
+                let failed = text.contains("cannot be preloaded");
+                let shown: String = text
+                    .lines()
+                    .filter(|l| l.contains("cgshim") || failed)
+                    .take(12)
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                eprintln!(
+                    "note: preload probe {n}/{tries}: {} {shown}",
+                    if failed { "FAILED" } else { "ok" }
+                );
+                if !failed {
+                    return;
+                }
+            }
+            Err(e) => {
+                eprintln!("note: preload probe {n}/{tries}: could not run `true`: {e}");
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 /// Unit files the user manager reads from `$XDG_RUNTIME_DIR/systemd/user`, which outrank the image's own
 /// (`/usr/lib/systemd/user`). Images that ship `dbus-broker` as the bus (Bluefin, CentOS bootc) also ship
 /// `dbus-daemon`; `dbus-broker-launch` exits `ENOENT` (launcher.c +1345) here on every start, so with
@@ -586,6 +626,7 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
         crate::journal::start(true);
         // A desktop closed and reopened leaves the previous session's bus and generated units behind.
         explain_shim_access(shim);
+        probe_preload(shim, 5);
         if !retire_stale_socket(&dir.join("bus"), Duration::from_secs(5)) {
             eprintln!(
                 "warn: something still listens on {}",
