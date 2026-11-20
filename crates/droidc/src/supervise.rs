@@ -537,20 +537,37 @@ fn start_systemd_user_with_shim(
     dir: &std::path::Path,
     attempts: u32,
 ) -> Result<Child> {
-    if !shim.is_file() || shim_mapped(std::process::id()).is_none() {
+    if !shim.is_file() {
         return start_systemd_user(bin, shim, dir);
     }
     for attempt in 1..attempts {
         let mut child = start_systemd_user(bin, shim, dir)?;
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut readable = false;
         loop {
-            if shim_mapped(child.id()) == Some(true) {
-                return Ok(child);
+            match shim_mapped(child.id()) {
+                Some(true) => {
+                    eprintln!(
+                        "note: systemd --user (pid {}) has the shim mapped (attempt {attempt})",
+                        child.id()
+                    );
+                    return Ok(child);
+                }
+                Some(false) => readable = true,
+                None => {}
             }
             if matches!(child.try_wait(), Ok(Some(_))) || std::time::Instant::now() > deadline {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+        if !readable {
+            // cannot tell: do not kill a manager that may be fine
+            eprintln!(
+                "note: cannot read /proc/{}/maps; not checking for the shim",
+                child.id()
+            );
+            return Ok(child);
         }
         eprintln!("warn: systemd --user did not load the shim (attempt {attempt}/{attempts}); starting it again");
         let _ = child.kill();
