@@ -519,6 +519,47 @@ fn start_systemd_user(
         .context(bin.display())
 }
 
+/// Whether `pid` has the shim mapped. On the API 34 emulator a `systemd --user` started right after another
+/// session ended sometimes comes up without it ("ld.so: ... cannot be preloaded"; its trace never gets a
+/// link map for the shim), and then fails with no bus. `None` when the process's mappings cannot be read.
+fn shim_mapped(pid: u32) -> Option<bool> {
+    fs::read_to_string(format!("/proc/{pid}/maps"))
+        .ok()
+        .map(|m| m.contains("cgshim"))
+}
+
+/// [`start_systemd_user`], checked: if the manager has not mapped the shim within a few seconds (or exited),
+/// kill it and start again, up to `attempts` times; the last start is returned unchecked. Skipped when the
+/// shim file does not exist or mappings cannot be read, where the check could only misfire.
+fn start_systemd_user_with_shim(
+    bin: &std::path::Path,
+    shim: &std::path::Path,
+    dir: &std::path::Path,
+    attempts: u32,
+) -> Result<Child> {
+    if !shim.is_file() || shim_mapped(std::process::id()).is_none() {
+        return start_systemd_user(bin, shim, dir);
+    }
+    for attempt in 1..attempts {
+        let mut child = start_systemd_user(bin, shim, dir)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if shim_mapped(child.id()) == Some(true) {
+                return Ok(child);
+            }
+            if matches!(child.try_wait(), Ok(Some(_))) || std::time::Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!("warn: systemd --user did not load the shim (attempt {attempt}/{attempts}); starting it again");
+        let _ = child.kill();
+        let _ = child.wait();
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    start_systemd_user(bin, shim, dir)
+}
+
 /// Wait until something accepts connections on `socket`.
 fn wait_for_socket(socket: &std::path::Path, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
@@ -679,7 +720,7 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
             if let Some(spec) = &spec {
                 mask_units(&dir, &units_replaced_by_services(&spec.services));
             }
-            start_systemd_user(std::path::Path::new(SYSTEMD), shim, &dir)
+            start_systemd_user_with_shim(std::path::Path::new(SYSTEMD), shim, &dir, 4)
         });
         match started {
             Ok(child) => {
@@ -1037,6 +1078,13 @@ mod tests {
             fs::read_to_string(cg.join("cgroup.events")).unwrap(),
             "populated 0\n"
         );
+    }
+
+    #[test]
+    fn shim_mapping_is_read_from_proc() {
+        // our own process has no shim mapped, and its mappings are readable
+        assert_eq!(shim_mapped(std::process::id()), Some(false));
+        assert_eq!(shim_mapped(u32::MAX), None);
     }
 
     #[test]
