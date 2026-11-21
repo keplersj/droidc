@@ -55,7 +55,13 @@ pub struct Deployment {
     pub signature: SignatureInfo,
     pub insecure: bool,
     pub stats: Stats,
+    /// `"image"` once `fix-ownership` applied the image's uid/gid/mode/xattrs (needs root from then
+    /// on); absent while everything belongs to the app uid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership: Option<String>,
 }
+
+pub const OWNERSHIP_IMAGE: &str = "image";
 
 /// First 16 hex chars of the manifest digest.
 pub fn deployment_id(manifest_digest: &str) -> String {

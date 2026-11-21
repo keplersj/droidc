@@ -2,6 +2,7 @@
 pub mod bridge;
 pub mod cgroups;
 pub mod deploy;
+pub mod enter;
 pub mod error;
 pub mod etcmerge;
 pub mod events;
@@ -11,6 +12,7 @@ pub mod layout;
 pub mod link;
 pub mod logcat;
 pub mod login1;
+pub mod ownership;
 pub mod platform;
 pub mod record;
 pub mod registry;

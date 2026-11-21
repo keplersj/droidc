@@ -84,9 +84,78 @@ pub fn is_empty_dir(p: &Path) -> bool {
     }
 }
 
+/// SELinux label (`security.selinux`) of `p`; `follow` resolves a final symlink (needed for
+/// `/proc/self/fd/N`). None without SELinux.
+pub fn selinux_label(p: &Path, follow: bool) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; 512];
+    let n = if follow {
+        rustix::fs::getxattr(p, "security.selinux", &mut buf[..])
+    } else {
+        rustix::fs::lgetxattr(p, "security.selinux", &mut buf[..])
+    }
+    .ok()?;
+    buf.truncate(n);
+    Some(buf)
+}
+
+/// Give `p` (never followed) the SELinux label `label` unless it already has it. On Android a file
+/// a root (su) process creates in app storage gets that process's MLS level instead of the app's
+/// categories, and the app can then read but not write, rename or delete it; ownership alone does
+/// not fix that. Best effort: without SELinux, or without permission, nothing happens.
+pub fn inherit_selinux_label(p: &Path, label: Option<&[u8]>) {
+    if let Some(l) = label {
+        if selinux_label(p, false).as_deref() != Some(l) {
+            let _ =
+                rustix::fs::lsetxattr(p, "security.selinux", l, rustix::fs::XattrFlags::empty());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Needs SELinux (skips without it, e.g. on the CI runners): relabels a file to its
+    /// directory's label, never through a symlink.
+    #[test]
+    fn selinux_label_is_inherited() {
+        let d = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let Some(dir_label) = selinux_label(d.path(), false) else {
+            eprintln!("skipped: no SELinux");
+            return;
+        };
+        let f = d.path().join("f");
+        fs::write(&f, "").unwrap();
+        // give it some other valid label: the one of a file in /tmp
+        let other = tempfile::NamedTempFile::new().unwrap();
+        let Some(other_label) = selinux_label(other.path(), false).filter(|l| *l != dir_label)
+        else {
+            eprintln!("skipped: no second label to test with");
+            return;
+        };
+        if rustix::fs::lsetxattr(
+            &f,
+            "security.selinux",
+            &other_label,
+            rustix::fs::XattrFlags::empty(),
+        )
+        .is_err()
+        {
+            eprintln!("skipped: not allowed to relabel");
+            return;
+        }
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(other.path(), &link).unwrap();
+        inherit_selinux_label(&f, Some(&dir_label));
+        assert_eq!(selinux_label(&f, false).as_deref(), Some(&dir_label[..]));
+        inherit_selinux_label(&link, Some(&dir_label));
+        assert_eq!(
+            selinux_label(other.path(), false).as_deref(),
+            Some(&other_label[..]),
+            "symlink target untouched"
+        );
+        inherit_selinux_label(&f, None); // no-op without SELinux
+    }
 
     #[test]
     fn rmtree_handles_readonly_and_symlinks() {

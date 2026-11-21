@@ -564,6 +564,7 @@ dependencies = [
  "flate2",
  "hex",
  "hickory-resolver",
+ "libc",
  "reqwest",
  "rustix",
  "rustls",

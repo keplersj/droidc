@@ -7,7 +7,7 @@ use droidc::link::{LinkKind, DEFAULT_L2S_PREFIX};
 use droidc::platform::Platform;
 use droidc::registry::HttpConfig;
 use droidc::session::{self, Renderer, SessionSpec};
-use droidc::{bridge, logcat, login1, status, supervise};
+use droidc::{bridge, enter, logcat, login1, ownership, status, supervise};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -48,6 +48,9 @@ enum Cmd {
         /// Resolve and verify the signature only; download and change nothing
         #[arg(long)]
         verify_only: bool,
+        /// (root) Apply the image's uid/gid/mode/xattrs, as fix-ownership does
+        #[arg(long)]
+        apply_ownership: bool,
     },
     /// Re-resolve the current ref; no-op if the digest is unchanged
     Upgrade,
@@ -58,9 +61,40 @@ enum Cmd {
     /// Remove unreferenced deployments and blobs
     Gc,
     /// How to enter the current deployment
-    ShellSpec,
+    ShellSpec {
+        /// proot|chroot (chroot needs real root)
+        #[arg(long, default_value = "proot")]
+        launcher: String,
+    },
     /// Detected platform
     Platform,
+    /// (as root) apply the image's uid/gid/mode/xattrs to the current deployment, or with --undo
+    /// give the whole root back to the app uid
+    FixOwnership {
+        #[arg(long)]
+        undo: bool,
+    },
+    /// (as root) run a command in the current deployment: namespaces + chroot, no proot
+    Enter {
+        /// Extra bind after the deployment's, HOST:/GUEST (repeatable)
+        #[arg(long = "bind", value_name = "HOST:GUEST")]
+        binds: Vec<String>,
+        /// Extra environment, KEY=VALUE (repeatable)
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Hostname in the new UTS namespace
+        #[arg(long)]
+        hostname: Option<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        cmd: Vec<String>,
+    },
+    /// PID 1 of `enter`'s namespace (internal)
+    #[command(name = "__enter-init", hide = true)]
+    EnterInit {
+        plan: String,
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
     /// (inside the guest) start session services, then run a command or the graphical session
     Supervise {
         /// Start the deployment's graphical session (see `droidc session`)
@@ -234,6 +268,7 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
             platform,
             links,
             verify_only,
+            apply_ownership,
         } => {
             let mut o = SwitchOpts::new(reference);
             o.insecure = *insecure_allow_unsigned;
@@ -243,48 +278,82 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
             o.http = http;
             o.l2s_prefix = l2s;
             o.verify_only = *verify_only;
+            o.apply_ownership = *apply_ownership;
             Ok(("switch", deploy::switch(&root, em, &o)?))
         }
         Cmd::Upgrade => Ok(("upgrade", deploy::upgrade(&root, em, http, &l2s)?)),
         Cmd::Rollback => Ok(("rollback", deploy::rollback(&root, em)?)),
         Cmd::Status => Ok(("status", status::status(&root)?)),
         Cmd::Gc => Ok(("gc", deploy::gc(&root, em)?)),
-        Cmd::ShellSpec => Ok(("shell-spec", status::shell_spec(&root)?)),
+        Cmd::ShellSpec { launcher } => {
+            let l = status::Launcher::parse(launcher)
+                .ok_or_else(|| Error::invalid(format!("unknown --launcher '{launcher}'")))?;
+            Ok((
+                "shell-spec",
+                serde_json::to_value(status::shell_spec(&root, l)?)?,
+            ))
+        }
         Cmd::Platform => Ok(("platform", serde_json::to_value(Platform::detect()?)?)),
         Cmd::Session { action } => Ok(("session", session_cmd(&root, action)?)),
-        Cmd::Supervise { .. } | Cmd::Bridge { .. } | Cmd::Login1 | Cmd::Log { .. } => {
-            unreachable!()
-        }
+        Cmd::FixOwnership { undo: false } => Ok(("fix-ownership", ownership::fix(&root, &l2s)?)),
+        Cmd::FixOwnership { undo: true } => Ok(("fix-ownership", ownership::undo(&root)?)),
+        Cmd::Supervise { .. }
+        | Cmd::Bridge { .. }
+        | Cmd::Login1
+        | Cmd::Log { .. }
+        | Cmd::Enter { .. }
+        | Cmd::EnterInit { .. } => unreachable!(),
     }
 }
 
 fn main() {
     let cli = Cli::parse();
-    if let Cmd::Supervise {
-        session,
-        width,
-        height,
-        scale,
-        systemd,
-        cmd,
-    } = &cli.cmd
-    {
-        let opts = supervise::Opts {
-            session: session.then(|| supervise::SessionOpts {
-                root: cli.root.clone().unwrap_or_else(default_root),
-                params: session::Params {
-                    width: *width,
-                    height: *height,
-                    scale: *scale,
-                    ..Default::default()
-                },
-            }),
-            systemd: *systemd,
-        };
-        match supervise::supervise_with(cmd, &opts) {
+    // These own stdio (it belongs to the command they run): no NDJSON, errors on stderr, exit 127.
+    let direct = match &cli.cmd {
+        Cmd::Supervise {
+            session,
+            width,
+            height,
+            scale,
+            systemd,
+            cmd,
+        } => {
+            let opts = supervise::Opts {
+                session: session.then(|| supervise::SessionOpts {
+                    root: cli.root.clone().unwrap_or_else(default_root),
+                    params: session::Params {
+                        width: *width,
+                        height: *height,
+                        scale: *scale,
+                        ..Default::default()
+                    },
+                }),
+                systemd: *systemd,
+            };
+            Some(("supervise", supervise::supervise_with(cmd, &opts)))
+        }
+        Cmd::Enter {
+            binds,
+            env,
+            hostname,
+            cmd,
+        } => {
+            let opts = enter::EnterOpts {
+                binds: binds.clone(),
+                env: env.clone(),
+                hostname: hostname.clone(),
+            };
+            let root = cli.root.clone().unwrap_or_else(default_root);
+            Some(("enter", enter::enter(&root, &opts, cmd)))
+        }
+        Cmd::EnterInit { plan, cmd } => Some(("enter", enter::init(plan, cmd))),
+        _ => None,
+    };
+    if let Some((name, r)) = direct {
+        match r {
             Ok(code) => std::process::exit(code),
             Err(e) => {
-                eprintln!("droidc supervise: {e}");
+                eprintln!("droidc {name}: {e}");
                 std::process::exit(127);
             }
         }

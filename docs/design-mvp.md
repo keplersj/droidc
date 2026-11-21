@@ -147,12 +147,15 @@ locally → keep local; deleted locally → stays deleted. First deployment: liv
 ```
 droidc [--root DIR] [--json] [--dns IPS] <command>
   switch <ref> [--insecure-allow-unsigned] [--platform os/arch] [--links auto|hardlink|link2symlink|copy]
+         [--apply-ownership]    (root) fix-ownership the deployment it activates
   upgrade                       re-pull current ref; no-op if digest unchanged
   rollback                      swap current and previous
   status                        current, previous, staged
   gc
-  shell-spec                    how to enter the current deployment (rootfs, binds, env, cwd)
+  shell-spec [--launcher proot|chroot]  how to enter the current deployment (rootfs, binds, env, cwd)
   platform                      detected platform
+  enter [--bind H:G] [--env K=V] [--hostname N] -- <cmd...>   (as root) run cmd in the deployment
+  fix-ownership [--undo]        (as root) apply image uid/gid/mode/xattrs; --undo: back to the app uid
   supervise -- <cmd...>         (inside the guest) start session services, dbus first, then cmd
   supervise --session [--width W --height H --scale S] [-- cmd...]
                                 (inside the guest) start the graphical session, see "Graphical session"
@@ -166,7 +169,7 @@ droidc [--root DIR] [--json] [--dns IPS] <command>
 Every line is one object with an `event` field. Human text goes to stderr.
 
 ```json
-{"event":"progress","phase":"resolve|download|verify|unpack|etc-merge|deploy|gc","current":123,"total":456,"unit":"bytes|files|layers","message":"layer 3/68"}
+{"event":"progress","phase":"resolve|download|verify|unpack|etc-merge|deploy|ownership|gc","current":123,"total":456,"unit":"bytes|files|layers","message":"layer 3/68"}
 {"event":"log","level":"info|warn|error","message":"..."}
 {"event":"result","ok":true,"data":{...}}
 {"event":"result","ok":false,"error":{"kind":"network|signature|storage|not-found|invalid|locked|internal","message":"..."}}
@@ -204,14 +207,122 @@ layers) and returns `{"changed":false,"verify_only":true,"id","manifest_digest",
  "env":{"DROIDC_ROOT":"/run/droidc/root","HOME":"/root","PATH":"...","TERM":"xterm-256color","LANG":"C.UTF-8"},
  "cwd":"/root","session_label":"gnome",
  "session":{"name":"GNOME","renderer":"screencast","exec":["gnome-shell","--headless","--virtual-monitor","{width}x{height}"],
-            "services":[["pipewire"],["wireplumber"]],"configured":true,"source":"label|override"}}
+            "services":[["pipewire"],["wireplumber"]],"configured":true,"source":"label|override"},
+ "launcher":{"kind":"proot","requires_root":false,"link2symlink":true}}
 ```
 
 `session.configured` is false (and `renderer`/`exec` null) when neither labels nor an override describe
 a graphical session.
 
 Selkie adds Android binds (`/dev`, `/proc`, `/sys`, fake proc files, `/usr/bin/droidc` → the
-`libdroidc.so` path) and runs `proot`.
+`libdroidc.so` path) and runs `proot` (with `--link2symlink` when `launcher.link2symlink`).
+
+`shell-spec --launcher chroot` is for devices where Selkie has real root (Magisk, KernelSU, Shizuku
+started as root). Selkie chooses; droidc runs as the app uid and cannot tell. `launcher` becomes:
+
+```json
+{"kind":"chroot","requires_root":true,"namespaces":["mount","pid","uts","ipc","cgroup"],
+ "mounts":[{"fstype":"proc","guest":"/proc","options":"nosuid,nodev,noexec"},
+           {"fstype":"sysfs","guest":"/sys","options":"ro,nosuid,nodev,noexec"},
+           {"fstype":"cgroup2","guest":"/sys/fs/cgroup","options":"...","optional":true},
+           {"fstype":"tmpfs","guest":"/dev","options":"nosuid,mode=0755"},
+           {"bind":"/dev/null","guest":"/dev/null"}, ...zero, full, random, urandom, tty,
+           {"fstype":"devpts","guest":"/dev/pts","options":"nosuid,noexec,newinstance,ptmxmode=0666,mode=0620"},
+           {"fstype":"tmpfs","guest":"/dev/shm",...},{"fstype":"tmpfs","guest":"/run",...},{"fstype":"tmpfs","guest":"/tmp",...}],
+ "symlinks":[{"target":"pts/ptmx","guest":"/dev/ptmx"},{"target":"/proc/self/fd","guest":"/dev/fd"}, ...stdin, stdout, stderr],
+ "warnings":["..."]}
+```
+
+The launcher unshares `namespaces` (`mount` required, the rest best-effort), mounts `mounts`, creates
+`symlinks`, binds `binds` under `rootfs`, chroots and execs. `options` are fstab style: `ro`,
+`nosuid`, `nodev`, `noexec` are flags, the rest is filesystem data. `/dev` is a private tmpfs with
+only harmless host nodes, so the guest never sees Android's block devices or binder; Selkie adds GPU,
+input, fuse and tun nodes with `--bind`. cgroup2 is mounted only inside a cgroup namespace (the guest
+sees its own subtree, never Android's whole tree), otherwise skipped. A link2symlink deployment gets
+one more bind, the canonical `<root>` at the same path in the guest, so its absolute chains resolve
+without proot. `warnings` flags a link2symlink deployment and a rootfs whose `/usr` is not owned by
+uid 0 (ownership from `metadata.jsonl.zst` not applied), in which case setuid binaries and ownership
+checks fail.
+
+## Running droidc as root
+
+Selkie creates `<root>` as the app before running anything through su. Every command that takes the
+root lock, when run as root, hands back on exit (before releasing the lock) every entry under
+`<root>` that belongs to uid 0 to the owner of `<root>`: the lock, `policy.json`, blobs, staging,
+records, and deployments a root `switch` made without `--apply-ownership`, so non-root commands and
+proot keep working. Left alone: the `rootfs` of image-owned deployments, and `var`/`home` while any
+deployment is image-owned. Nothing happens when `<root>` itself belongs to root. Symlinks are never
+followed. Each entry handed back also gets `<root>`'s SELinux label (`security.selinux`), as do the
+entries `fix-ownership --undo` walks and the mount points `enter` creates (from their parent): on
+Android a file a su process creates in app storage carries that process's MLS level instead of the
+app's categories, and the app could read but not write, rename or delete it.
+
+## `enter` (root launcher)
+
+`droidc enter -- cmd...` is the `chroot` launcher above, done by droidc so Selkie only runs
+`su -c '<libdroidc.so> --root <root> enter --bind <libdroidc-guest.so>:/usr/bin/droidc -- droidc supervise -- bash -l'`.
+Not NDJSON: stdio belongs to the command; droidc's own errors go to stderr with exit 127, otherwise
+the exit status is the command's (128+signal if it was killed).
+
+1. Refuse unless euid is 0. Print the spec's `warnings` to stderr.
+2. Canonicalize `rootfs` (pins `deployments/<id>` against a concurrent switch), add `--bind`/`--env`.
+3. `unshare` the mount namespace (required), then pid, uts, ipc and cgroup one at a time, warning
+   about each the kernel lacks (Android configs often have no SysV IPC). `--hostname` is dropped
+   without a uts namespace (it would rename Android). Make `/` recursively private (nothing reaches
+   Android's namespace), re-exec itself as the hidden `__enter-init <plan-json> -- cmd`, and wait.
+4. `enter` first resets SIGTERM and SIGHUP to their default action (an inherited "ignore" from su
+   or a wrapper would survive exec and keep the guest alive when Selkie stops a session). Init with
+   a pid namespace: PID 1 with `PR_SET_PDEATHSIG(SIGKILL)`; when it exits or dies with `enter`, the
+   kernel kills the whole namespace. Without one (the Android emulator's kernel has no pid or ipc
+   namespace): a `PR_SET_CHILD_SUBREAPER` that reaps with a 50 ms `WNOHANG` poll and also watches its
+   parent; when cmd exits or `enter` goes away (SIGTERM, SIGHUP, even SIGKILL) it SIGKILLs every
+   remaining descendant and exits.
+5. Mounts, symlinks, binds; hostname; `chroot`, `chdir(cwd)` (else `/`); run cmd with exactly the
+   spec env; reap all children until cmd exits.
+
+Every guest path is resolved with `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)` against the
+rootfs and mounted through `/proc/self/fd/N`, so image symlinks (bootc's `/home -> var/home`, or a
+hostile absolute or `..` one) can never put a mount on the host. Missing mount points are created
+inside the rootfs (directories, or an empty file when the source is a file) and chowned to their
+parent directory's owner, so the app-uid `gc` can still delete the deployment; a dangling symlink is
+followed inside the rootfs and its target created. A failing `optional` mount is a warning.
+
+`DROIDC_ENTER_NO_NS=pid,ipc,...` skips those namespaces as if the kernel lacked them (testing).
+
+Unverified on Android: the link2symlink self-bind assumes `<root>` canonicalizes to the same path in
+su's mount namespace as in the app's when the chains were written (Magisk's namespace modes and
+Android's app data isolation may differ). If not, the record needs the canonical root used at unpack.
+
+## `fix-ownership` (root)
+
+Applies `metadata.jsonl.zst` to the current deployment: uid/gid, then the full mode (setuid,
+setgid, sticky; chown clears them), then xattrs (chown clears `security.capability`;
+`security.selinux` is never applied). Rows map to trees: `usr/etc/X` also to the live `etc/X`;
+`var/X` to `<root>/var/X` (only the deployment that seeded `<root>/var` has `var/` rows, unpack drops
+them for the others). Every row is resolved with `openat2(O_PATH|O_NOFOLLOW, RESOLVE_IN_ROOT)` and
+must match its recorded type, so neither the image nor a guest that ran as root (swapping a
+directory for a symlink to a host path) can make it touch a host file. The exception: an `f`/`h`
+row that link2symlink turned into a chain (an absolute link to an l2s-named intermediate) is followed
+and accepted only if it ends at an l2s-named regular file inside the canonical root. Both layouts
+(`.l2s.`, `.proot.l2s.`) are recognised whatever `DROIDC_L2S_PREFIX` says, because `sudo`/`su`
+usually drop it. Any other symlink on an `h` row is a hard link to a symlink (ostree-built images
+have thousands) and is left alone. `f`/`d`/`l` rows are applied first; an `h` row
+only for an inode no `f` row reached (hard-link headers carry their own, often wrong, mode). The
+record gets `"ownership":"image"`; result `{id, ownership, applied, via_l2s, xattr_errors,
+skipped:{reason: n}}` (the `l2s chain does not resolve` count shows a canonical root mismatch).
+
+From then on the root is root-only: every mutating command (`switch`, `upgrade`, `rollback`, `gc`)
+run without root refuses up front with kind `invalid` (etcmerge cannot read a `0000` /etc/shadow, gc
+could not delete root-owned trees), and `shell-spec --launcher chroot` drops its ownership warning.
+`switch --apply-ownership` (root; refused before any download otherwise) does the same for the
+deployment it activates, right after activation (`<root>/var` is seeded by then) and before gc;
+when the image is already current it applies it if not yet applied, so it is idempotent. Its result
+gets `"ownership": <report>|null` (null: not requested or already applied). `upgrade` keeps the
+current deployment's mode: image-owned in, image-owned out. A root `switch` without the flag while
+other deployments are image-owned warns. `--undo` lchowns everything under
+the root (all deployments, `var`, `home`, blobs) to the owner of the root directory, sets directories
+`| 0o700` and files `| 0o600` without setuid/setgid/sticky, drops `security.capability`, never
+follows symlinks, and clears `ownership` in every record: proot and non-root commands work again.
 
 ## Session label
 
