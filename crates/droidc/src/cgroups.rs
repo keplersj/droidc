@@ -1,4 +1,4 @@
-//! Process accounting for the fake cgroup tree (`shim/cgshim.c`).
+//! Process accounting for the fake cgroup tree (`crates/cgshim`).
 //!
 //! `systemd --user` runs on a plain directory that pretends to be cgroup2. The kernel would keep
 //! `cgroup.procs` and `cgroup.events` current; here nothing does, so a transient scope or a
