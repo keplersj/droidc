@@ -34,7 +34,7 @@
       "groupName": "github actions"
     },
     {
-      "description": "Group the RustCrypto/sigstore-style crates that must move together is left to Renovate; group other Rust minor/patch bumps",
+      "description": "Group Rust crate minor/patch bumps into one PR",
       "matchManagers": ["cargo"],
       "matchUpdateTypes": ["minor", "patch"],
       "groupName": "rust crates (non-major)"
