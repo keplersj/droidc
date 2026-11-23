@@ -507,8 +507,9 @@ it across the proot boundary:
   the container's own proot argv plus `-0`). It listens on the abstract socket `NAME`, checks each
   caller's uid (any app can reach an abstract socket), and for each request starts the launcher — a
   second proot in the same container, as fake root — running the requested command.
-- In the guest, `/usr/bin/sudo`, `/usr/bin/su` and `/usr/bin/pkexec` are bound to the guest droidc
-  (`shell-spec` binds them; dispatched by `argv[0]`). The shim parses the usual options, connects to
+- In the guest, `/usr/bin/sudo`, `/usr/bin/su` and `/usr/bin/pkexec` are the guest droidc,
+  dispatched by `argv[0]`: `shell-spec` lists them under `shims` (proot only), and the launcher binds
+  its guest droidc over each, as it binds `/usr/bin/droidc`. The shim parses the usual options, connects to
   `$DROIDC_SPAWNER`, passes its own stdin/stdout/stderr over the socket (`SCM_RIGHTS`) so the root
   command shares the terminal, and exits with its status. Terminal signals are forwarded.
 - The request carries only a command, a working directory and an environment (the caller's, minus

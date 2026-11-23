@@ -1380,16 +1380,12 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with("/root/current/rootfs"));
-        // proot binds the guest droidc over sudo/su/pkexec (the spawner shims)
-        let guests: Vec<&str> = sp["binds"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|b| b["guest"].as_str().unwrap())
-            .collect();
-        for shim in ["/usr/bin/sudo", "/usr/bin/su", "/usr/bin/pkexec"] {
-            assert!(guests.contains(&shim), "{shim} bound");
-        }
+        // under proot the launcher binds the guest droidc over sudo/su/pkexec (the spawner shims)
+        assert_eq!(
+            sp["shims"],
+            serde_json::json!(["/usr/bin/sudo", "/usr/bin/su", "/usr/bin/pkexec"])
+        );
+        assert_eq!(sp["binds"].as_array().unwrap().len(), 3);
         // reading through a different absolute path (as the guest does) works
         let alias = _d.path().join("alias");
         std::os::unix::fs::symlink(&root.path, &alias).unwrap();
@@ -1403,14 +1399,9 @@ mod tests {
         do_install(&root, &ld, "aaaa", image("A", "x"), LinkKind::Link2Symlink);
         let sp = serde_json::to_value(crate::status::shell_spec(&root, Launcher::Chroot).unwrap())
             .unwrap();
-        let guests: Vec<&str> = sp["binds"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|b| b["guest"].as_str().unwrap())
-            .collect();
-        assert!(
-            !guests.contains(&"/usr/bin/sudo"),
+        assert_eq!(
+            sp["shims"],
+            serde_json::json!([]),
             "chroot keeps the real setuid sudo"
         );
         let l = &sp["launcher"];
