@@ -24,6 +24,40 @@ pub fn rmtree(p: &Path) -> Result<()> {
     }
 }
 
+/// Clear every write bit in a tree without following symlinks, keeping read and search bits, and
+/// leaving the subtrees in `skip` alone. Best effort: entries that cannot be changed (owned by
+/// someone else) are counted, not fatal. Returns (changed, failed).
+pub fn clear_write_bits(p: &Path, skip: &[&Path]) -> (u64, u64) {
+    fn walk(p: &Path, skip: &[&Path], n: &mut (u64, u64)) {
+        if skip.contains(&p) {
+            return;
+        }
+        let Ok(md) = fs::symlink_metadata(p) else {
+            return;
+        };
+        if md.file_type().is_symlink() {
+            return;
+        }
+        let mode = md.mode() & 0o7777;
+        if mode & 0o222 != 0 {
+            match fs::set_permissions(p, fs::Permissions::from_mode(mode & !0o222)) {
+                Ok(()) => n.0 += 1,
+                Err(_) => n.1 += 1,
+            }
+        }
+        if md.is_dir() {
+            if let Ok(rd) = fs::read_dir(p) {
+                for e in rd.flatten() {
+                    walk(&e.path(), skip, n);
+                }
+            }
+        }
+    }
+    let mut n = (0, 0);
+    walk(p, skip, &mut n);
+    n
+}
+
 /// du-like: allocated bytes of a tree (hard-linked inodes counted once, symlinks not followed).
 pub fn disk_usage(p: &Path) -> u64 {
     fn walk(p: &Path, seen: &mut HashSet<(u64, u64)>, total: &mut u64) {
@@ -114,6 +148,40 @@ pub fn inherit_selinux_label(p: &Path, label: Option<&[u8]>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mode_of(p: &Path) -> u32 {
+        fs::symlink_metadata(p).unwrap().mode() & 0o7777
+    }
+
+    #[test]
+    fn clear_write_bits_keeps_read_and_search() {
+        let d = tempfile::tempdir().unwrap();
+        let usr = d.path().join("usr");
+        fs::create_dir_all(usr.join("bin")).unwrap();
+        fs::write(usr.join("bin/tool"), b"x").unwrap();
+        fs::set_permissions(usr.join("bin/tool"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(usr.join("data"), b"x").unwrap();
+        fs::set_permissions(usr.join("data"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(usr.join("bin"), fs::Permissions::from_mode(0o1777)).unwrap();
+        std::os::unix::fs::symlink("/nonexistent", usr.join("link")).unwrap();
+        fs::create_dir(usr.join("etc")).unwrap();
+        fs::write(usr.join("etc/conf"), b"x").unwrap();
+        let (changed, failed) = clear_write_bits(&usr, &[&usr.join("etc")]);
+        assert_eq!((changed, failed), (4, 0));
+        assert_eq!(mode_of(&usr.join("etc/conf")) & 0o200, 0o200, "skipped");
+        let mode = |p: &str| fs::symlink_metadata(usr.join(p)).unwrap().mode() & 0o7777;
+        assert_eq!(mode("bin"), 0o1555);
+        assert_eq!(mode("bin/tool"), 0o555);
+        assert_eq!(mode("data"), 0o444);
+        assert_eq!(
+            clear_write_bits(&usr, &[&usr.join("etc")]),
+            (0, 0),
+            "idempotent"
+        );
+        // a sealed tree still goes away
+        rmtree(&usr).unwrap();
+        assert!(!usr.exists());
+    }
 
     /// Needs SELinux (skips without it, e.g. on the CI runners): relabels a file to its
     /// directory's label, never through a symlink.

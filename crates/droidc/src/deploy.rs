@@ -262,9 +262,25 @@ fn seed_var(root: &Root, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// `/usr` is read-only on a bootc host. Here only the write bits can say so: clearing them makes
+/// `pip install`, `make install` and the like fail with EACCES instead of silently changing a
+/// verified deployment (the true modes are in `metadata.jsonl.zst`). Not a security boundary: the
+/// app uid owns the tree. `rmtree` puts the bits back when gc deletes it. Done on every switch, so a
+/// deployment unpacked before this is sealed the next time it becomes current; image-owned trees
+/// (fix-ownership, root-owned) are skipped by the kernel and need nothing. `/usr/etc` is left as
+/// unpack made it: the next switch's /etc merge compares its modes with the live /etc.
+fn seal_usr(root: &Root, id: &str) {
+    let usr = root.deployment(id).join("rootfs/usr");
+    let (_, failed) = fsutil::clear_write_bits(&usr, &[&usr.join("etc")]);
+    if failed > 0 && !rustix::process::getuid().is_root() {
+        eprintln!("warn: {failed} entries under /usr of {id} stay writable");
+    }
+}
+
 /// Commit: seed var, `previous` := old current, `current` := new, drop PENDING.
 fn finish_switch(root: &Root, p: &Pending) -> Result<()> {
     seed_var(root, &p.id)?;
+    seal_usr(root, &p.id);
     if let Some(prev) = &p.prev {
         if prev != &p.id && root.deployment(prev).join("deployment.json").is_file() {
             root.set_link("previous", prev)?;
@@ -1530,7 +1546,13 @@ mod tests {
             let m = fs::metadata(&p).unwrap();
             assert_eq!(m.uid(), 1000, "{}", p.display());
             assert_eq!(m.mode() & 0o7000, 0, "{}", p.display());
-            assert_eq!(m.mode() & 0o600, 0o600, "{}", p.display());
+            // /usr is sealed again: readable, not writable.
+            let want = if p.starts_with(rf.join("usr")) {
+                0o400
+            } else {
+                0o600
+            };
+            assert_eq!(m.mode() & 0o600, want, "{}", p.display());
         }
         assert!(root.read_record("aaaa").unwrap().ownership.is_none());
         let host = fs::metadata(&sentinel).unwrap();
