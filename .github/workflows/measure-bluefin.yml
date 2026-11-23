@@ -35,8 +35,8 @@ jobs:
     env:
       IMAGE: ${{ inputs.ref || 'ghcr.io/projectbluefin/bluefin-lts:stable' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: aarch64-unknown-linux-musl,aarch64-unknown-linux-gnu
       - run: pip install --break-system-packages ziglang==0.13.0 cargo-zigbuild
@@ -155,21 +155,21 @@ jobs:
             /usr/bin/droidc supervise --systemd=on -- sh /tmp/probe.sh > systemd-proot.log 2>&1
           echo "exit=$?"
           { echo "### systemd --user on the cgroup shim (proot)"; echo '```'; cat systemd-proot.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: systemd-user
           path: |
             systemd-bwrap.log
             systemd-proot.log
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: gnome-frame
           path: |
             gnome.png
             session.log
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: inventory
