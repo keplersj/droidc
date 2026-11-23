@@ -20,4 +20,5 @@ pub mod session;
 pub mod status;
 pub mod supervise;
 pub mod unpack;
+pub mod usersvc;
 pub mod verify_glue;

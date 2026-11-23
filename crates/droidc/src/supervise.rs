@@ -1,7 +1,8 @@
 //! `droidc supervise [--session] -- cmd...`: the in-guest session supervisor (no systemd).
 //!
-//! Makes sure `XDG_RUNTIME_DIR` exists (0700), starts a D-Bus session bus and exports
-//! `DBUS_SESSION_BUS_ADDRESS`, runs `cmd` as a child and reaps every child (including orphans
+//! Makes sure `XDG_RUNTIME_DIR` exists (0700), joins the container's session bus (kept by
+//! `droidc user-services`, see `usersvc.rs`) and exports `DBUS_SESSION_BUS_ADDRESS`, runs `cmd` as a
+//! child and reaps every child (including orphans
 //! re-parented to us) until it exits, then exits with its status. Under proot the guest has no PID 1,
 //! so orphans only come to us because we mark ourselves a child subreaper first.
 //!
@@ -28,7 +29,7 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-fn runtime_dir() -> Result<PathBuf> {
+pub(crate) fn runtime_dir() -> Result<PathBuf> {
     let dir = match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
         Some(d) => PathBuf::from(d),
         None => {
@@ -640,7 +641,7 @@ fn start_system_bus() -> Option<Child> {
 
 /// Orphaned descendants (double-forked daemons) are re-parented to the nearest subreaper, else to
 /// the host's init, where we would never reap them or see them exit. Best effort.
-fn become_subreaper() {
+pub(crate) fn become_subreaper() {
     if let Err(e) = rustix::process::set_child_subreaper(Some(rustix::process::getpid())) {
         eprintln!("warn: could not become a child subreaper: {e}");
     }
@@ -681,6 +682,192 @@ fn start_system_services() -> Vec<Child> {
     out
 }
 
+/// A container's user services, run by `droidc user-services` (see `usersvc.rs`): the session bus, or the
+/// image's `systemd --user` and the system bus and logind stand-in its units expect.
+#[derive(Debug)]
+pub(crate) struct UserServices {
+    children: Vec<Child>,
+    /// Index in `children` of the bus's owner (`dbus-daemon` or `systemd --user`), started again if it goes.
+    owner: Option<usize>,
+    shim: Option<PathBuf>,
+    pub systemd: bool,
+    pub bus: String,
+    pub system_bus: Option<String>,
+}
+
+impl UserServices {
+    /// Forget a child that was reaped (so `stop` cannot hit a reused pid). True if it owned the bus.
+    pub fn reaped(&mut self, pid: u32) -> bool {
+        let Some(i) = self.children.iter().position(|c| c.id() == pid) else {
+            return false;
+        };
+        // Already reaped by the keeper's wait; nothing left to wait for.
+        #[allow(clippy::zombie_processes)]
+        drop(self.children.remove(i));
+        match self.owner {
+            Some(o) if o == i => {
+                self.owner = None;
+                true
+            }
+            Some(o) if o > i => {
+                self.owner = Some(o - 1);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Start the bus's owner again, on the same socket.
+    pub fn restart_owner(&mut self, dir: &std::path::Path) -> Result<()> {
+        let bus = dir.join("bus");
+        retire_stale_socket(&bus, Duration::from_secs(1));
+        let child = match (&self.shim, self.systemd) {
+            (Some(shim), true) => {
+                clear_stale_manager_state(dir);
+                let c = start_systemd_user_with_shim(std::path::Path::new(SYSTEMD), shim, dir, 4)?;
+                if !wait_for_socket(&bus, Duration::from_secs(30)) {
+                    eprintln!("warn: systemd --user did not open {} in 30s", bus.display());
+                }
+                c
+            }
+            _ => start_session_bus(dir)
+                .ok_or_else(|| Error::internal("could not start the session bus"))?,
+        };
+        self.children.push(child);
+        self.owner = Some(self.children.len() - 1);
+        Ok(())
+    }
+
+    pub fn stop(&mut self) {
+        let pids: Vec<u32> = self.children.iter().map(Child::id).collect();
+        stop_all(&pids, Duration::from_secs(3));
+        self.children.clear();
+        self.owner = None;
+    }
+}
+
+/// Starts a container's user services in the calling process (the keeper). With `spec` (the image's
+/// graphical session), the user manager's units for the session's own services are masked up front.
+pub(crate) fn start_user_services(
+    dir: &std::path::Path,
+    mode: SystemdMode,
+    spec: Option<&SessionSpec>,
+) -> Result<UserServices> {
+    if let Err(e) = ensure_machine_id(std::path::Path::new(MACHINE_ID)) {
+        eprintln!("warn: could not initialise {MACHINE_ID}: {e}");
+    }
+    let shim = resolve_systemd(
+        mode,
+        std::path::Path::new(SYSTEMD),
+        &std::env::var_os("DROIDC_CGSHIM")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_SHIM)),
+    )?;
+    // Before the buses start: activated services inherit the bus's environment.
+    if spec.is_some() || shim.is_some() {
+        std::env::set_var("XDG_SESSION_ID", "1");
+        std::env::set_var("XDG_SEAT", "seat0");
+    }
+    // Ours alone: an inherited address would be another bus, and the keeper is the bus's owner.
+    std::env::remove_var("DBUS_SESSION_BUS_ADDRESS");
+    let mut svc = UserServices {
+        children: Vec::new(),
+        owner: None,
+        shim: shim.clone(),
+        systemd: false,
+        bus: String::new(),
+        system_bus: None,
+    };
+    if shim.is_some() {
+        // What the user manager's units expect on the system bus: a bus, and logind answering on it
+        // (`systemd --user` itself logs "Failed to connect to system bus" without one).
+        svc.children.extend(start_system_services());
+        svc.system_bus = std::env::var("DBUS_SYSTEM_BUS_ADDRESS").ok();
+    }
+    if let Some(shim) = &shim {
+        crate::journal::start(true);
+        explain_shim_access(shim);
+        probe_preload(shim, "true", &[], 2);
+        probe_preload(shim, SYSTEMD, &["--version"], 3);
+        // An earlier keeper (or an older droidc's supervisor) may have left its bus and generated units.
+        if !retire_stale_socket(&dir.join("bus"), Duration::from_secs(5)) {
+            eprintln!(
+                "warn: something still listens on {}",
+                dir.join("bus").display()
+            );
+        }
+        clear_stale_manager_state(dir);
+        let started = prepare_systemd(
+            std::path::Path::new("/run"),
+            std::path::Path::new(CGROUP_ROOT),
+        )
+        .and_then(|fake| {
+            if fake {
+                // Before the manager starts: it consults the tree from its first unit on.
+                let me = std::process::id() as i32;
+                std::thread::spawn(move || {
+                    crate::cgroups::Cgroups::new(
+                        CGROUP_ROOT,
+                        crate::cgroups::Scope::Descendants(me),
+                    )
+                    .run(Duration::from_millis(200))
+                });
+            }
+            if !prefer_dbus_daemon(dir, std::path::Path::new(USER_UNITS)) {
+                eprintln!("warn: no dbus-daemon unit; the image's own bus unit is used");
+            }
+            if let Some(spec) = spec {
+                mask_units(dir, &units_replaced_by_services(&spec.services));
+            }
+            if !write_graphical_target(dir) {
+                eprintln!("warn: could not write {GRAPHICAL_TARGET}");
+            }
+            start_systemd_user_with_shim(std::path::Path::new(SYSTEMD), shim, dir, 4)
+        });
+        match started {
+            Ok(child) => {
+                svc.children.push(child);
+                svc.owner = Some(svc.children.len() - 1);
+                svc.systemd = true;
+                // The image's `dbus.socket` user unit listens here; real systemd activates the bus.
+                let bus = dir.join("bus");
+                if !wait_for_socket(&bus, Duration::from_secs(30)) {
+                    eprintln!("warn: systemd --user did not open {} in 30s", bus.display());
+                }
+                svc.bus = format!("unix:path={}", bus.display());
+                std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &svc.bus);
+            }
+            Err(e) if mode == SystemdMode::On => {
+                svc.stop();
+                return Err(e);
+            }
+            Err(e) => eprintln!("warn: systemd --user not started, using dbus-daemon: {e}"),
+        }
+    }
+    if !svc.systemd {
+        if let Some(c) = start_session_bus(dir) {
+            svc.children.push(c);
+            svc.owner = Some(svc.children.len() - 1);
+            // Without dbus-daemon's guid: a bus started again after a crash has a new one, and the
+            // address the supervisors hand out must still match it.
+            std::env::set_var(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", dir.join("bus").display()),
+            );
+        }
+        match std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+            Ok(a) => svc.bus = a,
+            Err(_) => {
+                svc.stop();
+                return Err(Error::not_found(
+                    "no session bus: the image has neither dbus-daemon nor dbus-broker-launch",
+                ));
+            }
+        }
+    }
+    Ok(svc)
+}
+
 pub fn supervise(cmd: &[String]) -> Result<i32> {
     supervise_with(cmd, &Opts::default())
 }
@@ -701,22 +888,6 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
     become_subreaper();
     let dir = runtime_dir()?;
     std::env::set_var("XDG_RUNTIME_DIR", &dir);
-    if let Err(e) = ensure_machine_id(std::path::Path::new(MACHINE_ID)) {
-        eprintln!("warn: could not initialise {MACHINE_ID}: {e}");
-    }
-    let shim = resolve_systemd(
-        opts.systemd,
-        std::path::Path::new(SYSTEMD),
-        &std::env::var_os("DROIDC_CGSHIM")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_SHIM)),
-    )?;
-    // Before the buses start: activated services inherit the bus's environment.
-    if spec.is_some() || shim.is_some() {
-        // The one session/seat the login1 stand-in serves; mutter and libsystemd look them up by id.
-        std::env::set_var("XDG_SESSION_ID", "1");
-        std::env::set_var("XDG_SEAT", "seat0");
-    }
     if let Some(spec) = &spec {
         std::env::set_var("XDG_SESSION_TYPE", "wayland");
         if let Some(n) = &spec.name {
@@ -724,77 +895,25 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
             std::env::set_var("XDG_SESSION_DESKTOP", n.to_lowercase());
         }
     }
-    // Long-running helpers (buses, session services), stopped when the session ends.
+    // The container's bus (or user manager), shared with its other supervisors and kept by
+    // `droidc user-services` rather than by us: a terminal's bus no longer dies with the desktop.
+    // The command runs even without a bus, unless systemd was demanded.
+    let lease = match crate::usersvc::attach(&dir, opts.systemd) {
+        Ok(l) => l,
+        Err(e) if opts.systemd == SystemdMode::On => return Err(e),
+        Err(e) => {
+            eprintln!("warn: no session bus: {e}");
+            None
+        }
+    };
+    let user_manager = lease.as_ref().is_some_and(|l| l.state.systemd);
+    if spec.is_some() || user_manager {
+        // The one session/seat the login1 stand-in serves; mutter and libsystemd look them up by id.
+        std::env::set_var("XDG_SESSION_ID", "1");
+        std::env::set_var("XDG_SEAT", "seat0");
+    }
+    // Long-running helpers (session services), stopped when the session ends.
     let mut background: Vec<Child> = Vec::new();
-    if shim.is_some() {
-        // What the user manager's units expect on the system bus: a bus, and logind answering on it
-        // (`systemd --user` itself logs "Failed to connect to system bus" without one).
-        background.extend(start_system_services());
-    }
-    let mut user_manager = false;
-    if let Some(shim) = &shim {
-        crate::journal::start(true);
-        // A desktop closed and reopened leaves the previous session's bus and generated units behind.
-        explain_shim_access(shim);
-        probe_preload(shim, "true", &[], 2);
-        probe_preload(shim, SYSTEMD, &["--version"], 3);
-        if !retire_stale_socket(&dir.join("bus"), Duration::from_secs(5)) {
-            eprintln!(
-                "warn: something still listens on {}",
-                dir.join("bus").display()
-            );
-        }
-        clear_stale_manager_state(&dir);
-        let started = prepare_systemd(
-            std::path::Path::new("/run"),
-            std::path::Path::new(CGROUP_ROOT),
-        )
-        .and_then(|fake| {
-            if fake {
-                // Before the manager starts: it consults the tree from its first unit on.
-                let me = std::process::id() as i32;
-                std::thread::spawn(move || {
-                    crate::cgroups::Cgroups::new(
-                        CGROUP_ROOT,
-                        crate::cgroups::Scope::Descendants(me),
-                    )
-                    .run(Duration::from_millis(200))
-                });
-            }
-            if !prefer_dbus_daemon(&dir, std::path::Path::new(USER_UNITS)) {
-                eprintln!("warn: no dbus-daemon unit; the image's own bus unit is used");
-            }
-            if let Some(spec) = &spec {
-                mask_units(&dir, &units_replaced_by_services(&spec.services));
-            }
-            if !write_graphical_target(&dir) {
-                eprintln!("warn: could not write {GRAPHICAL_TARGET}");
-            }
-            start_systemd_user_with_shim(std::path::Path::new(SYSTEMD), shim, &dir, 4)
-        });
-        match started {
-            Ok(child) => {
-                background.push(child);
-                user_manager = true;
-                // The image's `dbus.socket` user unit listens here; real systemd activates the bus.
-                let bus = dir.join("bus");
-                if !wait_for_socket(&bus, Duration::from_secs(30)) {
-                    eprintln!("warn: systemd --user did not open {} in 30s", bus.display());
-                }
-                if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
-                    std::env::set_var(
-                        "DBUS_SESSION_BUS_ADDRESS",
-                        format!("unix:path={}", bus.display()),
-                    );
-                }
-            }
-            Err(e) if opts.systemd == SystemdMode::On => return Err(e),
-            Err(e) => eprintln!("warn: systemd --user not started, using dbus-daemon: {e}"),
-        }
-    }
-    if !user_manager && std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
-        background.extend(start_session_bus(&dir));
-    }
     // The first of these to exit ends the supervisor; the first one's status wins ties.
     let critical = match (&spec, &opts.session) {
         (Some(spec), Some(so)) => {
@@ -806,6 +925,10 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
     let mut all: Vec<u32> = critical.iter().map(Child::id).collect();
     all.extend(background.iter().map(Child::id));
     stop_all(&all, Duration::from_secs(3));
+    if user_manager && spec.is_some() {
+        deactivate_graphical_session();
+    }
+    drop(lease);
     Ok(code)
 }
 
@@ -919,7 +1042,18 @@ fn announce_session_display(dir: &std::path::Path, host_display: &str, user_mana
                 .into_iter()
                 .find(|n| *n != host && !existing.contains(n))
             {
-                let env = std::collections::HashMap::from([("WAYLAND_DISPLAY", name.as_str())]);
+                // The bus belongs to the container, not to this session: tell it what a session-started
+                // bus would have inherited (xdg-desktop-portal picks its backend by the desktop's name).
+                let mut env = std::collections::HashMap::from([("WAYLAND_DISPLAY", name.clone())]);
+                for k in [
+                    "XDG_CURRENT_DESKTOP",
+                    "XDG_SESSION_DESKTOP",
+                    "XDG_SESSION_TYPE",
+                ] {
+                    if let Ok(v) = std::env::var(k) {
+                        env.insert(k, v);
+                    }
+                }
                 let r = zbus::blocking::Connection::session().and_then(|c| {
                     c.call_method(
                         Some("org.freedesktop.DBus"),
@@ -978,6 +1112,34 @@ fn activate_graphical_session(display: &str) {
     match r {
         Ok(()) => eprintln!("note: started {GRAPHICAL_TARGET} with WAYLAND_DISPLAY={display}"),
         Err(e) => eprintln!("warn: starting {GRAPHICAL_TARGET}: {e}"),
+    }
+}
+
+/// The session is over but the user manager stays (terminals still use it): stop the units the session
+/// started and drop its display from the manager's environment. Best effort.
+fn deactivate_graphical_session() {
+    const DEST: Option<&str> = Some("org.freedesktop.systemd1");
+    const PATH: &str = "/org/freedesktop/systemd1";
+    const IFACE: Option<&str> = Some("org.freedesktop.systemd1.Manager");
+    let r = zbus::blocking::Connection::session().and_then(|c| {
+        c.call_method(
+            DEST,
+            PATH,
+            IFACE,
+            "StopUnit",
+            &(GRAPHICAL_TARGET, "replace"),
+        )?;
+        c.call_method(
+            DEST,
+            PATH,
+            IFACE,
+            "UnsetEnvironment",
+            &(vec!["WAYLAND_DISPLAY", "DISPLAY"],),
+        )
+        .map(|_| ())
+    });
+    if let Err(e) = r {
+        eprintln!("warn: stopping {GRAPHICAL_TARGET}: {e}");
     }
 }
 
@@ -1378,7 +1540,13 @@ mod tests {
         let run = d.path().join("run");
         fs::create_dir_all(&run).unwrap();
         std::env::set_var("XDG_RUNTIME_DIR", &run);
-        std::env::set_var("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent");
+        // A bus that answers is used as given (no user services started for it).
+        let bus = d.path().join("bus");
+        let _bus = UnixListener::bind(&bus).unwrap();
+        std::env::set_var(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", bus.display()),
+        );
         std::env::set_var("DBUS_SYSTEM_BUS_ADDRESS", "unix:path=/nonexistent");
         std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
         let o = |n: &str| d.path().join(n).display().to_string();
