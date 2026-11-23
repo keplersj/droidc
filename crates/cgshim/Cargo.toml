@@ -16,4 +16,4 @@ crate-type = ["cdylib"]
 libc = "0.2"
 
 [dev-dependencies]
-libc = "0.2"
+libc = "=0.2.191"
