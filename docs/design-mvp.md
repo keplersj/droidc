@@ -43,8 +43,34 @@ image on an x86_64 host for measurement only).
   staging/PENDING             marker JSON {op, id, started}; present only during an operation
   var/                        persistent /var for every deployment (bound to /var)
   home/                       persistent /home (bound to /home); /root is bound to home/root
-  lock                        flock(2) lock; one mutating command at a time
+  cgroup/                     cgroup stand-in for `supervise --systemd` (bound to /sys/fs/cgroup)
+  session.json                optional graphical session override (`droidc session set`)
+  lock                        flock(2) lock; one mutating command at a time, for every container
+  containers/<name>/          a named container: its own deployments/, current, previous,
+                              staging/, var/, home/, cgroup/ and session.json, as above
 ```
+
+### Containers
+
+One root holds any number of containers, picked with `--container NAME` (env `DROIDC_CONTAINER`,
+default `default`). Names are 1-63 of `a-z 0-9 - _ .`, starting with a letter or digit. The
+`default` container is the top of the root, exactly the layout above, so roots made before
+containers keep working without a migration. Every other container keeps the per-container entries
+under `containers/<name>/`.
+
+Shared by all containers: `blobs/` (an image is downloaded once, whichever container pulls it
+first), `policy.json` and `lock`. Each container has its own deployments, so two containers on one
+image each unpack it and each keep their own `/etc` merge, `/var`, `/home` and session. Sharing
+unpacked deployments between containers is a later step: it needs a read-only `/usr` and a
+per-container `/etc` first.
+
+GC is per container for deployments, but blob GC keeps every blob that any container's `current`
+or `previous` deployment needs. `container rm NAME` deletes `containers/NAME/` and then GCs the
+blobs nothing else uses; `default` can't be removed this way.
+
+`shell-spec` for a named container binds that container's `var/`, `home/` and `cgroup/`, still binds
+the whole root at `/run/droidc/root`, and sets `DROIDC_CONTAINER` beside `DROIDC_ROOT`, so `droidc`
+inside the guest (`status`, `session`, `supervise --session`) reads the same container.
 
 Crash safety: write `staging/PENDING`, unpack into `staging/<id>`, fsync, rename into
 `deployments/<id>`, then update `previous` and `current` with symlink-to-temp + `rename(2)`, then
@@ -145,7 +171,7 @@ locally → keep local; deleted locally → stays deleted. First deployment: liv
 ## CLI
 
 ```
-droidc [--root DIR] [--json] [--dns IPS] <command>
+droidc [--root DIR] [--container NAME] [--json] [--dns IPS] <command>
   switch <ref> [--insecure-allow-unsigned] [--platform os/arch] [--links auto|hardlink|link2symlink|copy]
          [--apply-ownership]    (root) fix-ownership the deployment it activates
   upgrade                       re-pull current ref; no-op if digest unchanged
@@ -162,6 +188,8 @@ droidc [--root DIR] [--json] [--dns IPS] <command>
   bridge [--width W --height H --connector C --dump-frame PNG]
                                 (inside the guest) show a headless session compositor on the host compositor
   session show|set|clear        the graphical session (override, else image labels)
+  container list                every container with its current and previous deployment
+  container rm <name>           delete a named container, then GC blobs nothing else uses
 ```
 
 ### `--json` output: newline-delimited JSON on stdout
@@ -189,7 +217,7 @@ The last line is always a `result`. Exit status is 0 iff `ok`.
  "stats":{"download_bytes":0,"files":0,"bytes_on_disk":0,"hardlinks":0,"link_strategy":"link2symlink","unpack_seconds":0.0}}
 ```
 
-`status` data: `{"root":..., "platform":{...}, "current":<record>|null, "previous":<record>|null,
+`status` data: `{"root":..., "container":"default", "platform":{...}, "current":<record>|null, "previous":<record>|null,
 "staged":<PENDING>|null}` (`staged` is non-null only while an operation runs or was interrupted).
 
 `switch`/`upgrade` result data: `{"changed":true,"id","previous","deployment":<record>,"gc":{...}}`, or
@@ -198,6 +226,8 @@ The last line is always a `result`. Exit status is 0 iff `ok`.
 layers) and returns `{"changed":false,"verify_only":true,"id","manifest_digest","signature",...}`.
 `rollback`: `{"changed":true,"current","previous"}`. `gc`: `{"deployments_removed":[...],
 "blobs_removed":n,"bytes_freed":n}`. `stats` additionally has `link_strategy_used`.
+`container list`: `{"containers":[{"name","current":{"id","image_ref"}|null,"previous":...|null}]}`
+(`default` is listed only when it has a deployment). `container rm`: `{"removed","bytes_freed","gc":{...}}`.
 
 ### `shell-spec` data
 

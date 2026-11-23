@@ -46,6 +46,8 @@ droidc --root ~/droidc --json switch ghcr.io/projectbluefin/bluefin-lts:stable [
 droidc --root ~/droidc switch quay.io/centos-bootc/centos-bootc:stream10 --insecure-allow-unsigned
 droidc switch <ref> --verify-only      # resolve + verify signature, download no layers
 droidc upgrade | rollback | status | gc | shell-spec | platform
+droidc --container dev switch <ref>    # a second container: shares downloaded images, own /var, /home, session
+droidc container list | rm <name>
 droidc supervise -- bash -l            # inside the guest
 droidc supervise --systemd=on -- bash -l   # run the image's own systemd --user (cgroup shim, see docs/systemd-on-proot.md)
 droidc supervise --session --width 1920 --height 1200   # inside the guest: the graphical session
@@ -56,7 +58,8 @@ sudo droidc --root ~/droidc fix-ownership [--undo]   # apply the image's owners/
 sudo droidc --root ~/droidc switch <ref> --apply-ownership   # same, for the deployment switch activates
 ```
 
-`--root`/`DROIDC_ROOT`, `--dns`/`DROIDC_DNS` (comma separated IPs; else `/etc/resolv.conf`, else
+`--root`/`DROIDC_ROOT`, `--container`/`DROIDC_CONTAINER` (default `default`, the top of the root;
+see docs/design-mvp.md "Containers"), `--dns`/`DROIDC_DNS` (comma separated IPs; else `/etc/resolv.conf`, else
 1.1.1.1,8.8.8.8), `--json` (NDJSON events; last line is always `result`; exit 0 iff ok).
 Other environment: `HTTPS_PROXY`/`NO_PROXY`, `DROIDC_EXTRA_CA_FILE` or `SSL_CERT_FILE` (extra PEM CAs
 on top of webpki-roots), `DROIDC_L2S_PREFIX` (`.l2s.` for Termux proot, `.proot.l2s.` for upstream

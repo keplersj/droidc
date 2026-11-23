@@ -620,8 +620,9 @@ fn wait_for_socket(socket: &std::path::Path, timeout: Duration) -> bool {
 
 #[derive(Debug)]
 pub struct SessionOpts {
-    /// droidc root (inside the guest `DROIDC_ROOT`, i.e. `/run/droidc/root`).
-    pub root: PathBuf,
+    /// droidc root and container (inside the guest `DROIDC_ROOT`, i.e. `/run/droidc/root`, and
+    /// `DROIDC_CONTAINER`).
+    pub root: crate::layout::Root,
     pub params: session::Params,
 }
 
@@ -1358,7 +1359,7 @@ mod tests {
         session::write_override(&crate::layout::Root::new(root), &spec).unwrap();
         Opts {
             session: Some(SessionOpts {
-                root: root.to_path_buf(),
+                root: crate::layout::Root::new(root),
                 params: session::Params {
                     width: 640,
                     height: 480,
@@ -1497,7 +1498,7 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let opts = Opts {
             session: Some(SessionOpts {
-                root: empty.path().to_path_buf(),
+                root: crate::layout::Root::new(empty.path()),
                 params: Default::default(),
             }),
             ..Default::default()

@@ -27,6 +27,7 @@ jobs:
           sudo "$BIN" --exact deploy::tests::fix_ownership_then_undo_as_root
           sudo "$BIN" --exact deploy::tests::apply_ownership_applies_once_as_root
           sudo "$BIN" --exact deploy::tests::root_commands_hand_back_what_they_create
+          sudo "$BIN" --exact deploy::tests::root_commands_hand_back_named_containers
 
   build:
     strategy:

@@ -205,9 +205,9 @@ fn apply(r: &Resolved, row: &Value, rep: &mut Report) -> Result<()> {
 }
 
 /// Apply the image's ownership to the current deployment.
-pub fn fix(root_path: &Path, l2s_prefix: &str) -> Result<Value> {
+pub fn fix(target: &Root, l2s_prefix: &str) -> Result<Value> {
     require_root("fix-ownership")?;
-    let (root, _lock) = open_root(root_path)?;
+    let (root, _lock) = open_root(target)?;
     let id = root
         .current_id()
         .ok_or_else(|| Error::not_found("no current deployment"))?;
@@ -282,9 +282,9 @@ pub(crate) fn apply_image(root: &Root, id: &str, l2s_prefix: &str) -> Result<Val
 
 /// Give everything under the root back to the root directory's owner (the app uid) with unpack's
 /// safe modes, so proot sessions and non-root commands work again.
-pub fn undo(root_path: &Path) -> Result<Value> {
+pub fn undo(target: &Root) -> Result<Value> {
     require_root("fix-ownership --undo")?;
-    let (root, _lock) = open_root(root_path)?;
+    let (root, _lock) = open_root(target)?;
     let md = fs::metadata(&root.path)?;
     if md.uid() == 0 {
         return Err(Error::invalid(format!(

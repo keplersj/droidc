@@ -14,6 +14,7 @@
 //! land on the host. Missing mount points are created inside the rootfs.
 
 use crate::error::{Context, Error, Result};
+use crate::layout::Root;
 use crate::status::{self, Bind, Launcher, LauncherSpec, Mount, Symlink};
 use rustix::fs::{
     chownat, fstat, mkdirat, openat, openat2, symlinkat, AtFlags, Mode, OFlags, ResolveFlags,
@@ -62,8 +63,8 @@ pub struct EnterOpts {
     pub hostname: Option<String>,
 }
 
-pub fn plan(root_path: &Path, opts: &EnterOpts) -> Result<(Plan, Vec<String>)> {
-    let spec = status::shell_spec(root_path, Launcher::Chroot)?;
+pub fn plan(root: &Root, opts: &EnterOpts) -> Result<(Plan, Vec<String>)> {
+    let spec = status::shell_spec(root, Launcher::Chroot)?;
     let LauncherSpec::Chroot {
         mounts,
         symlinks,
@@ -110,7 +111,7 @@ pub fn plan(root_path: &Path, opts: &EnterOpts) -> Result<(Plan, Vec<String>)> {
 }
 
 /// Parent side: returns the command's exit status.
-pub fn enter(root_path: &Path, opts: &EnterOpts, cmd: &[String]) -> Result<i32> {
+pub fn enter(root: &Root, opts: &EnterOpts, cmd: &[String]) -> Result<i32> {
     if cmd.is_empty() {
         return Err(Error::invalid("enter needs a command after --"));
     }
@@ -126,7 +127,7 @@ pub fn enter(root_path: &Path, opts: &EnterOpts, cmd: &[String]) -> Result<i32> 
         // SAFETY: plain signal(2) to the default action; no handler runs.
         unsafe { libc::signal(sig, libc::SIG_DFL) };
     }
-    let (mut plan, warnings) = plan(root_path, opts)?;
+    let (mut plan, warnings) = plan(root, opts)?;
     for w in &warnings {
         eprintln!("warn: {w}");
     }

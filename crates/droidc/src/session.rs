@@ -9,7 +9,7 @@ use crate::layout::Root;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub const NAME_LABEL: &str = "containers.droidc.session";
 pub const RENDERER_LABEL: &str = "containers.droidc.session.renderer";
@@ -153,7 +153,7 @@ pub fn fill(argv: &[String], p: &Params) -> Vec<String> {
 }
 
 pub fn override_path(root: &Root) -> PathBuf {
-    root.path.join("session.json")
+    root.cdir.join("session.json")
 }
 
 pub fn read_override(root: &Root) -> Result<Option<SessionSpec>> {
@@ -173,7 +173,7 @@ pub fn read_override(root: &Root) -> Result<Option<SessionSpec>> {
 pub fn write_override(root: &Root, s: &SessionSpec) -> Result<()> {
     s.validate()?;
     let p = override_path(root);
-    fs::create_dir_all(&root.path).context(root.path.display())?;
+    fs::create_dir_all(&root.cdir).context(root.cdir.display())?;
     let tmp = p.with_extension("json.tmp");
     fs::write(&tmp, serde_json::to_vec_pretty(s)?).context(tmp.display())?;
     fs::rename(&tmp, &p).context(p.display())
@@ -189,9 +189,8 @@ pub fn clear_override(root: &Root) -> Result<bool> {
 }
 
 /// The session for the current deployment: the override, else the current image's labels.
-pub fn resolve(root_path: &Path) -> Result<Option<(SessionSpec, Source)>> {
-    let root = Root::new(root_path);
-    if let Some(s) = read_override(&root)? {
+pub fn resolve(root: &Root) -> Result<Option<(SessionSpec, Source)>> {
+    if let Some(s) = read_override(root)? {
         return Ok(Some((s, Source::Override)));
     }
     let Some(id) = root.current_id() else {
@@ -320,7 +319,7 @@ mod tests {
     fn override_wins_and_clears() {
         let d = tempfile::tempdir().unwrap();
         let root = Root::new(d.path());
-        assert_eq!(resolve(d.path()).unwrap(), None);
+        assert_eq!(resolve(&Root::new(d.path())).unwrap(), None);
         let s = SessionSpec {
             name: Some("Plasma".into()),
             renderer: Renderer::Wayland,
@@ -331,10 +330,13 @@ mod tests {
             services: vec![],
         };
         write_override(&root, &s).unwrap();
-        assert_eq!(resolve(d.path()).unwrap(), Some((s, Source::Override)));
+        assert_eq!(
+            resolve(&Root::new(d.path())).unwrap(),
+            Some((s, Source::Override))
+        );
         assert!(clear_override(&root).unwrap());
         assert!(!clear_override(&root).unwrap());
-        assert_eq!(resolve(d.path()).unwrap(), None);
+        assert_eq!(resolve(&Root::new(d.path())).unwrap(), None);
         let bad = SessionSpec {
             name: None,
             renderer: Renderer::Wayland,
