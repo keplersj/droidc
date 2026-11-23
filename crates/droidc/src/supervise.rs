@@ -914,6 +914,10 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
     }
     // Long-running helpers (session services), stopped when the session ends.
     let mut background: Vec<Child> = Vec::new();
+    if spec.is_some() {
+        // Before the compositor picks its display: a dead session's leftovers would push it to the next.
+        crate::displays::sweep_and_report(&dir);
+    }
     // The first of these to exit ends the supervisor; the first one's status wins ties.
     let critical = match (&spec, &opts.session) {
         (Some(spec), Some(so)) => {
@@ -925,8 +929,11 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
     let mut all: Vec<u32> = critical.iter().map(Child::id).collect();
     all.extend(background.iter().map(Child::id));
     stop_all(&all, Duration::from_secs(3));
-    if user_manager && spec.is_some() {
-        deactivate_graphical_session();
+    if spec.is_some() {
+        if user_manager {
+            deactivate_graphical_session();
+        }
+        crate::displays::sweep_and_report(&dir);
     }
     drop(lease);
     Ok(code)
@@ -1549,6 +1556,10 @@ mod tests {
         );
         std::env::set_var("DBUS_SYSTEM_BUS_ADDRESS", "unix:path=/nonexistent");
         std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+        std::env::set_var("DROIDC_X11_TMP", d.path().join("tmp"));
+        // a dead session's socket is cleared before the compositor starts
+        let stale = run.join("wayland-1");
+        drop(UnixListener::bind(&stale).unwrap());
         let o = |n: &str| d.path().join(n).display().to_string();
         let svc = script(
             d.path(),
@@ -1592,6 +1603,7 @@ mod tests {
             "--display=wayland-0 640x480 wayland-0 wayland Test"
         );
         assert_eq!(fs::read_to_string(o("svc.out")).unwrap().trim(), "up");
+        assert!(!stale.exists(), "stale wayland-1 swept");
 
         // nested, no command: the compositor's own exit ends the session
         let quick = script(d.path(), "quick", "exit 4");
