@@ -450,8 +450,9 @@ supervisor came first, so a terminal's bus no longer dies with the desktop (#8):
 - A bus or user manager that exits is started again on the same socket (backoff from 1 s to 30 s).
   The published address has no `guid`, so it stays valid across a restart.
 - An inherited `DBUS_SESSION_BUS_ADDRESS` is used only if it answers; a dead one is dropped.
-- Under proot the keeper keeps the proot that started it running (proot waits for everything it
-  traces). A host running a proot per session should start `droidc user-services --stay` in a proot
+- Under proot the keeper is tied to the proot that started it: proot waits for everything it traces,
+  or with `--kill-on-exit` (Selkie) kills the keeper when the session that started it ends. A host
+  running a proot per session should start `droidc user-services --stay` in a proot
   of its own, stop it when the container's last session ends, and give the sessions
   `DROIDC_USER_SERVICES_WAIT` (seconds to wait for that keeper before starting one themselves).
 

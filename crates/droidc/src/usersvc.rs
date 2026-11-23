@@ -151,8 +151,8 @@ fn keeper_argv(mode: SystemdMode) -> Vec<String> {
 
 /// Starts a keeper in its own session (a terminal's hangup must not reach it), with its output in
 /// `user-services.log` rather than on our stdio, which belongs to the command and may close first.
-/// Under proot the keeper keeps the starting proot running until it stops (proot waits for every
-/// process it traces), so a host that runs several proots per container starts the keeper in one of
+/// Under proot the keeper is tied to the starting proot (which waits for every process it traces, or
+/// with `--kill-on-exit` kills them when its first one exits), so a host that runs several proots per container starts the keeper in one of
 /// its own (`droidc user-services --stay`) and sets `DROIDC_USER_SERVICES_WAIT` for its sessions.
 fn spawn_keeper(p: &Paths, mode: SystemdMode) -> Result<std::process::Child> {
     let argv = keeper_argv(mode);
