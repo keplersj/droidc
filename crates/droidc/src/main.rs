@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use droidc::deploy::{self, SwitchOpts};
 use droidc::error::{Error, Result};
 use droidc::events::Emitter;
-use droidc::layout::Root;
+use droidc::layout::{Root, DEFAULT_CONTAINER};
 use droidc::link::{LinkKind, DEFAULT_L2S_PREFIX};
 use droidc::platform::Platform;
 use droidc::registry::HttpConfig;
@@ -21,6 +21,10 @@ struct Cli {
     /// Root directory for blobs, deployments and persistent state
     #[arg(long, global = true, env = "DROIDC_ROOT")]
     root: Option<PathBuf>,
+    /// Container to act on. Containers share downloaded images; each has its own deployments,
+    /// /var, /home and session. `default` lives at the top of the root, as before containers
+    #[arg(long, global = true, env = "DROIDC_CONTAINER", default_value = DEFAULT_CONTAINER)]
+    container: String,
     /// NDJSON events on stdout (last line is always a `result`)
     #[arg(long, global = true)]
     json: bool,
@@ -155,6 +159,19 @@ enum Cmd {
         #[command(subcommand)]
         action: SessionCmd,
     },
+    /// List or remove containers (`--container` picks the one other commands act on)
+    Container {
+        #[command(subcommand)]
+        action: ContainerCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ContainerCmd {
+    /// Every container under the root, with its current and previous deployment
+    List,
+    /// Delete a container's deployments, /var, /home and session, then GC unused images
+    Rm { name: String },
 }
 
 #[derive(Subcommand)]
@@ -216,8 +233,8 @@ fn human(cmd: &str, d: &Value) {
     }
 }
 
-fn session_cmd(root: &std::path::Path, action: &SessionCmd) -> Result<Value> {
-    let r = Root::new(root);
+fn session_cmd(root: &Root, action: &SessionCmd) -> Result<Value> {
+    let r = root;
     match action {
         SessionCmd::Show => {}
         SessionCmd::Set {
@@ -241,10 +258,10 @@ fn session_cmd(root: &std::path::Path, action: &SessionCmd) -> Result<Value> {
                     None => Vec::new(),
                 },
             };
-            session::write_override(&r, &spec)?;
+            session::write_override(r, &spec)?;
         }
         SessionCmd::Clear => {
-            session::clear_override(&r)?;
+            session::clear_override(r)?;
         }
     }
     let label = r
@@ -257,8 +274,15 @@ fn session_cmd(root: &std::path::Path, action: &SessionCmd) -> Result<Value> {
     ))
 }
 
+fn target(cli: &Cli) -> Result<Root> {
+    Root::with_container(
+        cli.root.clone().unwrap_or_else(default_root),
+        &cli.container,
+    )
+}
+
 fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
-    let root = cli.root.clone().unwrap_or_else(default_root);
+    let root = target(cli)?;
     let http = HttpConfig::from_env(cli.dns.clone());
     let l2s = std::env::var("DROIDC_L2S_PREFIX").unwrap_or_else(|_| DEFAULT_L2S_PREFIX.to_string());
     match &cli.cmd {
@@ -297,6 +321,15 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
         Cmd::Session { action } => Ok(("session", session_cmd(&root, action)?)),
         Cmd::FixOwnership { undo: false } => Ok(("fix-ownership", ownership::fix(&root, &l2s)?)),
         Cmd::FixOwnership { undo: true } => Ok(("fix-ownership", ownership::undo(&root)?)),
+        Cmd::Container {
+            action: ContainerCmd::List,
+        } => Ok(("container", deploy::list_containers(&root))),
+        Cmd::Container {
+            action: ContainerCmd::Rm { name },
+        } => Ok((
+            "container",
+            deploy::remove_container(&Root::with_container(&root.path, name)?, em)?,
+        )),
         Cmd::Supervise { .. }
         | Cmd::Bridge { .. }
         | Cmd::Login1
@@ -320,7 +353,10 @@ fn main() {
         } => {
             let opts = supervise::Opts {
                 session: session.then(|| supervise::SessionOpts {
-                    root: cli.root.clone().unwrap_or_else(default_root),
+                    root: target(&cli).unwrap_or_else(|e| {
+                        eprintln!("droidc supervise: {e}");
+                        std::process::exit(127)
+                    }),
                     params: session::Params {
                         width: *width,
                         height: *height,
@@ -343,8 +379,10 @@ fn main() {
                 env: env.clone(),
                 hostname: hostname.clone(),
             };
-            let root = cli.root.clone().unwrap_or_else(default_root);
-            Some(("enter", enter::enter(&root, &opts, cmd)))
+            Some((
+                "enter",
+                target(&cli).and_then(|root| enter::enter(&root, &opts, cmd)),
+            ))
         }
         Cmd::EnterInit { plan, cmd } => Some(("enter", enter::init(plan, cmd))),
         _ => None,

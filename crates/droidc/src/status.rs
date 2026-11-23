@@ -1,5 +1,6 @@
 //! `status` and `shell-spec`. Both are read-only and work inside the guest with `DROIDC_ROOT`
-//! pointing at the bound root: they only follow the relative `current`/`previous` symlinks.
+//! pointing at the bound root and `DROIDC_CONTAINER` naming the container: they only follow the
+//! relative `current`/`previous` symlinks.
 
 use crate::error::{Context, Error, Result};
 use crate::layout::Root;
@@ -16,8 +17,7 @@ fn rec(root: &Root, id: Option<String>) -> Value {
         .unwrap_or(Value::Null)
 }
 
-pub fn status(root_path: &Path) -> Result<Value> {
-    let root = Root::new(root_path);
+pub fn status(root: &Root) -> Result<Value> {
     let platform = Platform::detect()
         .ok()
         .map(|p| serde_json::to_value(p).unwrap())
@@ -27,10 +27,11 @@ pub fn status(root_path: &Path) -> Result<Value> {
         .map(|p| serde_json::to_value(p).unwrap())
         .unwrap_or(Value::Null);
     Ok(json!({
-        "root": root_path.display().to_string(),
+        "root": root.path.display().to_string(),
+        "container": root.container,
         "platform": platform,
-        "current": rec(&root, root.current_id()),
-        "previous": rec(&root, root.previous_id()),
+        "current": rec(root, root.current_id()),
+        "previous": rec(root, root.previous_id()),
         // Non-null only while an operation is in progress or was interrupted (recovered on next mutating command).
         "staged": pending,
     }))
@@ -194,23 +195,26 @@ pub fn chroot_symlinks() -> Vec<Symlink> {
     .to_vec()
 }
 
-pub fn shell_spec(root_path: &Path, launcher: Launcher) -> Result<ShellSpec> {
-    let root = Root::new(root_path);
+pub fn shell_spec(root: &Root, launcher: Launcher) -> Result<ShellSpec> {
+    let root_path = root.path.as_path();
     let cur = root
         .current_id()
         .ok_or_else(|| Error::not_found("no current deployment"))?;
     let record = root.read_record(&cur)?;
     let abs = std::path::absolute(root_path).unwrap_or_else(|_| root_path.to_path_buf());
     let r = abs.display().to_string();
-    let rootfs = format!("{r}/current/rootfs");
+    // This container's state directory, absolute like `r`.
+    let c = abs.join(root.cdir.strip_prefix(&root.path).unwrap_or(Path::new("")));
+    let c = c.display().to_string().trim_end_matches('/').to_string();
+    let rootfs = format!("{c}/current/rootfs");
     let link2symlink = record.stats.link_strategy_used.contains("link2symlink");
     let bind = |host: String, guest: &str| Bind {
         host,
         guest: guest.into(),
     };
     let mut binds = vec![
-        bind(format!("{r}/var"), "/var"),
-        bind(format!("{r}/home"), "/home"),
+        bind(format!("{c}/var"), "/var"),
+        bind(format!("{c}/home"), "/home"),
         bind(r.clone(), "/run/droidc/root"),
     ];
     let launcher = match launcher {
@@ -245,6 +249,7 @@ pub fn shell_spec(root_path: &Path, launcher: Launcher) -> Result<ShellSpec> {
     };
     let env = [
         ("DROIDC_ROOT", "/run/droidc/root"),
+        ("DROIDC_CONTAINER", root.container.as_str()),
         ("HOME", "/root"),
         ("PATH", DEFAULT_PATH),
         ("TERM", "xterm-256color"),
@@ -258,13 +263,13 @@ pub fn shell_spec(root_path: &Path, launcher: Launcher) -> Result<ShellSpec> {
         // Only for `supervise --systemd`: the cgroup stand-in must be bound after `/sys`, and the
         // LD_PRELOAD library (built for the guest's glibc) placed at `shim`.
         systemd: SystemdSpec {
-            binds: vec![bind(format!("{r}/cgroup"), "/sys/fs/cgroup")],
+            binds: vec![bind(format!("{c}/cgroup"), "/sys/fs/cgroup")],
             shim: "/usr/lib/droidc/cgshim.so".into(),
         },
         env,
         cwd: "/root".into(),
         session: crate::session::describe(
-            &crate::session::resolve(root_path)?,
+            &crate::session::resolve(root)?,
             record.session_label.as_deref(),
         ),
         session_label: record.session_label,

@@ -85,7 +85,29 @@ pub(crate) fn hand_back(root: &Root) -> Result<u64> {
         gid: rustix::process::Gid::from_raw(md.gid()),
         label: fsutil::selinux_label(&root.path, false),
     };
-    let image: HashSet<String> = fs::read_dir(root.deployments())
+    let mut n = 0;
+    // The top of the root: shared state plus the `default` container.
+    let top = Root::new(&root.path);
+    hand_back_dir(&top, &top.path, &owner, &image_owned_ids(&top), &mut n)?;
+    // Named containers: their own deployments, var and home, with the same image-owned rules.
+    let cdirs = crate::layout::containers_dir(&root.path);
+    if cdirs.symlink_metadata().is_ok() {
+        give_root_entries(&cdirs, &owner, &mut n, false)?;
+        for c in root
+            .all_containers()
+            .into_iter()
+            .filter(|c| !c.is_default())
+        {
+            let image = image_owned_ids(&c);
+            give_root_entries(&c.cdir, &owner, &mut n, false)?;
+            hand_back_dir(&c, &c.cdir, &owner, &image, &mut n)?;
+        }
+    }
+    Ok(n)
+}
+
+fn image_owned_ids(root: &Root) -> HashSet<String> {
+    fs::read_dir(root.deployments())
         .into_iter()
         .flatten()
         .flatten()
@@ -94,33 +116,43 @@ pub(crate) fn hand_back(root: &Root) -> Result<u64> {
             root.read_record(id)
                 .is_ok_and(|r| r.ownership.as_deref() == Some(crate::record::OWNERSHIP_IMAGE))
         })
-        .collect();
-    let mut n = 0;
-    for e in fs::read_dir(&root.path)?.flatten() {
+        .collect()
+}
+
+/// Hand back the entries of one state directory (the root itself for `default`).
+fn hand_back_dir(
+    root: &Root,
+    dir: &Path,
+    owner: &Owner,
+    image: &HashSet<String>,
+    n: &mut u64,
+) -> Result<()> {
+    for e in fs::read_dir(dir)?.flatten() {
         let p = e.path();
         let name = e.file_name().to_string_lossy().into_owned();
         match name.as_str() {
+            "containers" if dir == root.path.as_path() => {}
             "var" | "home" if !image.is_empty() => {}
             "deployments" => {
-                give_root_entries(&p, &owner, &mut n, false)?;
+                give_root_entries(&p, owner, n, false)?;
                 for d in fs::read_dir(&p)?.flatten() {
                     let id = d.file_name().to_string_lossy().into_owned();
                     if image.contains(&id) {
-                        give_root_entries(&d.path(), &owner, &mut n, false)?;
+                        give_root_entries(&d.path(), owner, n, false)?;
                         for f in fs::read_dir(d.path())?.flatten() {
                             if f.file_name() != "rootfs" {
-                                give_root_entries(&f.path(), &owner, &mut n, true)?;
+                                give_root_entries(&f.path(), owner, n, true)?;
                             }
                         }
                     } else {
-                        give_root_entries(&d.path(), &owner, &mut n, true)?;
+                        give_root_entries(&d.path(), owner, n, true)?;
                     }
                 }
             }
-            _ => give_root_entries(&p, &owner, &mut n, true)?,
+            _ => give_root_entries(&p, owner, n, true)?,
         }
     }
-    Ok(n)
+    Ok(())
 }
 
 /// The root directory's owner and SELinux label: what everything droidc creates should carry.
@@ -159,11 +191,13 @@ fn give_root_entries(p: &Path, owner: &Owner, n: &mut u64, recurse: bool) -> Res
     Ok(())
 }
 
-/// Create the root (if needed), canonicalize it and take the lock.
-pub(crate) fn open_root(path: &Path) -> Result<(Root, RootGuard)> {
+/// Create the root (if needed), canonicalize it and take the lock. The lock is root-wide, so
+/// mutating commands on different containers of one root run one at a time.
+pub(crate) fn open_root(target: &Root) -> Result<(Root, RootGuard)> {
+    let path = &target.path;
     fs::create_dir_all(path).context(path.display())?;
     let canon = fs::canonicalize(path).context(path.display())?;
-    let root = Root::new(canon);
+    let root = target.rebase(canon);
     let lock = RootGuard {
         root: root.clone(),
         _lock: RootLock::acquire(&root)?,
@@ -568,8 +602,8 @@ fn build_record(
     }
 }
 
-pub fn switch(root_path: &Path, em: &Emitter, opts: &SwitchOpts) -> Result<Value> {
-    let (root, _lock) = open_root(root_path)?;
+pub fn switch(target: &Root, em: &Emitter, opts: &SwitchOpts) -> Result<Value> {
+    let (root, _lock) = open_root(target)?;
     recover(&root, em)?;
     switch_locked(&root, em, opts)
 }
@@ -727,13 +761,8 @@ fn apply_ownership_if_needed(
     Ok(r)
 }
 
-pub fn upgrade(
-    root_path: &Path,
-    em: &Emitter,
-    http: HttpConfig,
-    l2s_prefix: &str,
-) -> Result<Value> {
-    let (root, _lock) = open_root(root_path)?;
+pub fn upgrade(target: &Root, em: &Emitter, http: HttpConfig, l2s_prefix: &str) -> Result<Value> {
+    let (root, _lock) = open_root(target)?;
     recover(&root, em)?;
     let cur = root
         .current_id()
@@ -755,8 +784,8 @@ pub fn upgrade(
 
 // ------------------------------------------------------------------ rollback
 
-pub fn rollback(root_path: &Path, em: &Emitter) -> Result<Value> {
-    let (root, _lock) = open_root(root_path)?;
+pub fn rollback(target: &Root, em: &Emitter) -> Result<Value> {
+    let (root, _lock) = open_root(target)?;
     recover(&root, em)?;
     let cur = root
         .current_id()
@@ -780,10 +809,71 @@ pub fn rollback(root_path: &Path, em: &Emitter) -> Result<Value> {
     Ok(json!({"changed": true, "current": prev, "previous": cur}))
 }
 
+// ------------------------------------------------------------------ containers
+
+/// Every container under the root: name, current and previous deployment (id and image).
+pub fn list_containers(target: &Root) -> Value {
+    let dep = |c: &Root, id: Option<String>| match id {
+        Some(id) => {
+            let image = c.read_record(&id).ok().map(|r| r.image_ref);
+            json!({"id": id, "image_ref": image})
+        }
+        None => Value::Null,
+    };
+    let list: Vec<Value> = target
+        .all_containers()
+        .iter()
+        .map(|c| {
+            json!({
+                "name": c.container,
+                "current": dep(c, c.current_id()),
+                "previous": dep(c, c.previous_id()),
+            })
+        })
+        .collect();
+    json!({"containers": list})
+}
+
+/// Delete a named container's state, then GC the images no other container uses. `default` is
+/// the root itself and can't be removed this way.
+pub fn remove_container(target: &Root, em: &Emitter) -> Result<Value> {
+    if target.is_default() {
+        return Err(Error::invalid(
+            "the default container is the root itself; remove the root directory instead",
+        ));
+    }
+    let (root, _lock) = open_root_existing(target)?;
+    if root.cdir.symlink_metadata().is_err() {
+        return Err(Error::not_found(format!(
+            "no container named {}",
+            root.container
+        )));
+    }
+    let freed = fsutil::disk_usage(&root.cdir);
+    fsutil::rmtree(&root.cdir)?;
+    fsync_dir(&crate::layout::containers_dir(&root.path));
+    let g = gc_locked(&root, em)?;
+    Ok(json!({"removed": root.container, "bytes_freed": freed, "gc": g}))
+}
+
+/// Like [`open_root`], but for a container that is about to go: nothing is created for it.
+fn open_root_existing(target: &Root) -> Result<(Root, RootGuard)> {
+    let canon = fs::canonicalize(&target.path).context(target.path.display())?;
+    let root = target.rebase(canon);
+    let lock = RootGuard {
+        root: root.clone(),
+        _lock: RootLock::acquire(&root)?,
+    };
+    if !rustix::process::geteuid().is_root() {
+        refuse_image_owned(&root)?;
+    }
+    Ok((root, lock))
+}
+
 // ------------------------------------------------------------------ gc
 
-pub fn gc(root_path: &Path, em: &Emitter) -> Result<Value> {
-    let (root, _lock) = open_root(root_path)?;
+pub fn gc(target: &Root, em: &Emitter) -> Result<Value> {
+    let (root, _lock) = open_root(target)?;
     recover(&root, em)?;
     gc_locked(&root, em)
 }
@@ -828,7 +918,18 @@ pub fn gc_locked(root: &Root, em: &Emitter) -> Result<Value> {
         clear_staging(root)?;
     }
     let mut blobs_removed = 0u64;
-    match referenced_blobs(root, &keep) {
+    // Blobs are shared: keep what any container's current or previous deployment needs. This
+    // container is added even if it has no state left to be listed by.
+    let mut containers = root.all_containers();
+    if !containers.iter().any(|c| c.cdir == root.cdir) {
+        containers.push(root.clone());
+    }
+    let refs = containers.iter().try_fold(HashSet::new(), |mut acc, c| {
+        let ids: Vec<String> = c.current_id().into_iter().chain(c.previous_id()).collect();
+        acc.extend(referenced_blobs(c, &ids)?);
+        Some(acc)
+    });
+    match refs {
         Some(refs) => {
             if let Ok(rd) = fs::read_dir(root.blobs()) {
                 for e in rd.flatten() {
@@ -869,6 +970,7 @@ pub fn gc_locked(root: &Root, em: &Emitter) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorKind;
     use crate::events::testutil::capture;
     use crate::status::Launcher;
     use crate::unpack::tests::Layer;
@@ -1016,18 +1118,18 @@ mod tests {
         assert_eq!(b.stats.link_strategy_used, "hardlink");
 
         // rollback swaps
-        let r = rollback(&root.path, &em).unwrap();
+        let r = rollback(&root, &em).unwrap();
         assert_eq!(r["current"], "aaaa");
         assert_eq!(root.current_id().as_deref(), Some("aaaa"));
         assert_eq!(root.previous_id().as_deref(), Some("bbbb"));
-        rollback(&root.path, &em).unwrap();
+        rollback(&root, &em).unwrap();
         assert_eq!(root.current_id().as_deref(), Some("bbbb"));
 
         // a third deployment: A becomes unreferenced and is collected
         do_install(&root, &ld, "cccc", image("C", "motd-C"), LinkKind::Copy);
         assert_eq!(root.previous_id().as_deref(), Some("bbbb"));
         assert!(root.deployment("aaaa").exists());
-        let g = gc(&root.path, &em).unwrap();
+        let g = gc(&root, &em).unwrap();
         assert_eq!(g["deployments_removed"], json!(["aaaa"]));
         assert!(!root.deployment("aaaa").exists());
         assert!(root.deployment("bbbb").exists() && root.deployment("cccc").exists());
@@ -1046,10 +1148,130 @@ mod tests {
         fs::write(root.blob(&mdig), serde_json::to_vec(&man).unwrap()).unwrap();
         fs::write(root.blob(&l1), b"layer").unwrap();
         fs::write(root.blobs().join("2".repeat(64)), b"orphan").unwrap();
-        let g = gc(&root.path, &em).unwrap();
+        let g = gc(&root, &em).unwrap();
         assert_eq!(g["blobs_removed"], 1);
         assert!(root.blob(&l1).exists());
         assert!(!root.blobs().join("2".repeat(64)).exists());
+    }
+
+    /// A manifest blob for `id` whose only layer is `layer` (64 hex chars).
+    fn write_manifest(root: &Root, id: &str, layer: &str) {
+        let man = json!({"config": {"digest": format!("sha256:{}", "c".repeat(64)), "size": 1},
+                         "layers": [{"digest": format!("sha256:{layer}"), "size": 1}]});
+        fs::write(
+            root.blob(&rec(id).manifest_digest),
+            serde_json::to_vec(&man).unwrap(),
+        )
+        .unwrap();
+        fs::write(root.blob(layer), b"layer").unwrap();
+    }
+
+    fn container(root: &Root, name: &str) -> Root {
+        let c = Root::with_container(&root.path, name).unwrap();
+        c.init().unwrap();
+        c
+    }
+
+    #[test]
+    fn named_containers_have_their_own_state() {
+        let (_d, root, ld) = setup();
+        let (em, _) = capture();
+        let dev = container(&root, "dev");
+        do_install(&root, &ld, "aaaa", image("A", "x"), LinkKind::Copy);
+        // Same image in a second container: its own deployment, /var seeded on its own.
+        do_install(&dev, &ld, "aaaa", image("A", "x"), LinkKind::Copy);
+        do_install(&dev, &ld, "bbbb", image("B", "y"), LinkKind::Copy);
+        assert!(dev.deployment("aaaa").join("deployment.json").is_file());
+        assert!(root.deployment("aaaa").join("deployment.json").is_file());
+        assert_ne!(dev.deployment("aaaa"), root.deployment("aaaa"));
+        assert_eq!(fs::read(dev.var().join("lib/seed")).unwrap(), b"seed");
+        fs::write(root.var().join("lib/mine"), "m").unwrap();
+        assert!(!dev.var().join("lib/mine").exists());
+        assert_eq!(root.current_id().as_deref(), Some("aaaa"));
+        assert!(root.previous_id().is_none());
+        assert_eq!(dev.current_id().as_deref(), Some("bbbb"));
+        assert_eq!(dev.previous_id().as_deref(), Some("aaaa"));
+        // Rolling one container back leaves the other alone.
+        rollback(&dev, &em).unwrap();
+        assert_eq!(dev.current_id().as_deref(), Some("aaaa"));
+        assert_eq!(root.current_id().as_deref(), Some("aaaa"));
+        assert!(root.previous_id().is_none());
+        let names: Vec<_> = list_containers(&root)["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["default", "dev"]);
+    }
+
+    #[test]
+    fn gc_keeps_blobs_any_container_uses() {
+        let (_d, root, ld) = setup();
+        let (em, _) = capture();
+        let dev = container(&root, "dev");
+        do_install(&root, &ld, "aaaa", image("A", "x"), LinkKind::Copy);
+        do_install(&dev, &ld, "bbbb", image("B", "y"), LinkKind::Copy);
+        let (l1, l2) = ("1".repeat(64), "2".repeat(64));
+        write_manifest(&root, "aaaa", &l1);
+        write_manifest(&root, "bbbb", &l2);
+        fs::write(root.blobs().join("3".repeat(64)), b"orphan").unwrap();
+        // GC from either container keeps both containers' layers.
+        for c in [&dev, &root] {
+            let g = gc(c, &em).unwrap();
+            assert!(root.blob(&l1).exists() && root.blob(&l2).exists());
+            assert!(g["deployments_removed"].as_array().unwrap().is_empty());
+        }
+        assert!(!root.blobs().join("3".repeat(64)).exists());
+    }
+
+    #[test]
+    fn removing_a_container_frees_only_its_images() {
+        let (_d, root, ld) = setup();
+        let (em, _) = capture();
+        let dev = container(&root, "dev");
+        do_install(&root, &ld, "aaaa", image("A", "x"), LinkKind::Copy);
+        do_install(&dev, &ld, "bbbb", image("B", "y"), LinkKind::Copy);
+        let (l1, l2) = ("1".repeat(64), "2".repeat(64));
+        write_manifest(&root, "aaaa", &l1);
+        write_manifest(&root, "bbbb", &l2);
+        let r = remove_container(&dev, &em).unwrap();
+        assert_eq!(r["removed"], "dev");
+        assert!(!dev.cdir.exists());
+        assert!(root.blob(&l1).exists());
+        assert!(!root.blob(&l2).exists());
+        assert_eq!(root.current_id().as_deref(), Some("aaaa"));
+        assert_eq!(
+            remove_container(&dev, &em).unwrap_err().kind,
+            ErrorKind::NotFound
+        );
+        assert_eq!(
+            remove_container(&root, &em).unwrap_err().kind,
+            ErrorKind::Invalid
+        );
+    }
+
+    #[test]
+    fn shell_spec_for_a_named_container() {
+        let (_d, root, ld) = setup();
+        let dev = container(&root, "dev");
+        do_install(&dev, &ld, "aaaa", image("A", "x"), LinkKind::Copy);
+        let sp = serde_json::to_value(crate::status::shell_spec(&dev, Launcher::Proot).unwrap())
+            .unwrap();
+        let host = |v: &Value| v.as_str().unwrap().to_string();
+        assert!(host(&sp["rootfs"]).ends_with("/root/containers/dev/current/rootfs"));
+        assert_eq!(sp["binds"][0]["guest"], "/var");
+        assert!(host(&sp["binds"][0]["host"]).ends_with("/root/containers/dev/var"));
+        assert!(host(&sp["binds"][1]["host"]).ends_with("/root/containers/dev/home"));
+        assert_eq!(sp["binds"][2]["guest"], "/run/droidc/root");
+        assert!(host(&sp["binds"][2]["host"]).ends_with("/root"));
+        assert!(host(&sp["systemd"]["binds"][0]["host"]).ends_with("/root/containers/dev/cgroup"));
+        assert_eq!(sp["env"]["DROIDC_CONTAINER"], "dev");
+        // The guest reads it back through the bound root and DROIDC_CONTAINER.
+        let s = crate::status::status(&dev).unwrap();
+        assert_eq!(s["container"], "dev");
+        assert_eq!(s["current"]["id"], "aaaa");
+        assert!(crate::status::shell_spec(&root, Launcher::Proot).is_err());
     }
 
     #[test]
@@ -1138,13 +1360,12 @@ mod tests {
     fn status_and_shell_spec_use_relative_links() {
         let (_d, root, ld) = setup();
         do_install(&root, &ld, "aaaa", image("A", "x"), LinkKind::Copy);
-        let s = crate::status::status(&root.path).unwrap();
+        let s = crate::status::status(&root).unwrap();
         assert_eq!(s["current"]["id"], "aaaa");
         assert!(s["previous"].is_null());
         assert!(s["staged"].is_null());
-        let sp =
-            serde_json::to_value(crate::status::shell_spec(&root.path, Launcher::Proot).unwrap())
-                .unwrap();
+        let sp = serde_json::to_value(crate::status::shell_spec(&root, Launcher::Proot).unwrap())
+            .unwrap();
         assert_eq!(sp["session_label"], "gnome");
         assert_eq!(sp["launcher"]["kind"], "proot");
         assert_eq!(sp["launcher"]["link2symlink"], false);
@@ -1162,7 +1383,7 @@ mod tests {
         // reading through a different absolute path (as the guest does) works
         let alias = _d.path().join("alias");
         std::os::unix::fs::symlink(&root.path, &alias).unwrap();
-        let s2 = crate::status::status(&alias).unwrap();
+        let s2 = crate::status::status(&Root::new(&alias)).unwrap();
         assert_eq!(s2["current"]["id"], "aaaa");
     }
 
@@ -1170,9 +1391,8 @@ mod tests {
     fn chroot_shell_spec_binds_root_for_link2symlink() {
         let (_d, root, ld) = setup();
         do_install(&root, &ld, "aaaa", image("A", "x"), LinkKind::Link2Symlink);
-        let sp =
-            serde_json::to_value(crate::status::shell_spec(&root.path, Launcher::Chroot).unwrap())
-                .unwrap();
+        let sp = serde_json::to_value(crate::status::shell_spec(&root, Launcher::Chroot).unwrap())
+            .unwrap();
         let l = &sp["launcher"];
         assert_eq!(l["kind"], "chroot");
         assert_eq!(l["requires_root"], true);
@@ -1200,7 +1420,7 @@ mod tests {
             env: vec!["TERM=dumb".into(), "WAYLAND_DISPLAY=wayland-0".into()],
             hostname: Some("selkie".into()),
         };
-        let (p, _warnings) = plan(&root.path, &o).unwrap();
+        let (p, _warnings) = plan(&root, &o).unwrap();
         let canon = fs::canonicalize(&root.path).unwrap();
         assert_eq!(
             p.rootfs,
@@ -1219,13 +1439,13 @@ mod tests {
                 binds: vec![bad.into()],
                 ..Default::default()
             };
-            assert!(plan(&root.path, &o).is_err(), "{bad}");
+            assert!(plan(&root, &o).is_err(), "{bad}");
         }
         let o = EnterOpts {
             env: vec!["NOEQUALS".into()],
             ..Default::default()
         };
-        assert!(plan(&root.path, &o).is_err());
+        assert!(plan(&root, &o).is_err());
     }
 
     /// Real chown/chmod: runs only as root (CI under sudo, or locally in
@@ -1263,7 +1483,7 @@ mod tests {
         fs::write(rf.join("opt/keep"), "").unwrap();
         fs::rename(rf.join("srv"), rf.join("opt/srv")).unwrap();
         std::os::unix::fs::symlink(&sentinel, rf.join("srv")).unwrap();
-        let r = crate::ownership::fix(&root.path, ".l2s.").unwrap();
+        let r = crate::ownership::fix(&root, ".l2s.").unwrap();
         assert_eq!(r["ownership"], "image");
         let su = fs::metadata(rf.join("usr/bin/su")).unwrap();
         assert_eq!((su.uid(), su.mode() & 0o7777), (0, 0o4755), "{r}");
@@ -1290,7 +1510,7 @@ mod tests {
             root.read_record("aaaa").unwrap().ownership.as_deref(),
             Some("image")
         );
-        let spec = crate::status::shell_spec(&root.path, Launcher::Chroot).unwrap();
+        let spec = crate::status::shell_spec(&root, Launcher::Chroot).unwrap();
         let crate::status::LauncherSpec::Chroot { warnings, .. } = spec.launcher else {
             panic!()
         };
@@ -1299,7 +1519,7 @@ mod tests {
             "{warnings:?}"
         );
 
-        let u = crate::ownership::undo(&root.path).unwrap();
+        let u = crate::ownership::undo(&root).unwrap();
         assert_eq!(u["deployments"], json!(["aaaa"]));
         for p in [
             rf.join("usr/bin/su"),
@@ -1330,12 +1550,12 @@ mod tests {
         let mut r = root.read_record("aaaa").unwrap();
         r.ownership = Some("image".into());
         write_record(&root.deployment("aaaa").join("deployment.json"), &r).unwrap();
-        let e = gc(&root.path, &em).unwrap_err();
+        let e = gc(&root, &em).unwrap_err();
         assert_eq!(e.kind, crate::error::ErrorKind::Invalid);
         assert!(e.message.contains("fix-ownership --undo"), "{}", e.message);
         assert!(root.deployment("aaaa").is_dir());
         // read-only commands still work
-        crate::status::status(&root.path).unwrap();
+        crate::status::status(&root).unwrap();
     }
 
     #[test]
@@ -1384,6 +1604,52 @@ mod tests {
 
     /// Runs only as root, like `fix_ownership_then_undo_as_root`.
     #[test]
+    fn root_commands_hand_back_named_containers() {
+        use std::os::unix::fs::MetadataExt;
+        if !rustix::process::geteuid().is_root() {
+            eprintln!("skipped: needs root");
+            return;
+        }
+        let uid = |p: &Path| fs::symlink_metadata(p).unwrap().uid();
+        let (em, _) = capture();
+        let d = tempfile::tempdir().unwrap();
+        let rp = d.path().canonicalize().unwrap().join("root");
+        fs::create_dir(&rp).unwrap();
+        std::os::unix::fs::chown(&rp, Some(1000), Some(1000)).unwrap();
+        let dev = Root::with_container(&rp, "dev").unwrap();
+        gc(&dev, &em).unwrap();
+        for p in [
+            "containers",
+            "containers/dev",
+            "containers/dev/var",
+            "containers/dev/home/root",
+        ] {
+            assert_eq!(uid(&rp.join(p)), 1000, "{p}");
+        }
+        let ld = d.path().join("layers");
+        fs::create_dir(&ld).unwrap();
+        let layers = vec![Layer::new()
+            .dir_as("usr/", 0o755, 0, 0)
+            .dir_as("usr/bin/", 0o755, 0, 0)
+            .file_as("usr/bin/su", 0o4755, 0, 0, b"su")
+            .dir("var/", 0o755)
+            .dir_as("var/lib/", 0o700, 0, 0)
+            .bytes()];
+        do_install(&dev, &ld, "aaaa", layers, LinkKind::Copy);
+        let su = dev.deployment("aaaa").join("rootfs/usr/bin/su");
+        gc(&dev, &em).unwrap();
+        assert_eq!(uid(&su), 1000);
+        assert_eq!(uid(&dev.current_link()), 1000);
+        // Image-owned in the named container: its rootfs and var keep image owners.
+        crate::ownership::fix(&dev, ".l2s.").unwrap();
+        assert_eq!(uid(&su), 0);
+        gc(&Root::new(&rp), &em).unwrap();
+        assert_eq!(uid(&su), 0);
+        assert_eq!(uid(&dev.var().join("lib")), 0);
+        assert_eq!(uid(&dev.deployment("aaaa").join("deployment.json")), 1000);
+    }
+
+    #[test]
     fn root_commands_hand_back_what_they_create() {
         use std::os::unix::fs::MetadataExt;
         if !rustix::process::geteuid().is_root() {
@@ -1397,7 +1663,7 @@ mod tests {
         let rp = d.path().canonicalize().unwrap().join("root");
         fs::create_dir(&rp).unwrap();
         std::os::unix::fs::chown(&rp, Some(1000), Some(1000)).unwrap();
-        gc(&rp, &em).unwrap();
+        gc(&Root::new(&rp), &em).unwrap();
         for p in [
             "lock",
             "policy.json",
@@ -1425,11 +1691,11 @@ mod tests {
         root.set_link("current", "aaaa").unwrap();
         let su = root.deployment("aaaa").join("rootfs/usr/bin/su");
         assert_eq!(uid(&su), 0, "made as root");
-        gc(&rp, &em).unwrap();
+        gc(&Root::new(&rp), &em).unwrap();
         assert_eq!(uid(&su), 1000);
         assert_eq!(uid(&root.current_link()), 1000);
         // 3. image-owned: rootfs keeps image owners, droidc's own files are handed back, var too
-        crate::ownership::fix(&rp, ".l2s.").unwrap();
+        crate::ownership::fix(&Root::new(&rp), ".l2s.").unwrap();
         assert_eq!(uid(&su), 0);
         assert_eq!(uid(&root.deployment("aaaa").join("deployment.json")), 1000);
         assert_eq!(
@@ -1438,7 +1704,7 @@ mod tests {
             "var keeps image owners in image mode"
         );
         fs::write(root.blobs().join("made-as-root"), "").unwrap();
-        gc(&rp, &em).unwrap();
+        gc(&Root::new(&rp), &em).unwrap();
         assert_eq!(uid(&su), 0);
         assert_eq!(uid(&root.var().join("lib")), 0);
         // (gc removed the unreferenced blob; the blobs dir itself stays the app's)
@@ -1446,7 +1712,7 @@ mod tests {
         // 4. a root directory that belongs to root: nothing to hand back to
         std::os::unix::fs::chown(&rp, Some(0), Some(0)).unwrap();
         assert_eq!(hand_back(&root).unwrap(), 0);
-        crate::ownership::undo(&rp).unwrap_err();
+        crate::ownership::undo(&Root::new(&rp)).unwrap_err();
     }
 
     #[test]

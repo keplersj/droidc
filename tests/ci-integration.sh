@@ -112,6 +112,26 @@ echo "== gc"
 G=$(J gc); echo "$G" | jq -e '.ok' >/dev/null || fail "gc"
 test -d "$ROOT/deployments/$ID1" -a -d "$ROOT/deployments/$ID2" || fail "gc removed a kept deployment"
 
+echo "== named container: same image, no download, own state"
+C=$(J --container dev switch quay.io/centos-bootc/centos-bootc:stream9 --insecure-allow-unsigned --links link2symlink)
+echo "$C" | jq -e --arg id "$ID2" '.ok and .data.changed and .data.id == $id and .data.deployment.stats.download_bytes == 0' >/dev/null \
+  || fail "switch in container dev: $C"
+[ "$(readlink "$ROOT/containers/dev/current")" = "deployments/$ID2" ] || fail "dev current link"
+grep -q 'CentOS Stream' "$ROOT/containers/dev/current/rootfs/usr/lib/os-release" || fail "dev os-release"
+S=$(J --container dev status)
+echo "$S" | jq -e --arg id "$ID2" '.data.container == "dev" and .data.current.id == $id and .data.previous == null' >/dev/null || fail "dev status: $S"
+S=$(J status)
+[ "$(echo "$S" | jq -r .data.current.id)" = "$ID1" ] || fail "default current changed by dev"
+L=$(J container list)
+echo "$L" | jq -e '[.data.containers[].name] == ["default","dev"]' >/dev/null || fail "container list: $L"
+J --container dev shell-spec | jq -e '.data.env.DROIDC_CONTAINER == "dev" and (.data.rootfs | endswith("/containers/dev/current/rootfs"))' >/dev/null \
+  || fail "dev shell-spec"
+RM=$(J container rm dev)
+echo "$RM" | jq -e '.ok and .data.removed == "dev"' >/dev/null || fail "container rm: $RM"
+test ! -e "$ROOT/containers/dev" || fail "dev still there"
+test -d "$ROOT/deployments/$ID2" || fail "rm dev touched the default container"
+J status | jq -e --arg id "$ID2" '.data.previous.id == $id' >/dev/null || fail "default previous after rm dev"
+
 echo "== switch --apply-ownership (root, activates the present stream9 deployment), upgrade keeps it"
 A=$(sudo "$D" --root "$ROOT_REAL" --json switch quay.io/centos-bootc/centos-bootc:stream9 --insecure-allow-unsigned --links link2symlink --apply-ownership | tail -n1)
 echo "$A" | jq -e --arg id "$ID2" '.ok and .data.changed and .data.id == $id and .data.ownership.ownership == "image" and .data.deployment.ownership == "image"' >/dev/null \
