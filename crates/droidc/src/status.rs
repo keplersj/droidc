@@ -217,6 +217,14 @@ pub fn shell_spec(root: &Root, launcher: Launcher) -> Result<ShellSpec> {
         bind(format!("{c}/home"), "/home"),
         bind(r.clone(), "/run/droidc/root"),
     ];
+    // sudo/su/pkexec in the guest are the guest droidc (dispatched by argv[0]); they ask the host
+    // spawner for a second launcher as root. Only under proot: chroot already has a real root path,
+    // and binding over a setuid binary there would disable the real thing.
+    if matches!(launcher, Launcher::Proot) {
+        for shim in crate::spawn::SHIMS {
+            binds.push(bind("/usr/bin/droidc".into(), shim));
+        }
+    }
     let launcher = match launcher {
         Launcher::Proot => LauncherSpec::Proot {
             requires_root: false,
