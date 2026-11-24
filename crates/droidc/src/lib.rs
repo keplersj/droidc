@@ -1,4 +1,12 @@
 //! droidc engine library.
+/// `0.1.0 (9cf69ff)`: the package version and, when known, the git revision it was built from.
+pub const VERSION: &str = env!("DROIDC_VERSION");
+
+/// Short git revision droidc was built from, `-dirty` if the tree had changes; `None` if unknown.
+pub fn git_rev() -> Option<&'static str> {
+    Some(env!("DROIDC_GIT_REV")).filter(|r| !r.is_empty())
+}
+
 pub mod bridge;
 pub mod cgroups;
 pub mod deploy;
