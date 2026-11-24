@@ -438,6 +438,22 @@ only `dbus-broker` (CentOS Stream 10 bootc) get socket activation done by droidc
 wrapper so the pid matches). dbus-broker forwards D-Bus activation to systemd, so on such images
 activatable services don't start.
 
+### Network interfaces (`ifshim`)
+
+Android refuses an app's `NETLINK_ROUTE` socket (apps targeting API 30 and up), so glibc's
+`getifaddrs()` and `if_nameindex()` fail with `EACCES`, and with them Node's
+`os.networkInterfaces()`, Python's `socket.if_nameindex()` and `hostname -I` (Selkie #14).
+`/usr/lib/droidc/ifshim.so` (`DROIDC_IFSHIM`, empty turns it off; `crates/ifshim`, built against
+glibc 2.28) answers both from the ioctls that still work (`SIOCGIFCONF` and the per-interface
+`SIOCGIF*`), plus `/proc/net/if_inet6` and `/proc/net/dev` where they are readable. It calls the
+real function first, so it changes nothing where netlink works.
+
+supervise prepends it to its own `LD_PRELOAD` before it starts anything, so the shell, the buses
+and the session inherit it; proot's environment stays clean (proot is bionic). It does so only when
+the file exists and the guest's `/bin/sh` runs on glibc's loader: a glibc library preloaded into a
+musl process stops it from starting. Programs that open netlink themselves (`ip`, Go's
+`net.Interfaces()`, static binaries) are not covered.
+
 ### `--systemd=off|auto|on` (opt-in while it is proven)
 
 bootc images are systemd images, and GNOME depends on `systemd --user` (session services,
