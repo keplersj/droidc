@@ -14,7 +14,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "droidc",
-    version,
+    version = droidc::VERSION,
     about = "Run bootc images on Android under proot"
 )]
 struct Cli {
@@ -184,10 +184,10 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
     },
-    /// Show or override how the graphical session starts
+    /// Show or override how the graphical session starts (`show` when no subcommand is given)
     Session {
         #[command(subcommand)]
-        action: SessionCmd,
+        action: Option<SessionCmd>,
     },
     /// List or remove containers (`--container` picks the one other commands act on)
     Container {
@@ -348,7 +348,10 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
             ))
         }
         Cmd::Platform => Ok(("platform", serde_json::to_value(Platform::detect()?)?)),
-        Cmd::Session { action } => Ok(("session", session_cmd(&root, action)?)),
+        Cmd::Session { action } => Ok((
+            "session",
+            session_cmd(&root, action.as_ref().unwrap_or(&SessionCmd::Show))?,
+        )),
         Cmd::FixOwnership { undo: false } => Ok(("fix-ownership", ownership::fix(&root, &l2s)?)),
         Cmd::FixOwnership { undo: true } => Ok(("fix-ownership", ownership::undo(&root)?)),
         Cmd::Container {
