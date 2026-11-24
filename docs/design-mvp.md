@@ -187,7 +187,7 @@ droidc [--root DIR] [--container NAME] [--json] [--dns IPS] <command>
                                 (inside the guest) start the graphical session, see "Graphical session"
   bridge [--width W --height H --connector C --dump-frame PNG]
                                 (inside the guest) show a headless session compositor on the host compositor
-  session show|set|clear        the graphical session (override, else image labels)
+  session [show|set|clear]      the graphical session (override, else image labels); bare `session` shows
   container list                every container with its current and previous deployment
   container rm <name>           delete a named container, then GC blobs nothing else uses
 ```
@@ -217,7 +217,10 @@ The last line is always a `result`. Exit status is 0 iff `ok`.
  "stats":{"download_bytes":0,"files":0,"bytes_on_disk":0,"hardlinks":0,"link_strategy":"link2symlink","unpack_seconds":0.0}}
 ```
 
-`status` data: `{"root":..., "container":"default", "platform":{...}, "current":<record>|null, "previous":<record>|null,
+`--version` prints `droidc 0.1.0 (9cf69ff)`: the git revision droidc was built from, with `-dirty` for
+uncommitted changes (`build.rs`; set `DROIDC_GIT_REV` to build without a git checkout).
+
+`status` data: `{"version":"0.1.0 (9cf69ff)", "git_rev":"9cf69ff"|null, "root":..., "container":"default", "platform":{...}, "current":<record>|null, "previous":<record>|null,
 "staged":<PENDING>|null}` (`staged` is non-null only while an operation runs or was interrupted).
 
 `switch`/`upgrade` result data: `{"changed":true,"id","previous","deployment":<record>,"gc":{...}}`, or
