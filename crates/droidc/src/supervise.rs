@@ -253,6 +253,78 @@ const CGROUP_ROOT_FILES: [&str; 5] = [
     "cgroup.type",
 ];
 
+/// The network-interface shim (`crates/ifshim`, DROIDC_IFSHIM; empty turns it off): answers
+/// `getifaddrs`/`if_nameindex` from ioctls when the sandbox refuses glibc's netlink socket.
+const DEFAULT_IFSHIM: &str = "/usr/lib/droidc/ifshim.so";
+
+/// `shim` in front of an existing `LD_PRELOAD` list, once.
+fn prepend_preload(shim: &std::path::Path, existing: Option<&str>) -> String {
+    let shim = shim.display().to_string();
+    match existing.filter(|p| !p.is_empty()) {
+        Some(p) if p.split([':', ' ']).any(|e| e == shim) => p.to_string(),
+        Some(p) => format!("{shim}:{p}"),
+        None => shim,
+    }
+}
+
+/// The `PT_INTERP` path of a 64-bit little-endian ELF executable (`None` for anything else).
+fn elf_interp(bytes: &[u8]) -> Option<String> {
+    let u16_at = |o: usize| Some(u16::from_le_bytes(bytes.get(o..o + 2)?.try_into().ok()?));
+    let u32_at = |o: usize| Some(u32::from_le_bytes(bytes.get(o..o + 4)?.try_into().ok()?));
+    let u64_at = |o: usize| Some(u64::from_le_bytes(bytes.get(o..o + 8)?.try_into().ok()?));
+    // ELFCLASS64, ELFDATA2LSB
+    if bytes.get(..6)? != b"\x7fELF\x02\x01" {
+        return None;
+    }
+    let (phoff, phentsize, phnum) = (
+        u64_at(0x20)? as usize,
+        u16_at(0x36)? as usize,
+        u16_at(0x38)?,
+    );
+    (0..phnum as usize).find_map(|i| {
+        let ph = phoff.checked_add(i.checked_mul(phentsize)?)?;
+        if u32_at(ph)? != 3 {
+            return None; // not PT_INTERP
+        }
+        let (off, len) = (u64_at(ph + 8)? as usize, u64_at(ph + 32)? as usize);
+        let raw = bytes.get(off..off.checked_add(len)?)?;
+        let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+        Some(String::from_utf8_lossy(&raw[..end]).into_owned())
+    })
+}
+
+/// Whether `exe` runs on glibc's dynamic loader. A glibc library preloaded into a musl process
+/// stops it from starting, so the shim goes in only when the guest's shell is glibc's. A loader
+/// named `ld-linux*` that is really musl (Alpine's gcompat) resolves to `ld-musl*`.
+fn runs_on_glibc(exe: &std::path::Path) -> bool {
+    let Ok(bytes) = fs::read(exe) else {
+        return false;
+    };
+    let Some(interp) = elf_interp(&bytes) else {
+        return false;
+    };
+    let real = fs::canonicalize(&interp).unwrap_or_else(|_| PathBuf::from(&interp));
+    real.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("ld-linux"))
+}
+
+/// Puts the network-interface shim in front of everything this supervisor starts (the shell, the
+/// buses, the session), when it is installed and the guest is glibc. Done in our own environment
+/// rather than proot's: proot itself is a bionic binary.
+fn preload_ifshim() {
+    let shim = match std::env::var_os("DROIDC_IFSHIM") {
+        Some(v) if v.is_empty() => return,
+        Some(v) => PathBuf::from(v),
+        None => PathBuf::from(DEFAULT_IFSHIM),
+    };
+    if !shim.is_file() || !runs_on_glibc(std::path::Path::new("/bin/sh")) {
+        return;
+    }
+    let preload = prepend_preload(&shim, std::env::var("LD_PRELOAD").ok().as_deref());
+    std::env::set_var("LD_PRELOAD", preload);
+}
+
 /// The shim to preload into `systemd --user`, when `mode` and the guest allow it.
 fn resolve_systemd(
     mode: SystemdMode,
@@ -513,10 +585,7 @@ fn start_systemd_user(
     shim: &std::path::Path,
     dir: &std::path::Path,
 ) -> Result<Child> {
-    let preload = match std::env::var("LD_PRELOAD") {
-        Ok(p) if !p.is_empty() => format!("{}:{p}", shim.display()),
-        _ => shim.display().to_string(),
-    };
+    let preload = prepend_preload(shim, std::env::var("LD_PRELOAD").ok().as_deref());
     let mut cmd = Command::new(bin);
     // Like the log level, the target only sticks as an argument: the stand-in journal socket would
     // otherwise swallow the manager's own messages.
@@ -719,6 +788,8 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
     become_subreaper();
     let dir = runtime_dir()?;
     std::env::set_var("XDG_RUNTIME_DIR", &dir);
+    // Before anything is started (and before any thread): every child inherits it.
+    preload_ifshim();
     if let Err(e) = ensure_machine_id(std::path::Path::new(MACHINE_ID)) {
         eprintln!("warn: could not initialise {MACHINE_ID}: {e}");
     }
@@ -1111,6 +1182,71 @@ mod tests {
             );
         }
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn preload_prepends_once() {
+        let shim = std::path::Path::new("/usr/lib/droidc/ifshim.so");
+        assert_eq!(prepend_preload(shim, None), "/usr/lib/droidc/ifshim.so");
+        assert_eq!(prepend_preload(shim, Some("")), "/usr/lib/droidc/ifshim.so");
+        assert_eq!(
+            prepend_preload(shim, Some("/a.so")),
+            "/usr/lib/droidc/ifshim.so:/a.so"
+        );
+        assert_eq!(
+            prepend_preload(shim, Some("/a.so /usr/lib/droidc/ifshim.so")),
+            "/a.so /usr/lib/droidc/ifshim.so"
+        );
+    }
+
+    /// A minimal ELF64 header with one PT_LOAD and one PT_INTERP program header.
+    fn elf_with_interp(interp: &str) -> Vec<u8> {
+        let mut b = vec![0u8; 0x40 + 2 * 56];
+        b[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        b[0x20..0x28].copy_from_slice(&0x40u64.to_le_bytes());
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        b[0x38..0x3a].copy_from_slice(&2u16.to_le_bytes());
+        b[0x40..0x44].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        let ph = 0x40 + 56;
+        let off = b.len() as u64;
+        b[ph..ph + 4].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+        b[ph + 8..ph + 16].copy_from_slice(&off.to_le_bytes());
+        b[ph + 32..ph + 40].copy_from_slice(&(interp.len() as u64 + 1).to_le_bytes());
+        b.extend_from_slice(interp.as_bytes());
+        b.push(0);
+        b
+    }
+
+    #[test]
+    fn reads_the_elf_interpreter() {
+        assert_eq!(
+            elf_interp(&elf_with_interp("/lib/ld-linux-aarch64.so.1")).as_deref(),
+            Some("/lib/ld-linux-aarch64.so.1")
+        );
+        assert_eq!(elf_interp(b"#!/bin/sh\n"), None);
+        let mut cut = elf_with_interp("/lib/ld-musl-aarch64.so.1");
+        cut.truncate(0x50);
+        assert_eq!(elf_interp(&cut), None);
+    }
+
+    #[test]
+    fn glibc_and_musl_loaders() {
+        let d = tempfile::tempdir().unwrap();
+        let glibc = d.path().join("glibc");
+        fs::write(&glibc, elf_with_interp("/lib/ld-linux-aarch64.so.1")).unwrap();
+        assert!(runs_on_glibc(&glibc));
+        let musl = d.path().join("musl");
+        fs::write(&musl, elf_with_interp("/lib/ld-musl-aarch64.so.1")).unwrap();
+        assert!(!runs_on_glibc(&musl));
+        // gcompat: an ld-linux name that is a link to musl's loader.
+        let loader = d.path().join("ld-musl-x86_64.so.1");
+        fs::write(&loader, b"").unwrap();
+        let alias = d.path().join("ld-linux-x86-64.so.2");
+        std::os::unix::fs::symlink(&loader, &alias).unwrap();
+        let gcompat = d.path().join("gcompat");
+        fs::write(&gcompat, elf_with_interp(alias.to_str().unwrap())).unwrap();
+        assert!(!runs_on_glibc(&gcompat));
+        assert!(!runs_on_glibc(&d.path().join("missing")));
     }
 
     fn child_lock() -> std::sync::MutexGuard<'static, ()> {

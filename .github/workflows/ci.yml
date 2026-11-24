@@ -10,7 +10,7 @@ jobs:
   lint-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: rustfmt, clippy
@@ -37,7 +37,7 @@ jobs:
           - { runner: ubuntu-24.04-arm, arch: aarch64 }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: ${{ matrix.arch }}-unknown-linux-musl
@@ -58,30 +58,37 @@ jobs:
         with:
           name: droidc-${{ matrix.arch }}-linux-musl
           path: dist/droidc-${{ matrix.arch }}-linux-musl
-      # LD_PRELOAD library for the guest's systemd --user (crates/cgshim). The guest is glibc, so this is not
-      # the musl build above; target glibc 2.28 so any bootc image's libc is newer.
-      - name: Test the cgroup shim (preloaded into real programs)
+      # LD_PRELOAD libraries for the guest: the cgroup shim for its systemd --user (crates/cgshim) and the
+      # network-interface shim for everything supervise starts (crates/ifshim). The guest is glibc, so these
+      # are not the musl build above; target glibc 2.28 so any bootc image's libc is newer.
+      - name: Test the shims (preloaded into real programs)
         if: matrix.arch == 'x86_64'
-        run: cargo test -p cgshim
-      - name: Build the cgroup shim (glibc)
+        run: cargo test -p cgshim -p ifshim
+      - name: Build the shims (glibc)
         run: |
           rustup target add ${{ matrix.arch }}-unknown-linux-gnu
-          cargo zigbuild --release --target ${{ matrix.arch }}-unknown-linux-gnu.2.28 -p cgshim
-          so=target/${{ matrix.arch }}-unknown-linux-gnu/release/libcgshim.so
-          file "$so"
-          ! objdump -T "$so" | grep -E 'GLIBC_2\.(29|[3-9][0-9])'
-          cp "$so" dist/cgshim-${{ matrix.arch }}.so
+          for shim in cgshim ifshim; do
+            cargo zigbuild --release --target ${{ matrix.arch }}-unknown-linux-gnu.2.28 -p $shim
+            so=target/${{ matrix.arch }}-unknown-linux-gnu/release/lib$shim.so
+            file "$so"
+            ! objdump -T "$so" | grep -E 'GLIBC_2\.(29|[3-9][0-9])'
+            cp "$so" dist/$shim-${{ matrix.arch }}.so
+          done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cgshim-${{ matrix.arch }}
           path: dist/cgshim-${{ matrix.arch }}.so
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ifshim-${{ matrix.arch }}
+          path: dist/ifshim-${{ matrix.arch }}.so
 
   # Host-side Android build (bionic, NDK r27c, API 26): shipped by Selkie as libdroidc.so.
   # The musl build above is the guest-side binary (libdroidc-guest.so).
   android:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: aarch64-linux-android,x86_64-linux-android
@@ -129,7 +136,7 @@ jobs:
           - { runner: ubuntu-24.04-arm, arch: aarch64 }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: droidc-${{ matrix.arch }}-linux-musl
