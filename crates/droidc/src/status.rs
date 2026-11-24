@@ -27,6 +27,8 @@ pub fn status(root: &Root) -> Result<Value> {
         .map(|p| serde_json::to_value(p).unwrap())
         .unwrap_or(Value::Null);
     Ok(json!({
+        "version": crate::VERSION,
+        "git_rev": crate::git_rev(),
         "root": root.path.display().to_string(),
         "container": root.container,
         "platform": platform,
