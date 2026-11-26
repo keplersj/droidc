@@ -200,7 +200,8 @@ enum Cmd {
 enum ContainerCmd {
     /// Every container under the root, with its current and previous deployment
     List,
-    /// Delete a container's deployments, /var, /home and session, then GC unused images
+    /// Delete a container's deployments, /var, /home and session, then GC unused images.
+    /// For `default` only its own state goes; the root and the other containers stay.
     Rm { name: String },
 }
 

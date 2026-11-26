@@ -66,7 +66,9 @@ per-container `/etc` first.
 
 GC is per container for deployments, but blob GC keeps every blob that any container's `current`
 or `previous` deployment needs. `container rm NAME` deletes `containers/NAME/` and then GCs the
-blobs nothing else uses; `default` can't be removed this way.
+blobs nothing else uses. `container rm default` deletes only the default container's own entries at the
+top of the root (deployments, `current`, `previous`, `staging/`, `var/`, `home/`, `cgroup/`,
+`session.json`); the blobs, policy and other containers stay.
 
 `shell-spec` for a named container binds that container's `var/`, `home/` and `cgroup/`, still binds
 the whole root at `/run/droidc/root`, and sets `DROIDC_CONTAINER` beside `DROIDC_ROOT`, so `droidc`
@@ -189,7 +191,7 @@ droidc [--root DIR] [--container NAME] [--json] [--dns IPS] <command>
                                 (inside the guest) show a headless session compositor on the host compositor
   session [show|set|clear]      the graphical session (override, else image labels); bare `session` shows
   container list                every container with its current and previous deployment
-  container rm <name>           delete a named container, then GC blobs nothing else uses
+  container rm <name>           delete a container (default: only its own state), then GC blobs nothing else uses
 ```
 
 ### `--json` output: newline-delimited JSON on stdout
