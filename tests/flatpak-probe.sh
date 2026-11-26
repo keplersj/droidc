@@ -30,7 +30,7 @@ run flatpak remotes --system --show-details
 
 step "fake root over the spawner: sudo id, then the first-boot preinstall"
 run sudo id
-T=3600 TAIL=60 run sudo flatpak preinstall -y --noninteractive
+T=1200 TAIL=60 run sudo flatpak preinstall -y --noninteractive
 run flatpak list --system --columns=application,branch,origin,installation
 run flatpak remotes --system --show-details
 run sh -c 'ls -la /var/lib/flatpak /var/lib/flatpak/repo; cat /var/lib/flatpak/repo/config'
@@ -46,7 +46,7 @@ step "system install as the user, flatpak-system-helper started by hand on the s
 /usr/libexec/flatpak-system-helper -r > /tmp/helper.log 2>&1 &
 HELPER=$!
 sleep 3
-T=1800 run flatpak install --system -y --noninteractive flathub "$APP"
+T=600 run flatpak install --system -y --noninteractive flathub "$APP"
 kill $HELPER 2>/dev/null
 run cat /tmp/helper.log
 
@@ -55,13 +55,13 @@ dbus-daemon --session --address=unix:path=/tmp/session_bus --fork --print-pid=1 
 DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/session_bus /usr/libexec/flatpak-system-helper --session -r > /tmp/helper2.log 2>&1 &
 HELPER=$!
 sleep 3
-DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/session_bus FLATPAK_SYSTEM_HELPER_ON_SESSION=1 T=1800 run flatpak install --system -y --noninteractive flathub "$APP"
+DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/session_bus FLATPAK_SYSTEM_HELPER_ON_SESSION=1 T=600 run flatpak install --system -y --noninteractive flathub "$APP"
 kill $HELPER 2>/dev/null
 run cat /tmp/helper2.log
 
 step "user installation"
 run flatpak --user remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-T=1800 run flatpak --user install -y --noninteractive flathub "$APP"
+T=600 run flatpak --user install -y --noninteractive flathub "$APP"
 run flatpak list --columns=application,installation
 T=120 run flatpak run --command=true "$APP"
 

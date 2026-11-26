@@ -73,12 +73,12 @@ jobs:
           SPAWNER=$!
           sleep 2
           set +e
-          timeout 13000 "${base[@]}" "${envs[@]}" /bin/sh /tmp/probe.sh > probe.log 2>&1
+          timeout 9000 "${base[@]}" "${envs[@]}" /bin/sh /tmp/probe.sh 2>&1 | tee probe.log
           echo "exit=$?"
           set -e
           kill $SPAWNER || true
           { echo "### Flatpak under droidc (Bluefin LTS, arm64, proot, no userns)"; echo '```'; cat probe.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          cat probe.log
+          tail -n 3 probe.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
