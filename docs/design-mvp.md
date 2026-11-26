@@ -515,6 +515,33 @@ with the system bus and `droidc login1` its units expect:
 `DROIDC_JOURNAL=stderr` prints what reaches the stand-in journal sockets; `DROIDC_LOGCAT=auto|debug|info|warn|error`
 forwards it to Android's log ([`android-integration.md`](android-integration.md)).
 
+## Root in the guest (`spawn`, the sudo/su/pkexec shims)
+
+`sudo`, `su` and `pkexec` fail under proot like a broken image: the setuid bit does nothing, so they
+cannot become root (Selkie #9). A shim inside the guest cannot fix that by starting a second proot
+itself, because the guest is already traced by proot and proot is not in the image. So droidc splits
+it across the proot boundary:
+
+- `droidc spawn-server --socket NAME --uid U -- <launcher...>` runs on the host (Selkie starts it with
+  the container's own proot argv plus `-0`). It listens on the abstract socket `NAME`, checks each
+  caller's uid (any app can reach an abstract socket), and for each request starts the launcher — a
+  second proot in the same container, as fake root — running the requested command.
+- In the guest, `/usr/bin/sudo`, `/usr/bin/su` and `/usr/bin/pkexec` are the guest droidc,
+  dispatched by `argv[0]`: `shell-spec` lists them under `shims` (proot only), and the launcher binds
+  its guest droidc over each, as it binds `/usr/bin/droidc`. The shim parses the usual options, connects to
+  `$DROIDC_SPAWNER`, passes its own stdin/stdout/stderr over the socket (`SCM_RIGHTS`) so the root
+  command shares the terminal, and exits with its status. Terminal signals are forwarded.
+- The request carries only a command, a working directory and an environment (the caller's, minus
+  what `sudo` drops — `LD_PRELOAD` and the like — with root's `HOME`/`USER`). The rootfs, the binds
+  and the `-0` are the server's: the guest never chooses them. Only root is offered (`-u root`).
+- This is proot's fake root, as DroidDeck already uses, not real privilege: nothing escapes the app's
+  uid. On chroot (real root) the shims are not bound, so the image's own setuid binaries are used.
+
+Per container there is one spawn-server, on a socket named for the container. Flatpak's `bwrap` and
+rootless podman are not yet handled: `bwrap` needs its argv translated to a proot bind list (a later
+change on this base), and rootless podman sets up a user namespace before any runtime, which proot
+cannot give.
+
 `--session` also starts `droidc login1`, a stand-in for `systemd-logind` on the system bus (one session,
 one seat, always active; `TakeDevice` and power operations refused), and sets `XDG_SESSION_ID=1` and
 `XDG_SEAT=seat0`.

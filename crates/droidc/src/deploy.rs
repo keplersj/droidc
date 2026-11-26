@@ -1380,6 +1380,12 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with("/root/current/rootfs"));
+        // under proot the launcher binds the guest droidc over sudo/su/pkexec (the spawner shims)
+        assert_eq!(
+            sp["shims"],
+            serde_json::json!(["/usr/bin/sudo", "/usr/bin/su", "/usr/bin/pkexec"])
+        );
+        assert_eq!(sp["binds"].as_array().unwrap().len(), 3);
         // reading through a different absolute path (as the guest does) works
         let alias = _d.path().join("alias");
         std::os::unix::fs::symlink(&root.path, &alias).unwrap();
@@ -1393,6 +1399,11 @@ mod tests {
         do_install(&root, &ld, "aaaa", image("A", "x"), LinkKind::Link2Symlink);
         let sp = serde_json::to_value(crate::status::shell_spec(&root, Launcher::Chroot).unwrap())
             .unwrap();
+        assert_eq!(
+            sp["shims"],
+            serde_json::json!([]),
+            "chroot keeps the real setuid sudo"
+        );
         let l = &sp["launcher"];
         assert_eq!(l["kind"], "chroot");
         assert_eq!(l["requires_root"], true);

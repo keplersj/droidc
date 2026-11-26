@@ -39,10 +39,10 @@ echo "$OUT" | grep -q 'CentOS Stream' || fail "proot cat"
 run_in /usr/bin/true || fail "proot true (hard-linked binary)"
 
 echo "== shell-spec"
-J shell-spec | jq -e '.ok and (.data.binds | length == 3)' >/dev/null || fail "shell-spec"
+J shell-spec | jq -e '.ok and (.data.binds | length == 3) and (.data.shims | index("/usr/bin/sudo"))' >/dev/null || fail "shell-spec"
 
 echo "== enter (root: namespaces + chroot, link2symlink chains via the root self-bind)"
-J shell-spec --launcher chroot | jq -e '.ok and .data.launcher.kind == "chroot" and (.data.binds | length == 4)' >/dev/null || fail "shell-spec chroot"
+J shell-spec --launcher chroot | jq -e '.ok and .data.launcher.kind == "chroot" and (.data.binds | length == 4) and (.data.shims | length == 0)' >/dev/null || fail "shell-spec chroot"
 OUT=$(sudo "$D" --root "$ROOT_REAL" enter --env FOO=bar -- /bin/sh -c 'echo "pid=$$ foo=$FOO"; cat /etc/os-release; ls /run/droidc/root/deployments; echo "ptmx=$(readlink /dev/ptmx) cg=$(cat /proc/self/cgroup)"; ls /dev')
 echo "$OUT" | grep -q 'pid=2 foo=bar' || fail "enter pid/env: $OUT"
 echo "$OUT" | grep -q 'CentOS Stream' || fail "enter os-release"

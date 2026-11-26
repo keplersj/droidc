@@ -26,6 +26,7 @@ pub mod platform;
 pub mod record;
 pub mod registry;
 pub mod session;
+pub mod spawn;
 pub mod status;
 pub mod supervise;
 pub mod unpack;
