@@ -1,0 +1,89 @@
+name: flatpak-probe
+
+# Report only: what works and what breaks for Flatpak (Bazaar) in Bluefin LTS under droidc, on an
+# arm64 runner with user namespaces turned off as on Android. The guest runs under proot as the
+# runner's uid, as Selkie runs it; `sudo` is droidc's shim, served by a host spawn-server running
+# proot -0. See tests/flatpak-probe.sh. Runs when either file changes or by hand.
+on:
+  push:
+    paths:
+      - ".github/workflows/flatpak-probe.yml"
+      - "tests/flatpak-probe.sh"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: image ref
+        default: ghcr.io/projectbluefin/bluefin-lts:stable
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 240
+    env:
+      IMAGE: ${{ inputs.ref || 'ghcr.io/projectbluefin/bluefin-lts:stable' }}
+      DROIDC_L2S_PREFIX: .proot.l2s.   # Ubuntu's proot is upstream proot-me
+      PROOT_NO_SECCOMP: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - run: pip install --break-system-packages ziglang==0.13.0 cargo-zigbuild
+      - run: cargo zigbuild --release --target aarch64-unknown-linux-musl -p droidc
+      - name: Free disk space, install proot
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift || true
+          sudo apt-get update -qq && sudo apt-get install -y jq proot >/dev/null
+          proot --version | head -3
+          df -h /
+      - name: Switch to Bluefin LTS (link2symlink)
+        run: |
+          B=$PWD/target/aarch64-unknown-linux-musl/release/droidc
+          R=/droidc-probe; sudo mkdir -p $R && sudo chown "$USER" $R
+          echo "B=$B" >> "$GITHUB_ENV"; echo "R=$R" >> "$GITHUB_ENV"
+          "$B" --root "$R" --json switch "$IMAGE" --links link2symlink | tee switch.ndjson | grep -v '"progress"' || true
+          tail -1 switch.ndjson | jq -e '.ok' >/dev/null
+      - name: Turn user namespaces off (as on Android)
+        run: |
+          sudo sysctl -w user.max_user_namespaces=0
+          unshare --user true && echo "unexpected: userns still works" || echo "userns off"
+      - name: Probe (proot as the runner uid, sudo over droidc's spawner)
+        run: |
+          SPEC=$("$B" --root "$R" --json shell-spec | tail -1)
+          ROOTFS=$(echo "$SPEC" | jq -r .data.rootfs)
+          W=$RUNNER_TEMP/guest; mkdir -p $W/tmp $W/run/user/$(id -u)
+          chmod 700 $W/run/user/$(id -u); chmod 1777 $W/tmp
+          cp tests/flatpak-probe.sh $W/tmp/probe.sh
+          # The runner uid is unknown to the image: add it, as Selkie does.
+          { cat "$ROOTFS/etc/passwd"; echo "selkie:x:$(id -u):$(id -g):Selkie:/root:/bin/bash"; } > $W/passwd
+          { cat "$ROOTFS/etc/group"; echo "selkie:x:$(id -g):"; } > $W/group
+          base=(proot --link2symlink -r "$ROOTFS" -w /root -b /dev -b /proc -b /sys -b /etc/resolv.conf
+                -b $W/tmp:/tmp -b $W/run:/run -b $W/passwd:/etc/passwd -b $W/group:/etc/group -b "$R:$R")
+          while read -r h g; do base+=(-b "$h:$g"); done < <(echo "$SPEC" | jq -r '.data.binds[] | "\(.host) \(.guest)"')
+          base+=(-b "$B:/usr/bin/droidc")
+          for s in $(echo "$SPEC" | jq -r '.data.shims[]'); do base+=(-b "$B:$s"); done
+          envs=(/usr/bin/env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/usr/sbin LANG=C.UTF-8
+                XDG_RUNTIME_DIR=/run/user/$(id -u) DROIDC_ROOT=/run/droidc/root DROIDC_SPAWNER=flatpak-probe)
+          # Fake root for sudo: the same guest with -0 (the spawner appends -w and the command).
+          root=(proot --link2symlink -0 "${base[@]:2}")
+          "$B" spawn-server --socket flatpak-probe --uid "$(id -u)" -- "${root[@]}" > spawner.log 2>&1 &
+          SPAWNER=$!
+          sleep 2
+          set +e
+          timeout 13000 "${base[@]}" "${envs[@]}" /bin/sh /tmp/probe.sh > probe.log 2>&1
+          echo "exit=$?"
+          set -e
+          kill $SPAWNER || true
+          { echo "### Flatpak under droidc (Bluefin LTS, arm64, proot, no userns)"; echo '```'; cat probe.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          cat probe.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: flatpak-probe
+          path: |
+            probe.log
+            spawner.log
+            switch.ndjson
