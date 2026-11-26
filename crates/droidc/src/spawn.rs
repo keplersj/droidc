@@ -216,17 +216,13 @@ fn staging_dir() -> Result<Staging> {
     Ok(Staging(dir))
 }
 
-/// A sandbox's command, the environment it needs set directly, and its staging directory.
-type SandboxCommand = (Vec<String>, Option<BTreeMap<String, String>>, Staging);
-
-/// The command for a `bwrap` request: a sibling proot over the sandbox's own root and binds, and the
-/// environment to give it when `/usr/bin/env` is not in the sandbox (`None`: it is, and the argv sets
-/// the environment).
+/// The command for a `bwrap` request (a sibling proot over the sandbox's own root and binds), the
+/// environment to start it with, and its staging directory.
 fn sandbox_argv(
     launcher: &[String],
     req: &Request,
     sb: &crate::bwrap::Sandbox,
-) -> Result<SandboxCommand> {
+) -> Result<(Vec<String>, BTreeMap<String, String>, Staging)> {
     let l = crate::bwrap::Launcher::parse(launcher)?;
     let staging = staging_dir()?;
     // A bind may only resolve to what the guest itself sees.
@@ -234,21 +230,15 @@ fn sandbox_argv(
     allowed.extend(l.binds.iter().map(|(h, _)| h.clone()));
     let plan = crate::bwrap::plan(&l, &sb.ops, &staging.0, &allowed)?;
     let mut argv = plan.argv(&l, &req.cwd, sb.root);
-    if plan.host("/usr/bin/env").exists() {
-        argv.push("/usr/bin/env".into());
-        argv.push("-i".into());
-        argv.extend(req.env.iter().map(|(k, v)| format!("{k}={v}")));
-        argv.extend(req.argv.iter().cloned());
-        Ok((argv, None, staging))
-    } else {
-        // proot's own settings still reach proot; the rest is the request's.
-        let mut env: BTreeMap<String, String> = std::env::vars()
-            .filter(|(k, _)| k.starts_with("PROOT_"))
-            .collect();
-        env.extend(req.env.clone());
-        argv.extend(req.argv.iter().cloned());
-        Ok((argv, Some(env), staging))
-    }
+    argv.extend(req.argv.iter().cloned());
+    // proot passes its environment to the command: the request's, plus proot's own settings (which
+    // the server has, as every proot it starts does). No `env -i` as for root commands: the sandbox
+    // need not have `/usr/bin/env`.
+    let mut env: BTreeMap<String, String> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("PROOT_"))
+        .collect();
+    env.extend(req.env.clone());
+    Ok((argv, env, staging))
 }
 
 fn run_request(
@@ -274,7 +264,7 @@ fn run_request(
                 return Err(Error::invalid("a sandbox descriptor below 3"));
             }
             let (argv, env, staging) = sandbox_argv(launcher, req, sb)?;
-            (argv, env, Some(staging))
+            (argv, Some(env), Some(staging))
         }
     };
     let (stdin, stdout, stderr) = (fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd());
@@ -804,7 +794,10 @@ mod tests {
             argv: vec![
                 "/bin/sh".into(),
                 "-c".into(),
-                "cat /hello; cat <&9; ls /tmp | wc -l; test -e /home || echo no-home; exit 4"
+                // Shell builtins only: some hosts' coreutils (uutils, one multicall binary) refuse
+                // to run under proot with the host as the rootfs.
+                "read -r a </hello; read -r b <&9; set -- /tmp/*; [ -e \"$1\" ] && n=1 || n=0; \
+                 [ -e /home ] && h=home || h=no-home; echo \"$a $b $n $h $PATH\"; exit 4"
                     .into(),
             ],
             cwd: "/".into(),
@@ -839,7 +832,7 @@ mod tests {
             serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
         let written = std::fs::read_to_string(out.path()).unwrap();
         assert_eq!(done["status"], 4, "{done} {written}");
-        assert_eq!(written, "data\nfd nine\n0\nno-home\n");
+        assert_eq!(written, "data fd nine 0 no-home /usr/bin:/bin\n");
         assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
     }
 }
