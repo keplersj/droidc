@@ -738,6 +738,10 @@ mod tests {
         };
         let staging = tempfile::tempdir().unwrap();
         std::env::set_var("DROIDC_SANDBOX_DIR", staging.path());
+        // proot 5.4's seccomp acceleration misses path translation on recent kernels (Ubuntu 26.04
+        // runners): the tracee then sees the host's root, not the sandbox's. The server passes
+        // PROOT_* on to the proot it starts, as Selkie's own settings are passed.
+        std::env::set_var("PROOT_NO_SECCOMP", "1");
         let name = format!("droidc-sandbox-test-{}", std::process::id());
         let launcher: Vec<String> = [
             proot.to_str().unwrap(),
