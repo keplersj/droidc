@@ -10,6 +10,7 @@ pub fn git_rev() -> Option<&'static str> {
 pub mod bridge;
 pub mod cgroups;
 pub mod deploy;
+pub mod displays;
 pub mod enter;
 pub mod error;
 pub mod etcmerge;

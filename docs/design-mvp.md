@@ -408,6 +408,13 @@ already set; once the session compositor's own `wayland-N` socket appears, droid
 `UpdateActivationEnvironment`, so D-Bus-activated apps open in the session, not on the host compositor.
 The session bus is the container's (see "One bus per container" below), shared with its terminals.
 
+Before the compositor starts, and again when the session ends, droidc clears what dead sessions left
+(#12): `wayland-N` sockets that refuse connections and whose `.lock` nobody holds (libwayland keeps an
+exclusive `flock` on it), `/tmp/.X11-unix/X<n>` sockets that refuse connections with their
+`/tmp/.X<n>-lock`, and `.mutter-Xwaylandauth.*` once no X display answers. Nothing is judged by pid:
+the guest shares Android's PID namespace, and Xwayland's own `kill(pid, 0)` check takes a reused pid
+for a live server, so each crashed session pushed the next to another display number.
+
 The session ends when the session compositor, the bridge or the given command exits; every service
 started for it is then stopped (TERM, then KILL after 3 s), and with `systemd --user` the session's
 target is stopped and `WAYLAND_DISPLAY` dropped from the manager's environment. The container's bus
