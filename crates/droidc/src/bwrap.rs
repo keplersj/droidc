@@ -627,11 +627,49 @@ pub fn plan(launcher: &Launcher, ops: &[Op], staging: &Path, allowed: &[PathBuf]
             }
         }
     }
-    let binds = order
-        .iter()
-        .map(|d| (mounts[d].clone(), d.clone()))
+    let mut binds: Vec<(PathBuf, String)> = l2s_targets(launcher)
+        .into_iter()
+        .filter(|(_, g)| !mounts.contains_key(g))
         .collect();
+    binds.extend(order.iter().map(|d| (mounts[d].clone(), d.clone())));
     Ok(Plan { root, binds })
+}
+
+/// Under `--link2symlink` a hard link is a symlink to an absolute host path next to the first link of
+/// its set, which can be anywhere in the guest (a bootc image's `/usr` links into
+/// `/sysroot/ostree/repo`, a Flatpak checkout into `/var/lib/flatpak/repo`). The guest resolves them
+/// because they sit under its rootfs; a sandbox that binds only `/usr` would not. So the guest's own
+/// trees are also bound at their host paths, where nothing in a sandbox looks.
+fn l2s_targets(launcher: &Launcher) -> Vec<(PathBuf, String)> {
+    if !launcher
+        .flags
+        .iter()
+        .any(|f| f == "--link2symlink" || f == "-l")
+    {
+        return Vec::new();
+    }
+    let system = |p: &Path| {
+        p == Path::new("/") || ["/dev", "/proc", "/sys"].iter().any(|s| p.starts_with(s))
+    };
+    let mut dirs: Vec<PathBuf> = std::iter::once(&launcher.rootfs)
+        .chain(launcher.binds.iter().map(|(h, _)| h))
+        .filter_map(|h| std::fs::canonicalize(h).ok())
+        .filter(|h| h.is_dir() && !system(h))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    let mut out: Vec<PathBuf> = Vec::new();
+    for d in dirs {
+        if !out.iter().any(|o| d.starts_with(o)) {
+            out.push(d);
+        }
+    }
+    out.into_iter()
+        .filter_map(|d| {
+            let g = d.to_str()?.to_string();
+            Some((d, g))
+        })
+        .collect()
 }
 
 /// The descriptors this process has open above stderr.
@@ -1022,7 +1060,18 @@ mod tests {
         ];
         let p = plan(&l, &ops, &staging, &allowed).unwrap();
         assert_eq!(p.root, staging.join("root"));
-        let dests: Vec<&str> = p.binds.iter().map(|(_, g)| g.as_str()).collect();
+        // --link2symlink: the guest's trees at their host paths first, for the chains
+        let canon = |p: PathBuf| std::fs::canonicalize(p).unwrap();
+        let l2s = [
+            canon(c.join("run")),
+            canon(c.join("var")),
+            canon(rootfs.clone()),
+        ];
+        let n = l2s.len();
+        for (b, want) in p.binds[..n].iter().zip(&l2s) {
+            assert_eq!((&b.0, b.1.as_str()), (want, want.to_str().unwrap()));
+        }
+        let dests: Vec<&str> = p.binds[n..].iter().map(|(_, g)| g.as_str()).collect();
         assert_eq!(
             dests,
             [
@@ -1035,20 +1084,23 @@ mod tests {
                 "/run"
             ]
         );
-        assert_eq!(p.binds[0].0, c.join("var/lib/flatpak/runtime/x/files"));
-        assert_eq!(p.binds[4].0, PathBuf::from("/proc"));
-        assert_eq!(p.binds[5].0, c.join("maxns"));
+        assert_eq!(p.binds[n].0, c.join("var/lib/flatpak/runtime/x/files"));
+        assert_eq!(p.binds[n + 4].0, PathBuf::from("/proc"));
+        assert_eq!(p.binds[n + 5].0, c.join("maxns"));
         assert_eq!(
             std::fs::read_link(staging.join("root/bin")).unwrap(),
             PathBuf::from("usr/bin")
         );
-        assert!(p.binds[1].0.join("sub").is_dir(), "--dir inside a tmpfs");
+        assert!(
+            p.binds[n + 1].0.join("sub").is_dir(),
+            "--dir inside a tmpfs"
+        );
         // mount points are made in the sandbox's own root, as bubblewrap makes them
         assert!(staging.join("root/usr").is_dir());
         assert!(staging.join("root/proc").is_dir());
         assert!(staging.join("root/.flatpak-info").is_file());
         assert!(staging.join("root/run/user/1000").is_dir());
-        assert_eq!(std::fs::read(&p.binds[3].0).unwrap(), b"x");
+        assert_eq!(std::fs::read(&p.binds[n + 3].0).unwrap(), b"x");
         // the runtime itself was not touched
         assert!(!c.join("var/lib/flatpak/runtime/x/files/new").exists());
         let argv = p.argv(&l, "/app", false);
@@ -1075,7 +1127,7 @@ mod tests {
             &allowed,
         )
         .unwrap();
-        let dests: Vec<&str> = p.binds.iter().map(|(_, g)| g.as_str()).collect();
+        let dests: Vec<&str> = p.binds[n..].iter().map(|(_, g)| g.as_str()).collect();
         assert_eq!(
             dests,
             [

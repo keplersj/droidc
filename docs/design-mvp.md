@@ -552,7 +552,12 @@ some to the app), and the spawn-server starts a sibling proot:
   their own. Each bind's guest source becomes a host path through the server's own launcher (its `-r`
   and innermost `-b`), and a bind of a guest directory carries the launcher's binds below it. A source
   that resolves (on the host, following links) outside the rootfs and the launcher's binds is refused.
-  A later mount at or above an earlier one hides it, as in bubblewrap.
+  A later mount at or above an earlier one hides it, as in bubblewrap. Mount points the sandbox owns are
+  made before the mount, as bubblewrap makes them.
+- Under `--link2symlink` a hard link is an absolute symlink to a host path next to the first link of its
+  set, anywhere in the guest (bootc's `/usr` links into `/sysroot/ostree/repo`, a Flatpak checkout into
+  `/var/lib/flatpak/repo`). So the rootfs and the launcher's directory binds are also bound at their
+  own host paths in the sandbox, where the chains resolve and nothing else looks.
 - The launcher's own flags are kept (`--kill-on-exit`, `--link2symlink`), `-0` only when the caller is
   (proot's) root, and descriptors are put back at their numbers. `--info-fd` gets the proot's pid,
   `--json-status-fd` the pid and the exit code, `--sync-fd` closes when the sandbox ends, and the
