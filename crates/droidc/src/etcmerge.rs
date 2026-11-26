@@ -103,6 +103,16 @@ fn read_full(f: &mut fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
     Ok(n)
 }
 
+/// An empty regular file with mode 000: what proot leaves where it binds a file the rootfs lacked.
+fn is_bind_placeholder(e: &Ent) -> bool {
+    match e {
+        Ent::File(p, 0) => fs::symlink_metadata(p)
+            .map(|m| m.len() == 0)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 /// Equality of two non-directory entries (None == None).
 fn same(a: &Ent, b: &Ent) -> bool {
     match (a, b) {
@@ -184,6 +194,13 @@ impl Merger {
             let (cop, col, cnp) = (op.map(|p| p.join(&n)), ol.join(&n), np.map(|p| p.join(&n)));
             let eop = stat(cop.clone());
             let eol = stat(Some(col.clone()));
+            // A file the image never had that is empty with mode 000 is proot's placeholder for a bind
+            // target (Selkie binds its own /etc/hostname): it is no local change, and unreadable anyway.
+            let eol = if matches!(eop, Ent::None) && is_bind_placeholder(&eol) {
+                Ent::None
+            } else {
+                eol
+            };
             let enp = stat(cnp.clone());
             let dst = out.join(&n);
             match (&eol, &enp) {
@@ -391,6 +408,24 @@ mod tests {
         assert_eq!(rd(&t.out, "olddir/f").unwrap(), "1");
         assert!(!t.out.join("cleandir").exists());
         assert_eq!(rd(&t.out, "f2d/inner").unwrap(), "i");
+    }
+
+    #[test]
+    fn proot_bind_placeholder_is_not_a_local_file() {
+        let t = t();
+        w(&t.op, "keep", "k", 0o644);
+        w(&t.ol, "keep", "k", 0o644);
+        // proot's placeholder for a bind target the image lacks: empty, mode 000, unreadable
+        w(&t.ol, "hostname", "", 0o000);
+        let st = merge(Some(&t.op), Some(&t.ol), &t.np, &t.out).unwrap();
+        assert!(!t.out.join("hostname").exists());
+        assert_eq!(st.kept_local, 0);
+        // a new image that ships the file gets its own
+        let t = super::tests::t();
+        w(&t.ol, "hostname", "", 0o000);
+        w(&t.np, "hostname", "img\n", 0o644);
+        merge(Some(&t.op), Some(&t.ol), &t.np, &t.out).unwrap();
+        assert_eq!(rd(&t.out, "hostname").unwrap(), "img\n");
     }
 
     #[test]
