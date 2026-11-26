@@ -264,6 +264,8 @@ fn run_request(
                 return Err(Error::invalid("a sandbox descriptor below 3"));
             }
             let (argv, env, staging) = sandbox_argv(launcher, req, sb)?;
+            // The spawner's own log: what a sandbox was started as, for when it fails.
+            eprintln!("droidc spawn-server: bwrap: {}", argv.join(" "));
             (argv, Some(env), Some(staging))
         }
     };

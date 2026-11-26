@@ -515,6 +515,45 @@ pub fn plan(launcher: &Launcher, ops: &[Op], staging: &Path, allowed: &[PathBuf]
             )))
         }
     };
+    // Like bubblewrap, a mount point the sandbox owns is created before the mount (an empty directory,
+    // or an empty file for a file), so the launcher never has to invent one. Only through real
+    // directories: a symlink on the way could lead anywhere on the host.
+    let point = |mounts: &BTreeMap<String, PathBuf>,
+                 owned: &[PathBuf],
+                 dest: &str,
+                 dir: bool|
+     -> Result<()> {
+        let host = host_of(mounts, dest);
+        let Some(base) = owned
+            .iter()
+            .filter(|o| host.starts_with(o))
+            .max_by_key(|o| o.as_os_str().len())
+        else {
+            return Ok(());
+        };
+        if fs::symlink_metadata(&host).is_ok() {
+            return Ok(());
+        }
+        let mut at = base.clone();
+        let rest: Vec<_> = host
+            .strip_prefix(base)
+            .unwrap_or(Path::new(""))
+            .components()
+            .collect();
+        for (i, c) in rest.iter().enumerate() {
+            at.push(c);
+            match fs::symlink_metadata(&at) {
+                Ok(m) if m.is_dir() => continue,
+                Ok(_) => return Ok(()),
+                Err(_) if i + 1 < rest.len() => fs::create_dir(&at).map_err(|e| io(&at, e))?,
+                Err(_) if dir => fs::create_dir(&at).map_err(|e| io(&at, e))?,
+                Err(_) => {
+                    fs::File::create(&at).map_err(|e| io(&at, e))?;
+                }
+            }
+        }
+        Ok(())
+    };
     for op in ops {
         let dest_of = |d: &str| {
             normalize(d).ok_or_else(|| Error::invalid(format!("bwrap: {d:?} is not absolute")))
@@ -526,6 +565,7 @@ pub fn plan(launcher: &Launcher, ops: &[Op], staging: &Path, allowed: &[PathBuf]
                 let dest = dest_of(dest)?;
                 let host = launcher.to_host(&src);
                 check(&host)?;
+                point(&mounts, &owned, &dest, host.is_dir())?;
                 mount(&mut mounts, &mut order, &dest, host);
                 for (h, r) in launcher.below(&src) {
                     let d = if dest == "/" {
@@ -540,6 +580,7 @@ pub fn plan(launcher: &Launcher, ops: &[Op], staging: &Path, allowed: &[PathBuf]
                 let dest = dest_of(dest)?;
                 let dir = fresh("tmpfs");
                 fs::create_dir_all(&dir).map_err(|e| io(&dir, e))?;
+                point(&mounts, &owned, &dest, true)?;
                 owned.push(dir.clone());
                 mount(&mut mounts, &mut order, &dest, dir);
             }
@@ -581,6 +622,7 @@ pub fn plan(launcher: &Launcher, ops: &[Op], staging: &Path, allowed: &[PathBuf]
                 let dest = dest_of(dest)?;
                 let file = fresh("data");
                 fs::write(&file, data).map_err(|e| io(&file, e))?;
+                point(&mounts, &owned, &dest, false)?;
                 mount(&mut mounts, &mut order, &dest, file);
             }
         }
@@ -1001,6 +1043,11 @@ mod tests {
             PathBuf::from("usr/bin")
         );
         assert!(p.binds[1].0.join("sub").is_dir(), "--dir inside a tmpfs");
+        // mount points are made in the sandbox's own root, as bubblewrap makes them
+        assert!(staging.join("root/usr").is_dir());
+        assert!(staging.join("root/proc").is_dir());
+        assert!(staging.join("root/.flatpak-info").is_file());
+        assert!(staging.join("root/run/user/1000").is_dir());
         assert_eq!(std::fs::read(&p.binds[3].0).unwrap(), b"x");
         // the runtime itself was not touched
         assert!(!c.join("var/lib/flatpak/runtime/x/files/new").exists());
