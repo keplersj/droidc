@@ -126,6 +126,17 @@ enum Cmd {
         )]
         cmd: Vec<String>,
     },
+    /// (inside the guest) keep the container's session bus or `systemd --user` for its supervisors
+    #[command(name = "user-services", hide = true)]
+    UserServices {
+        /// As `supervise --systemd`; the first to start the container's services decides
+        #[arg(long, value_enum, default_value_t = supervise::SystemdMode::Off)]
+        systemd: supervise::SystemdMode,
+        /// Keep running with no supervisors (the host stops it), instead of stopping after
+        /// DROIDC_USER_LINGER seconds (default 10)
+        #[arg(long)]
+        stay: bool,
+    },
     /// (inside the guest) show a headless session compositor on the host compositor
     Bridge {
         #[arg(long, default_value_t = 1280)]
@@ -154,6 +165,25 @@ enum Cmd {
     },
     /// (inside the guest) answer org.freedesktop.login1 on the system bus (stand-in for logind)
     Login1,
+    /// (on the host) run commands as fake root for the guest's sudo/su/pkexec shims
+    #[command(name = "spawn-server", hide = true)]
+    SpawnServer {
+        /// Abstract socket name the guest shims connect to (DROIDC_SPAWNER)
+        #[arg(long)]
+        socket: String,
+        /// Only serve this uid (default: our own)
+        #[arg(long)]
+        uid: Option<u32>,
+        /// The launcher to run, e.g. the proot argv with -0; the command is appended
+        #[arg(last = true, required = true)]
+        launcher: Vec<String>,
+    },
+    /// (inside the guest) ask the host spawner to run a command as root
+    #[command(name = "spawn", hide = true)]
+    Spawn {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        cmd: Vec<String>,
+    },
     /// Show or override how the graphical session starts (`show` when no subcommand is given)
     Session {
         #[command(subcommand)]
@@ -334,6 +364,9 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
             deploy::remove_container(&Root::with_container(&root.path, name)?, em)?,
         )),
         Cmd::Supervise { .. }
+        | Cmd::UserServices { .. }
+        | Cmd::SpawnServer { .. }
+        | Cmd::Spawn { .. }
         | Cmd::Bridge { .. }
         | Cmd::Login1
         | Cmd::Log { .. }
@@ -342,7 +375,31 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
     }
 }
 
+/// Run a guest sudo/su/pkexec/spawn shim and exit with the root command's status; 127 if it could
+/// not run. `name` is how the user invoked it, for the error.
+fn run_shim(name: &str, args: &[String]) -> i32 {
+    match droidc::spawn::client(name, args) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("{name}: {e}");
+            127
+        }
+    }
+}
+
 fn main() {
+    // Bound into the guest as /usr/bin/{sudo,su,pkexec} (shell-spec), so argv[0] names the shim; clap
+    // never sees these, and their own flags (-u, -c, ...) stay out of droidc's parser.
+    if let Some(shim) = std::env::args().next().and_then(|a0| {
+        std::path::Path::new(&a0)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| droidc::spawn::SHIMS.iter().any(|s| s.ends_with(*n)))
+            .map(String::from)
+    }) {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        std::process::exit(run_shim(&shim, &args));
+    }
     let cli = Cli::parse();
     // These own stdio (it belongs to the command they run): no NDJSON, errors on stderr, exit 127.
     let direct = match &cli.cmd {
@@ -370,6 +427,13 @@ fn main() {
                 systemd: *systemd,
             };
             Some(("supervise", supervise::supervise_with(cmd, &opts)))
+        }
+        Cmd::UserServices { systemd, stay } => {
+            let root = target(&cli).ok();
+            Some((
+                "user-services",
+                droidc::usersvc::run(*systemd, root.as_ref(), *stay),
+            ))
         }
         Cmd::Enter {
             binds,
@@ -435,6 +499,23 @@ fn main() {
                 1
             }
         });
+    }
+    if let Cmd::SpawnServer {
+        socket,
+        uid,
+        launcher,
+    } = &cli.cmd
+    {
+        match droidc::spawn::serve(socket, *uid, launcher) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("droidc spawn-server: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Cmd::Spawn { cmd } = &cli.cmd {
+        std::process::exit(run_shim("spawn", cmd));
     }
     if let Cmd::Login1 = &cli.cmd {
         match login1::run() {

@@ -418,11 +418,19 @@ gnome-shell 50 aborts without a connection), the `services`, then by renderer:
 The buses start without the host's `WAYLAND_DISPLAY` and with `XDG_SESSION_TYPE`/`XDG_CURRENT_DESKTOP`
 already set; once the session compositor's own `wayland-N` socket appears, droidc passes it to
 `UpdateActivationEnvironment`, so D-Bus-activated apps open in the session, not on the host compositor.
-A bus socket that already has a live listener (a terminal's supervisor next to the desktop) is shared,
-never replaced.
+The session bus is the container's (see "One bus per container" below), shared with its terminals.
+
+Before the compositor starts, and again when the session ends, droidc clears what dead sessions left
+(#12): `wayland-N` sockets that refuse connections and whose `.lock` nobody holds (libwayland keeps an
+exclusive `flock` on it), `/tmp/.X11-unix/X<n>` sockets that refuse connections with their
+`/tmp/.X<n>-lock`, and `.mutter-Xwaylandauth.*` once no X display answers. Nothing is judged by pid:
+the guest shares Android's PID namespace, and Xwayland's own `kill(pid, 0)` check takes a reused pid
+for a live server, so each crashed session pushed the next to another display number.
 
 The session ends when the session compositor, the bridge or the given command exits; every service
-and bus started for it is then stopped (TERM, then KILL after 3 s). Both buses are `dbus-daemon`
+started for it is then stopped (TERM, then KILL after 3 s), and with `systemd --user` the session's
+target is stopped and `WAYLAND_DISPLAY` dropped from the manager's environment. The container's bus
+and user manager stay for its other supervisors. Both buses are `dbus-daemon`
 when the image has it (it activates `.service` files itself, which dbus-broker can't do without
 systemd), else `dbus-broker-launch` socket-activated as below.
 
@@ -438,12 +446,40 @@ image for `screencast`: `gst-launch-1.0` with the PipeWire plugin, `pw-link`, an
 
 ## `supervise`
 
-`droidc supervise -- cmd...` runs inside the guest: creates `XDG_RUNTIME_DIR` (0700) if needed, starts
-a session bus and exports `DBUS_SESSION_BUS_ADDRESS`, runs `cmd` as a child, reaps all children and
-exits with the command's status (the command always runs, even if no bus could be started).
+`droidc supervise -- cmd...` runs inside the guest: creates `XDG_RUNTIME_DIR` (0700) if needed, joins
+the container's session bus and exports `DBUS_SESSION_BUS_ADDRESS`, runs `cmd` as a child, reaps all
+children and exits with the command's status (the command runs even if no bus could be started).
 It marks itself a child subreaper first: under proot the guest has no PID 1, so orphaned daemons
-would otherwise go to the host's init and never be seen to exit. The bus is `dbus-daemon --nofork` (session configuration)
-when the image has it (Bluefin LTS does), kept as a child so it stops with the supervisor. Images with
+would otherwise go to the host's init and never be seen to exit.
+
+### One bus per container (`droidc user-services`)
+
+Every supervisor in a container (each terminal, the desktop) uses the same session bus, or the same
+`systemd --user` with `--systemd`. It belongs to a keeper, `droidc user-services`, not to whichever
+supervisor came first, so a terminal's bus no longer dies with the desktop (#8):
+
+- Each supervisor holds a shared `flock` on `$XDG_RUNTIME_DIR/droidc/lease` while it runs. The keeper
+  holds `droidc/keeper.lock` exclusively and writes `droidc/state.json` (`bus`, `systemd`,
+  `system_bus`) once the bus answers. Locks go with their holder, so nothing depends on pids, which
+  Android reuses.
+- A supervisor that finds no keeper starts one (in its own session, output in
+  `droidc/user-services.log`, or on ours with `DROIDC_SYSTEMD_STDIO=inherit`) and waits for its state.
+  The first keeper's `--systemd` decides for the container; `--systemd=on` against a container already
+  running without systemd is an error.
+- The keeper stops its services once no supervisor has held the lease for `DROIDC_USER_LINGER` seconds
+  (10). It decides while holding the lease exclusively and lets go of `keeper.lock` first, so a
+  supervisor arriving meanwhile waits and then starts a fresh keeper, never joins a leaving one.
+- A bus or user manager that exits is started again on the same socket (backoff from 1 s to 30 s).
+  The published address has no `guid`, so it stays valid across a restart.
+- An inherited `DBUS_SESSION_BUS_ADDRESS` is used only if it answers; a dead one is dropped.
+- Under proot the keeper is tied to the proot that started it: proot waits for everything it traces,
+  or with `--kill-on-exit` (Selkie) kills the keeper when the session that started it ends. A host
+  running a proot per session should start `droidc user-services --stay` in a proot
+  of its own, stop it when the container's last session ends, and give the sessions
+  `DROIDC_USER_SERVICES_WAIT` (seconds to wait for that keeper before starting one themselves).
+
+The bus is `dbus-daemon --nofork` (session configuration)
+when the image has it (Bluefin LTS does). Images with
 only `dbus-broker` (CentOS Stream 10 bootc) get socket activation done by droidc: bind+listen
 `$XDG_RUNTIME_DIR/bus`, spawn `dbus-broker-launch --scope user` with that socket as fd 3 and
 `LISTEN_FDS=1`, `LISTEN_FDNAMES=dbus.socket`, `LISTEN_PID=<broker pid>` (set by a tiny `sh -c ... exec`
@@ -470,7 +506,8 @@ musl process stops it from starting. Programs that open netlink themselves (`ip`
 
 bootc images are systemd images, and GNOME depends on `systemd --user` (session services,
 `org.freedesktop.systemd1` for dbus-broker activation and app scopes). With `--systemd=on`,
-supervise runs the image's own `/usr/lib/systemd/systemd --user` instead of a bare bus:
+the container's keeper runs the image's own `/usr/lib/systemd/systemd --user` instead of a bare bus,
+with the system bus and `droidc login1` its units expect:
 
 - `/usr/lib/droidc/cgshim.so` (`DROIDC_CGSHIM`; `crates/cgshim`, built against glibc for the guest's
   arch) is preloaded into it. systemd refuses to start without a writable cgroup2 tree, and an app
@@ -478,7 +515,7 @@ supervise runs the image's own `/usr/lib/systemd/systemd --user` instead of a ba
   bind it after `/sys`) look like cgroup2 (statfs magic, `/proc/<pid>/cgroup`, the `cgroup.*` files on
   `mkdir`, `rmdir`, append-mode `cgroup.procs`) and makes systemd 257's `posix_spawn(SETCGROUP)` a
   plain spawn followed by a `cgroup.procs` write.
-- supervise creates `/run/systemd/system` (systemd's `sd_booted()` test), a journal socket stand-in,
+- the keeper creates `/run/systemd/system` (systemd's `sd_booted()` test), a journal socket stand-in,
   and runs `cgroups.rs`: a poller that does what the kernel would, keeping `cgroup.procs` and
   `cgroup.events` (`populated`) current and honouring `cgroup.kill`. Membership comes from the pids
   systemd appends, forks, and `INVOCATION_ID` for orphans. Without it a finished unit never ends.
@@ -489,6 +526,33 @@ supervise runs the image's own `/usr/lib/systemd/systemd --user` instead of a ba
 
 `DROIDC_JOURNAL=stderr` prints what reaches the stand-in journal sockets; `DROIDC_LOGCAT=auto|debug|info|warn|error`
 forwards it to Android's log ([`android-integration.md`](android-integration.md)).
+
+## Root in the guest (`spawn`, the sudo/su/pkexec shims)
+
+`sudo`, `su` and `pkexec` fail under proot like a broken image: the setuid bit does nothing, so they
+cannot become root (Selkie #9). A shim inside the guest cannot fix that by starting a second proot
+itself, because the guest is already traced by proot and proot is not in the image. So droidc splits
+it across the proot boundary:
+
+- `droidc spawn-server --socket NAME --uid U -- <launcher...>` runs on the host (Selkie starts it with
+  the container's own proot argv plus `-0`). It listens on the abstract socket `NAME`, checks each
+  caller's uid (any app can reach an abstract socket), and for each request starts the launcher — a
+  second proot in the same container, as fake root — running the requested command.
+- In the guest, `/usr/bin/sudo`, `/usr/bin/su` and `/usr/bin/pkexec` are the guest droidc,
+  dispatched by `argv[0]`: `shell-spec` lists them under `shims` (proot only), and the launcher binds
+  its guest droidc over each, as it binds `/usr/bin/droidc`. The shim parses the usual options, connects to
+  `$DROIDC_SPAWNER`, passes its own stdin/stdout/stderr over the socket (`SCM_RIGHTS`) so the root
+  command shares the terminal, and exits with its status. Terminal signals are forwarded.
+- The request carries only a command, a working directory and an environment (the caller's, minus
+  what `sudo` drops — `LD_PRELOAD` and the like — with root's `HOME`/`USER`). The rootfs, the binds
+  and the `-0` are the server's: the guest never chooses them. Only root is offered (`-u root`).
+- This is proot's fake root, as DroidDeck already uses, not real privilege: nothing escapes the app's
+  uid. On chroot (real root) the shims are not bound, so the image's own setuid binaries are used.
+
+Per container there is one spawn-server, on a socket named for the container. Flatpak's `bwrap` and
+rootless podman are not yet handled: `bwrap` needs its argv translated to a proot bind list (a later
+change on this base), and rootless podman sets up a user namespace before any runtime, which proot
+cannot give.
 
 `--session` also starts `droidc login1`, a stand-in for `systemd-logind` on the system bus (one session,
 one seat, always active; `TakeDevice` and power operations refused), and sets `XDG_SESSION_ID=1` and

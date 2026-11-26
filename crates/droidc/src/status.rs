@@ -130,6 +130,10 @@ pub struct ShellSpec {
     /// The graphical session (see `session::describe`).
     pub session: Value,
     pub launcher: LauncherSpec,
+    /// Guest paths the launcher binds its guest droidc over (as it binds `/usr/bin/droidc`): the
+    /// `sudo`/`su`/`pkexec` shims, which ask the host spawner for a root command. Only under proot;
+    /// chroot has a real root path, and binding over a setuid binary there would disable the real thing.
+    pub shims: Vec<String>,
 }
 
 fn fs_mount(fstype: &str, guest: &str, options: &str) -> Mount {
@@ -219,6 +223,12 @@ pub fn shell_spec(root: &Root, launcher: Launcher) -> Result<ShellSpec> {
         bind(format!("{c}/home"), "/home"),
         bind(r.clone(), "/run/droidc/root"),
     ];
+    // The guest droidc lives at a host path only the launcher knows (Selkie's libdroidc-guest.so), so
+    // the shims are listed for it to bind rather than bound here.
+    let shims = match launcher {
+        Launcher::Proot => crate::spawn::SHIMS.iter().map(|s| s.to_string()).collect(),
+        Launcher::Chroot => Vec::new(),
+    };
     let launcher = match launcher {
         Launcher::Proot => LauncherSpec::Proot {
             requires_root: false,
@@ -276,5 +286,6 @@ pub fn shell_spec(root: &Root, launcher: Launcher) -> Result<ShellSpec> {
         ),
         session_label: record.session_label,
         launcher,
+        shims,
     })
 }
