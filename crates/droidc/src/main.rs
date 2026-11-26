@@ -126,6 +126,17 @@ enum Cmd {
         )]
         cmd: Vec<String>,
     },
+    /// (inside the guest) keep the container's session bus or `systemd --user` for its supervisors
+    #[command(name = "user-services", hide = true)]
+    UserServices {
+        /// As `supervise --systemd`; the first to start the container's services decides
+        #[arg(long, value_enum, default_value_t = supervise::SystemdMode::Off)]
+        systemd: supervise::SystemdMode,
+        /// Keep running with no supervisors (the host stops it), instead of stopping after
+        /// DROIDC_USER_LINGER seconds (default 10)
+        #[arg(long)]
+        stay: bool,
+    },
     /// (inside the guest) show a headless session compositor on the host compositor
     Bridge {
         #[arg(long, default_value_t = 1280)]
@@ -334,6 +345,7 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
             deploy::remove_container(&Root::with_container(&root.path, name)?, em)?,
         )),
         Cmd::Supervise { .. }
+        | Cmd::UserServices { .. }
         | Cmd::Bridge { .. }
         | Cmd::Login1
         | Cmd::Log { .. }
@@ -370,6 +382,13 @@ fn main() {
                 systemd: *systemd,
             };
             Some(("supervise", supervise::supervise_with(cmd, &opts)))
+        }
+        Cmd::UserServices { systemd, stay } => {
+            let root = target(&cli).ok();
+            Some((
+                "user-services",
+                droidc::usersvc::run(*systemd, root.as_ref(), *stay),
+            ))
         }
         Cmd::Enter {
             binds,

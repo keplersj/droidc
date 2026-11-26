@@ -277,6 +277,10 @@ pub fn fsync_dir(p: &Path) {
     }
 }
 
+/// How often, and how far apart, [`RootLock::acquire`] tries a busy lock before giving up.
+const LOCK_TRIES: u32 = 10;
+const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Exclusive advisory lock on `<root>/lock`, held until dropped.
 pub struct RootLock {
     _file: File,
@@ -291,14 +295,24 @@ impl RootLock {
             .write(true)
             .open(root.lock_path())
             .context("open lock file")?;
-        match rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(RootLock { _file: f }),
-            Err(e) if e == rustix::io::Errno::WOULDBLOCK => Err(Error::new(
-                ErrorKind::Locked,
-                "another droidc command holds the root lock",
-            )),
-            Err(e) => Err(Error::internal(format!("flock: {e}"))),
+        // A lock that was just released can still be held for a moment by a child forked while it
+        // was taken: the child shares the open file until it execs. So give a busy lock a short
+        // grace before calling it held by another command.
+        for attempt in 0..LOCK_TRIES {
+            match rustix::fs::flock(&f, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => return Ok(RootLock { _file: f }),
+                Err(e) if e == rustix::io::Errno::WOULDBLOCK => {
+                    if attempt + 1 < LOCK_TRIES {
+                        std::thread::sleep(LOCK_RETRY);
+                    }
+                }
+                Err(e) => return Err(Error::internal(format!("flock: {e}"))),
+            }
         }
+        Err(Error::new(
+            ErrorKind::Locked,
+            "another droidc command holds the root lock",
+        ))
     }
 }
 
