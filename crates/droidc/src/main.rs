@@ -151,13 +151,12 @@ enum Cmd {
         /// Write one frame as PNG and exit (no host compositor needed)
         #[arg(long)]
         dump_frame: Option<PathBuf>,
+        /// Monitor scale factor (e.g. 1.5 for 150%)
+        #[arg(long, default_value_t = 0.0)]
+        scale: f64,
         /// Seconds to wait for the session compositor's ScreenCast service
         #[arg(long, default_value_t = 120)]
         timeout: u64,
-        /// Monitor scale to set first (closest supported; 0 leaves it alone). The user's saved
-        /// GNOME display settings for this monitor and size win over it.
-        #[arg(long, default_value_t = 0.0)]
-        scale: f64,
     },
     /// (inside the guest) stream the guest's sound as raw S16LE PCM on stdout, from a PipeWire sink
     /// made the default; status goes to stderr
@@ -178,16 +177,6 @@ enum Cmd {
         #[arg(long, default_value_t = 60)]
         timeout: u64,
     },
-    /// (inside the guest) the guest's MPRIS media players as JSON lines on stdout, one each time
-    /// they change; commands such as `play-pause <player>` on stdin
-    Media {
-        /// Seconds to wait for the session bus
-        #[arg(long, default_value_t = 60)]
-        timeout: u64,
-        /// Milliseconds between re-reads when no signal arrives
-        #[arg(long, default_value_t = 2000)]
-        poll: u64,
-    },
     /// Write one message to Android's log (logcat), from the guest or the host
     Log {
         /// debug, info, warn or error
@@ -204,6 +193,11 @@ enum Cmd {
     /// (appearance), requests out on stdout; status goes to stderr
     #[command(name = "host-link")]
     HostLink,
+    /// (inside the guest) open a web, mail, phone, sms or map link on Android, through the host link
+    Open {
+        /// The link, e.g. https://example.org or mailto:someone@example.org
+        uri: String,
+    },
     /// (inside the guest) answer org.freedesktop.PolicyKit1 on the system bus (stand-in for polkitd)
     Polkit,
     /// (on the host) run commands as fake root for the guest's sudo/su/pkexec shims
@@ -412,9 +406,9 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
         | Cmd::Spawn { .. }
         | Cmd::Bridge { .. }
         | Cmd::AudioOut { .. }
-        | Cmd::Media { .. }
         | Cmd::Login1
         | Cmd::HostLink
+        | Cmd::Open { .. }
         | Cmd::Polkit
         | Cmd::Log { .. }
         | Cmd::Enter { .. }
@@ -520,17 +514,17 @@ fn main() {
         height,
         connector,
         dump_frame,
-        timeout,
         scale,
+        timeout,
     } = &cli.cmd
-    {
+{
         let opts = bridge::Opts {
             width: *width,
             height: *height,
             connector: connector.clone(),
             dump_frame: dump_frame.clone(),
-            timeout: std::time::Duration::from_secs(*timeout),
             scale: *scale,
+            timeout: std::time::Duration::from_secs(*timeout),
         };
         match bridge::run(&opts) {
             Ok(code) => std::process::exit(code),
@@ -559,19 +553,6 @@ fn main() {
             Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("droidc audio-out: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
-    if let Cmd::Media { timeout, poll } = &cli.cmd {
-        let opts = droidc::media::Opts {
-            timeout: std::time::Duration::from_secs(*timeout),
-            poll: std::time::Duration::from_millis(*poll),
-        };
-        match droidc::media::run(&opts) {
-            Ok(code) => std::process::exit(code),
-            Err(e) => {
-                eprintln!("droidc media: {e}");
                 std::process::exit(1);
             }
         }
@@ -606,6 +587,15 @@ fn main() {
     }
     if let Cmd::Spawn { cmd } = &cli.cmd {
         std::process::exit(run_shim("spawn", cmd));
+    }
+    if let Cmd::Open { uri } = &cli.cmd {
+        match droidc::open::open(uri) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("droidc open: {e}");
+                std::process::exit(1);
+            }
+        }
     }
     if let Cmd::HostLink = &cli.cmd {
         match droidc::host_link::run() {

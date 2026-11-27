@@ -9,6 +9,7 @@ pub fn git_rev() -> Option<&'static str> {
 
 pub mod apps;
 pub mod audio;
+pub mod awake;
 pub mod bridge;
 pub mod bwrap;
 pub mod cgroups;
@@ -25,10 +26,11 @@ pub mod layout;
 pub mod link;
 pub mod logcat;
 pub mod login1;
-pub mod media;
+pub mod network;
+pub mod open;
 pub mod ownership;
-pub mod platform;
 pub mod polkit;
+pub mod platform;
 pub mod record;
 pub mod registry;
 pub mod session;
@@ -36,5 +38,6 @@ pub mod spawn;
 pub mod status;
 pub mod supervise;
 pub mod unpack;
+pub mod upower;
 pub mod usersvc;
 pub mod verify_glue;
