@@ -346,7 +346,7 @@ impl<'a> Unpacker<'a> {
                     }
                     Err(_) => fs::create_dir(&path).context(path.display())?,
                 }
-                fs::set_permissions(&path, fs::Permissions::from_mode((mode & 0o777) | 0o700))
+                fs::set_permissions(&path, fs::Permissions::from_mode((mode & 0o1777) | 0o700))
                     .context(path.display())?;
                 self.meta.insert(rel, mk("d", None));
             }
@@ -583,6 +583,8 @@ pub mod tests {
             .file("usr/bin/su", 0o4755, b"bin")
             .file("usr/secret", 0o000, b"s")
             .symlink("bin", "usr/bin")
+            .dir("var/", 0o755)
+            .dir("var/tmp/", 0o1777)
             .bytes();
         let (_d, root, meta, _) = unpack(vec![l], LinkKind::Hardlink);
         assert_eq!(
@@ -607,6 +609,11 @@ pub mod tests {
         assert_eq!(
             fs::read_link(root.join("bin")).unwrap(),
             PathBuf::from("usr/bin")
+        );
+        // the sticky bit is kept on directories (/var/tmp)
+        assert_eq!(
+            fs::metadata(root.join("var/tmp")).unwrap().mode() & 0o7777,
+            0o1777
         );
         assert!(meta.contains_key("usr/etc/os-release"));
         assert!(!meta.contains_key("etc/os-release"));

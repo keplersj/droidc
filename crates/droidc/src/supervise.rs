@@ -22,6 +22,24 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+/// Directories everyone may write and only owners may delete from, as on any Linux host.
+const TMP_DIRS: [&str; 3] = ["/tmp", "/var/tmp", "/dev/shm"];
+
+/// Give each existing directory mode `1777`. Older droidc dropped the sticky bit on `/var/tmp`
+/// when unpacking, and the launcher's binds for `/tmp` and `/dev/shm` are made with whatever mode
+/// the host gave them; ssh, tmux and temp-dir checks refuse a `/tmp` that isn't `1777`.
+/// Best effort: a directory we can't change is left as it is.
+fn shared_tmp_dirs(dirs: &[&std::path::Path]) {
+    for d in dirs {
+        let Ok(md) = fs::metadata(d) else { continue };
+        if md.is_dir() && md.permissions().mode() & 0o7777 != 0o1777 {
+            if let Err(e) = fs::set_permissions(d, fs::Permissions::from_mode(0o1777)) {
+                eprintln!("warn: could not make {} mode 1777: {e}", d.display());
+            }
+        }
+    }
+}
+
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
     std::env::split_paths(&path)
@@ -1096,6 +1114,7 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
     // Before anything is started (and before any thread): every child inherits it, the
     // container's user services included when this supervisor is the one that starts them.
     preload_ifshim();
+    shared_tmp_dirs(&TMP_DIRS.map(std::path::Path::new));
     if let Some(spec) = &spec {
         std::env::set_var("XDG_SESSION_TYPE", "wayland");
         if let Some(n) = &spec.name {
@@ -1451,6 +1470,25 @@ pub(crate) static CHILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tmp_dirs_become_1777() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (d.path().join("tmp"), d.path().join("var-tmp"));
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o722)).unwrap();
+        fs::set_permissions(&b, fs::Permissions::from_mode(0o777)).unwrap();
+        let missing = d.path().join("missing");
+        shared_tmp_dirs(&[&a, &b, &missing]);
+        for p in [&a, &b] {
+            assert_eq!(
+                fs::metadata(p).unwrap().permissions().mode() & 0o7777,
+                0o1777
+            );
+        }
+        assert!(!missing.exists());
+    }
 
     #[test]
     fn preload_prepends_once() {
