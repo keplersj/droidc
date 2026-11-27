@@ -206,6 +206,41 @@ fn links_opened_in_the_guest_reach_the_host() {
     }
     assert!(percent.ends_with("61"), "Percentage: {percent:?}");
 
+    // Network: a metered connection reaches GLib's network monitor as NetworkManager's `Metered`.
+    {
+        let stdin = link.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"kind":"network","connected":true,"validated":true,"metered":true,"transport":"cellular"}}"#
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+    }
+    let mut metered = String::new();
+    for _ in 0..50 {
+        let Ok(o) = Command::new("dbus-send")
+            .args([
+                &format!("--bus={}", bus.address),
+                "--print-reply=literal",
+                "--dest=org.freedesktop.NetworkManager",
+                "/org/freedesktop/NetworkManager",
+                "org.freedesktop.DBus.Properties.Get",
+                "string:org.freedesktop.NetworkManager",
+                "string:Metered",
+            ])
+            .output()
+        else {
+            metered = "uint32 1".into();
+            break;
+        };
+        metered = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if metered.ends_with("uint32 1") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(metered.ends_with("uint32 1"), "Metered: {metered:?}");
+
     drop(link.stdin.take());
     assert!(link.wait().unwrap().success());
 
