@@ -1,7 +1,7 @@
 name: flatpak-probe
 
 # Report only: what works and what breaks for Flatpak (Bazaar) in Bluefin LTS under droidc, on an
-# arm64 runner with user namespaces turned off as on Android. The guest runs under proot as the
+# x86_64 runner with user namespaces turned off as on Android. The guest runs under proot as the
 # runner's uid, as Selkie runs it; `sudo` is droidc's shim, served by a host spawn-server running
 # proot -0. See tests/flatpak-probe.sh. Runs when either file changes or by hand.
 on:
@@ -21,9 +21,10 @@ permissions:
 jobs:
   # Selkie's own proot (Termux's fork plus Selkie's patch set), built for the runner: Ubuntu's
   # upstream proot fails link2symlink for linkat() of an O_TMPFILE, which Flatpak's repo needs.
-  # Built on 24.04: proot's compat.h redefines SYS_SECCOMP, which 26.04's glibc headers declare.
+  # x86_64 and 24.04: the script's host build has no arm64 32-bit loader, and 26.04's glibc headers
+  # clash with proot's SYS_SECCOMP.
   proot:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -37,7 +38,7 @@ jobs:
 
   probe:
     needs: proot
-    runs-on: ubuntu-26.04-arm
+    runs-on: ubuntu-24.04
     timeout-minutes: 240
     env:
       IMAGE: ${{ inputs.ref || 'ghcr.io/projectbluefin/bluefin-lts:stable' }}
@@ -46,9 +47,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
-          targets: aarch64-unknown-linux-musl
+          targets: x86_64-unknown-linux-musl
       - run: pip install --break-system-packages ziglang==0.13.0 cargo-zigbuild
-      - run: cargo zigbuild --release --target aarch64-unknown-linux-musl -p droidc
+      - run: cargo zigbuild --release --target x86_64-unknown-linux-musl -p droidc
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: selkie-proot
@@ -64,7 +65,7 @@ jobs:
           df -h /
       - name: Switch to Bluefin LTS (link2symlink)
         run: |
-          B=$PWD/target/aarch64-unknown-linux-musl/release/droidc
+          B=$PWD/target/x86_64-unknown-linux-musl/release/droidc
           R=/droidc-probe; sudo mkdir -p $R && sudo chown "$USER" $R
           echo "B=$B" >> "$GITHUB_ENV"; echo "R=$R" >> "$GITHUB_ENV"
           "$B" --root "$R" --json switch "$IMAGE" --links link2symlink | tee switch.ndjson | grep -v '"progress"' || true
@@ -103,7 +104,7 @@ jobs:
           cat probe.log
           set -e
           kill $SPAWNER || true
-          { echo "### Flatpak under droidc (Bluefin LTS, arm64, proot, no userns)"; echo '```'; cat probe.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "### Flatpak under droidc (Bluefin LTS, x86_64, Selkie proot, no userns)"; echo '```'; cat probe.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           tail -n 3 probe.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
