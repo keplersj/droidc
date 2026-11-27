@@ -24,7 +24,6 @@ jobs:
     timeout-minutes: 240
     env:
       IMAGE: ${{ inputs.ref || 'ghcr.io/projectbluefin/bluefin-lts:stable' }}
-      DROIDC_L2S_PREFIX: .proot.l2s.   # Ubuntu's proot is upstream proot-me
       PROOT_NO_SECCOMP: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -33,10 +32,19 @@ jobs:
           targets: aarch64-unknown-linux-musl
       - run: pip install --break-system-packages ziglang==0.13.0 cargo-zigbuild
       - run: cargo zigbuild --release --target aarch64-unknown-linux-musl -p droidc
-      - name: Free disk space, install proot
+      # Selkie's own proot (Termux's fork plus Selkie's patch set), built for the runner: Ubuntu's
+      # upstream proot fails link2symlink for linkat() of an O_TMPFILE, which Flatpak's repo needs.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: keplersj/selkie
+          path: selkie
+      - name: Free disk space, build Selkie's proot
         run: |
           sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift || true
-          sudo apt-get update -qq && sudo apt-get install -y jq proot >/dev/null
+          sudo apt-get update -qq && sudo apt-get install -y jq lld >/dev/null
+          selkie/third_party/proot/build.sh "$RUNNER_TEMP/proot" host
+          sudo install -m 755 "$RUNNER_TEMP/proot/proot" /usr/local/bin/proot
+          echo "PROOT_LOADER=$RUNNER_TEMP/proot/proot-loader" >> "$GITHUB_ENV"
           proot --version | head -3
           df -h /
       - name: Switch to Bluefin LTS (link2symlink)
@@ -51,6 +59,7 @@ jobs:
           sudo sysctl -w user.max_user_namespaces=0
           unshare --user true && echo "unexpected: userns still works" || echo "userns off"
       - name: Probe (proot as the runner uid, sudo over droidc's spawner)
+        timeout-minutes: 170
         run: |
           SPEC=$("$B" --root "$R" --json shell-spec | tail -1)
           ROOTFS=$(echo "$SPEC" | jq -r .data.rootfs)
@@ -73,8 +82,10 @@ jobs:
           SPAWNER=$!
           sleep 2
           set +e
-          timeout 9000 "${base[@]}" "${envs[@]}" /bin/sh /tmp/probe.sh 2>&1 | tee probe.log
+          # To a file, not a pipe: daemons the probe starts keep a pipe open after it ends.
+          timeout -k 30 9000 "${base[@]}" "${envs[@]}" /bin/sh /tmp/probe.sh > probe.log 2>&1
           echo "exit=$?"
+          cat probe.log
           set -e
           kill $SPAWNER || true
           { echo "### Flatpak under droidc (Bluefin LTS, arm64, proot, no userns)"; echo '```'; cat probe.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
