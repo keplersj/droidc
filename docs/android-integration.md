@@ -55,7 +55,8 @@ Value for effort, cheapest first. "Code" names where it would attach in the curr
 | 9 | **File chooser** | storage access framework | `FileChooser` portal returning fds; `xdg-user-dirs` bound to shared storage (Selkie) | C |
 | 10 | **Brightness, sensors, location, haptics** | `SensorManager`, `LocationManager`, `Vibrator` | `login1` `SetBrightness` (refused today), `iio-sensor-proxy` (auto-rotate, ambient light), GeoClue (Weather, Maps, automatic time zone), `feedbackd` | B |
 | 11 | **App launcher** | launcher shortcuts | `droidc apps --json`: read the deployment's `.desktop` files (name, icon path, categories, `NoDisplay`) with no guest process, so Selkie can list and launch guest apps | new, host side |
-| 12 | **Clipboard, IME, audio** | `ClipboardManager`, IME, AAudio | belong to Selkie's compositor and audio path, not droidc | out of scope |
+| 12 | **Media controls** | `MediaSession` (lock screen, shade, headset buttons; later Android Auto) | `droidc media`: watch the guest's MPRIS players on its session bus, JSON lines out, `play-pause <player>` and the like in (**done**) | `media.rs` |
+| 13 | **Clipboard, IME, audio** | `ClipboardManager`, IME, AAudio | belong to Selkie's compositor and audio path, not droidc | out of scope |
 
 Items 2 to 4 are what makes a session feel native and most are read-only or one-way, so start there.
 
