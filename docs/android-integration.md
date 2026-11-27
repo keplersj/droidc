@@ -45,7 +45,7 @@ Value for effort, cheapest first. "Code" names where it would attach in the curr
 | # | What | Android side | Guest side (layer) | Code |
 | --- | --- | --- | --- | --- |
 | 1 | **Logs** | logd | journal sockets → `adb logcat` (**done**, `DROIDC_LOGCAT`) | `journal.rs`, `logcat.rs` |
-| 2 | **Appearance, locale, time zone, hostname** | night mode, font scale, animation scale, `Locale`, `TimeZone`, device name | `org.freedesktop.portal.Settings` (color scheme, contrast, reduced motion, text scale); `timedate1`, `localed`, `hostname1` stand-ins (GNOME Settings and `gsd-datetime` ask them); `TZ`/`LANG` in the `shell-spec` env (today fixed to `C.UTF-8`, no `TZ`) | B/C, `status.rs` |
+| 2 | **Appearance, locale, time zone, hostname** | night mode, accent, font scale, animation scale, contrast, `Locale`, `TimeZone`, device name | `droidc host-link`: an `appearance` line sets GNOME's `color-scheme`, `accent-color`, `text-scaling-factor`, `enable-animations` and `high-contrast` (**appearance done**), which the GNOME portal hands on as `org.freedesktop.portal.Settings`; still open: `timedate1`, `localed`, `hostname1` stand-ins (GNOME Settings and `gsd-datetime` ask them); `TZ`/`LANG` in the `shell-spec` env (today fixed to `C.UTF-8`, no `TZ`) | `host_link.rs`, B, `status.rs` |
 | 3 | **Open links and files** | `ACTION_VIEW` intents | `OpenURI` portal backend and an `xdg-open` shim, so GNOME apps open links in the Android browser | C |
 | 4 | **Suspend, lock, inhibit** | Activity pause/resume, `KeyguardManager`, wake locks | `login1`: emit `PrepareForSleep`, drive `LockedHint`/`IdleHint`, make `Inhibit` hold a wake lock; `CanSuspend`/`CanPowerOff` return `yes` where they map (today `na`, and the power calls are refused) | `login1.rs` |
 | 5 | **Battery and power** | `BatteryManager`, power-save mode | `org.freedesktop.UPower`, `power-profiles-daemon` stand-ins | B |
@@ -59,6 +59,21 @@ Value for effort, cheapest first. "Code" names where it would attach in the curr
 | 13 | **Clipboard, IME, audio** | `ClipboardManager`, IME, AAudio | belong to Selkie's compositor and audio path, not droidc | out of scope |
 
 Items 2 to 4 are what makes a session feel native and most are read-only or one-way, so start there.
+
+## The host link
+
+`droidc host-link` is the one channel for everything above that is neither sound (`audio-out`) nor
+media (`media`). The host starts it in the guest under `supervise`, next to the desktop, and talks
+JSON lines over its stdio, one object per line with a `kind`, instead of the abstract socket of layer A:
+the host already owns the process, so there is no peer to check and nothing to listen on.
+
+- Host to guest (stdin): `appearance` (`dark`, `accent` as `#rrggbb`, `text_scale`, `animations`,
+  `high_contrast`; each optional). Settings are written with the image's `gsettings` (or
+  `DROIDC_GSETTINGS`), only when they change; a key the image's GNOME lacks is tried once.
+- Guest to host (stdout): `ready` with droidc's version, first.
+
+Unknown kinds and bad lines are skipped with a warning on stderr, so the host and droidc can be updated
+separately. Later integration points add kinds in both directions.
 
 ## Review notes on the systemd shim (PR #5)
 

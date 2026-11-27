@@ -196,6 +196,10 @@ enum Cmd {
     },
     /// (inside the guest) answer org.freedesktop.login1 on the system bus (stand-in for logind)
     Login1,
+    /// (inside the guest) the desktop's channel to Android: JSON lines, Android state in on stdin
+    /// (appearance), requests out on stdout; status goes to stderr
+    #[command(name = "host-link")]
+    HostLink,
     /// (inside the guest) answer org.freedesktop.PolicyKit1 on the system bus (stand-in for polkitd)
     Polkit,
     /// (on the host) run commands as fake root for the guest's sudo/su/pkexec shims
@@ -406,6 +410,7 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
         | Cmd::AudioOut { .. }
         | Cmd::Media { .. }
         | Cmd::Login1
+        | Cmd::HostLink
         | Cmd::Polkit
         | Cmd::Log { .. }
         | Cmd::Enter { .. }
@@ -595,6 +600,15 @@ fn main() {
     }
     if let Cmd::Spawn { cmd } = &cli.cmd {
         std::process::exit(run_shim("spawn", cmd));
+    }
+    if let Cmd::HostLink = &cli.cmd {
+        match droidc::host_link::run() {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("droidc host-link: {e}");
+                std::process::exit(1);
+            }
+        }
     }
     if let Cmd::Login1 = &cli.cmd {
         match login1::run() {

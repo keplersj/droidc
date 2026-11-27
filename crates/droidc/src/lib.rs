@@ -19,6 +19,7 @@ pub mod error;
 pub mod etcmerge;
 pub mod events;
 pub mod fsutil;
+pub mod host_link;
 pub mod journal;
 pub mod layout;
 pub mod link;
