@@ -190,6 +190,11 @@ enum Cmd {
     /// (appearance), requests out on stdout; status goes to stderr
     #[command(name = "host-link")]
     HostLink,
+    /// (inside the guest) open a web, mail, phone, sms or map link on Android, through the host link
+    Open {
+        /// The link, e.g. https://example.org or mailto:someone@example.org
+        uri: String,
+    },
     /// (on the host) run commands as fake root for the guest's sudo/su/pkexec shims
     #[command(name = "spawn-server", hide = true)]
     SpawnServer {
@@ -398,6 +403,7 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
         | Cmd::AudioOut { .. }
         | Cmd::Login1
         | Cmd::HostLink
+        | Cmd::Open { .. }
         | Cmd::Log { .. }
         | Cmd::Enter { .. }
         | Cmd::EnterInit { .. } => unreachable!(),
@@ -573,6 +579,15 @@ fn main() {
     }
     if let Cmd::Spawn { cmd } = &cli.cmd {
         std::process::exit(run_shim("spawn", cmd));
+    }
+    if let Cmd::Open { uri } = &cli.cmd {
+        match droidc::open::open(uri) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("droidc open: {e}");
+                std::process::exit(1);
+            }
+        }
     }
     if let Cmd::HostLink = &cli.cmd {
         match droidc::host_link::run() {

@@ -7,8 +7,9 @@
 //!
 //! - **stdin, host to guest:** Android state the guest should follow. `appearance` sets GNOME's color
 //!   scheme, accent color, text size, animations and contrast from Android's.
-//! - **stdout, guest to host:** `ready` once the link is up, then requests the host acts on (later
-//!   kinds: links to open, notifications, files to pick).
+//! - **stdout, guest to host:** `ready` once the link is up, then requests the host acts on:
+//!   `open-uri` for a link the desktop opened (served on the session bus as `dev.droidc.HostLink1`,
+//!   see [`crate::open`]).
 //!
 //! A line that doesn't parse, or a kind this droidc doesn't know, is reported on stderr and skipped, so
 //! a newer host can talk to an older droidc. Status and errors go to stderr. Closing stdin ends the link.
@@ -22,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 const INTERFACE: &str = "org.gnome.desktop.interface";
 const A11Y: &str = "org.gnome.desktop.a11y.interface";
@@ -54,6 +56,8 @@ pub enum HostMsg {
 pub enum GuestMsg {
     /// The link is up: the host can send state.
     Ready { version: &'static str },
+    /// Open this link on Android (see [`crate::open`]).
+    OpenUri { uri: String },
 }
 
 /// GNOME's accent colors (libadwaita 1.6 / GNOME 47), in `accent-color`'s spelling, with their
@@ -250,13 +254,48 @@ pub fn run() -> Result<i32> {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
+    let out: crate::open::Out = Arc::new(Mutex::new(Box::new(std::io::stdout())));
     let mut link = Link::new(Settings::from_env());
-    emit(
-        &mut std::io::stdout().lock(),
-        &GuestMsg::Ready {
-            version: crate::VERSION,
-        },
-    )?;
+
+    // Links: the bus method writes `open-uri` lines through the same stdout.
+    match crate::open::install_handler() {
+        Ok(took) if !took.is_empty() => {
+            eprintln!("host-link: links: now the default for {}", took.join(", "))
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("host-link: warn: links: no handler: {e}"),
+    }
+    let sink_out = out.clone();
+    let sink: crate::open::Sink = Arc::new(move |uri: &str| {
+        let mut o = sink_out
+            .lock()
+            .map_err(|_| Error::internal("stdout lock poisoned"))?;
+        emit(
+            &mut *o,
+            &GuestMsg::OpenUri {
+                uri: uri.to_string(),
+            },
+        )
+    });
+    let _bus = match crate::open::serve(sink) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("host-link: warn: links: {e}");
+            None
+        }
+    };
+
+    {
+        let mut o = out
+            .lock()
+            .map_err(|_| Error::internal("stdout lock poisoned"))?;
+        emit(
+            &mut *o,
+            &GuestMsg::Ready {
+                version: crate::VERSION,
+            },
+        )?;
+    }
     eprintln!("host-link: ready");
     for line in std::io::stdin().lock().lines() {
         match line {
