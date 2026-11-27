@@ -779,6 +779,7 @@ pub fn client(args: &[String]) -> Result<i32> {
         cwd,
         env,
         sandbox: Some(sandbox),
+        via: None,
     };
     let (info_fd, json_fd) = (a.info_fd, a.json_status_fd);
     let status = crate::spawn::request("bwrap", &req, &fds, |pid| {
