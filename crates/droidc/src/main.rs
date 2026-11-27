@@ -7,7 +7,7 @@ use droidc::link::{LinkKind, DEFAULT_L2S_PREFIX};
 use droidc::platform::Platform;
 use droidc::registry::HttpConfig;
 use droidc::session::{self, Renderer, SessionSpec};
-use droidc::{bridge, enter, logcat, login1, ownership, status, supervise};
+use droidc::{apps, bridge, enter, logcat, login1, ownership, status, supervise};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -62,6 +62,8 @@ enum Cmd {
     Rollback,
     /// Show current, previous and staged
     Status,
+    /// Applications in the current deployment, from its desktop entries
+    Apps,
     /// Remove unreferenced deployments and blobs
     Gc,
     /// How to enter the current deployment
@@ -339,6 +341,7 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
         Cmd::Upgrade => Ok(("upgrade", deploy::upgrade(&root, em, http, &l2s)?)),
         Cmd::Rollback => Ok(("rollback", deploy::rollback(&root, em)?)),
         Cmd::Status => Ok(("status", status::status(&root)?)),
+        Cmd::Apps => Ok(("apps", apps::list(&root)?)),
         Cmd::Gc => Ok(("gc", deploy::gc(&root, em)?)),
         Cmd::ShellSpec { launcher } => {
             let l = status::Launcher::parse(launcher)
