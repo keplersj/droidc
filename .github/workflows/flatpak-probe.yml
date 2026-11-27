@@ -1,0 +1,116 @@
+name: flatpak-probe
+
+# Report only: what works and what breaks for Flatpak (Bazaar) in Bluefin LTS under droidc, on an
+# x86_64 runner with user namespaces turned off as on Android. The guest runs under proot as the
+# runner's uid, as Selkie runs it; `sudo` is droidc's shim, served by a host spawn-server running
+# proot -0. See tests/flatpak-probe.sh. Runs when either file changes or by hand.
+on:
+  push:
+    paths:
+      - ".github/workflows/flatpak-probe.yml"
+      - "tests/flatpak-probe.sh"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: image ref
+        default: ghcr.io/projectbluefin/bluefin-lts:stable
+
+permissions:
+  contents: read
+
+jobs:
+  # Selkie's own proot (Termux's fork plus Selkie's patch set), built for the runner: Ubuntu's
+  # upstream proot fails link2symlink for linkat() of an O_TMPFILE, which Flatpak's repo needs.
+  # x86_64 and 24.04: the script's host build has no arm64 32-bit loader, and 26.04's glibc headers
+  # clash with proot's SYS_SECCOMP.
+  proot:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: keplersj/selkie
+      - run: sudo apt-get update -qq && sudo apt-get install -y lld >/dev/null
+      - run: third_party/proot/build.sh "$RUNNER_TEMP/proot" host
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: selkie-proot
+          path: ${{ runner.temp }}/proot/proot*
+
+  probe:
+    needs: proot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      IMAGE: ${{ inputs.ref || 'ghcr.io/projectbluefin/bluefin-lts:stable' }}
+      PROOT_NO_SECCOMP: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: pip install --break-system-packages ziglang==0.13.0 cargo-zigbuild
+      - run: cargo zigbuild --release --target x86_64-unknown-linux-musl -p droidc
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: selkie-proot
+          path: ${{ runner.temp }}/proot
+      - name: Free disk space, install Selkie's proot
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift || true
+          sudo apt-get update -qq && sudo apt-get install -y jq >/dev/null
+          chmod +x "$RUNNER_TEMP/proot/proot" "$RUNNER_TEMP/proot/proot-loader"
+          sudo install -m 755 "$RUNNER_TEMP/proot/proot" /usr/local/bin/proot
+          echo "PROOT_LOADER=$RUNNER_TEMP/proot/proot-loader" >> "$GITHUB_ENV"
+          proot --version | head -3
+          df -h /
+      - name: Switch to Bluefin LTS (link2symlink)
+        run: |
+          B=$PWD/target/x86_64-unknown-linux-musl/release/droidc
+          R=/droidc-probe; sudo mkdir -p $R && sudo chown "$USER" $R
+          echo "B=$B" >> "$GITHUB_ENV"; echo "R=$R" >> "$GITHUB_ENV"
+          "$B" --root "$R" --json switch "$IMAGE" --links link2symlink | tee switch.ndjson | grep -v '"progress"' || true
+          tail -1 switch.ndjson | jq -e '.ok' >/dev/null
+      - name: Turn user namespaces off (as on Android)
+        run: |
+          sudo sysctl -w user.max_user_namespaces=0
+          unshare --user true && echo "unexpected: userns still works" || echo "userns off"
+      - name: Probe (proot as the runner uid, sudo over droidc's spawner)
+        timeout-minutes: 170
+        run: |
+          SPEC=$("$B" --root "$R" --json shell-spec | tail -1)
+          ROOTFS=$(echo "$SPEC" | jq -r .data.rootfs)
+          W=$RUNNER_TEMP/guest; mkdir -p $W/tmp $W/run/user/$(id -u)
+          chmod 700 $W/run/user/$(id -u); chmod 1777 $W/tmp
+          cp tests/flatpak-probe.sh $W/tmp/probe.sh
+          # The runner uid is unknown to the image: add it, as Selkie does.
+          { cat "$ROOTFS/etc/passwd"; echo "selkie:x:$(id -u):$(id -g):Selkie:/root:/bin/bash"; } > $W/passwd
+          { cat "$ROOTFS/etc/group"; echo "selkie:x:$(id -g):"; } > $W/group
+          base=(proot --link2symlink -r "$ROOTFS" -w /root -b /dev -b /proc -b /sys -b /etc/resolv.conf
+                -b $W/tmp:/tmp -b $W/run:/run -b $W/passwd:/etc/passwd -b $W/group:/etc/group -b "$R:$R")
+          while read -r h g; do base+=(-b "$h:$g"); done < <(echo "$SPEC" | jq -r '.data.binds[] | "\(.host) \(.guest)"')
+          base+=(-b "$B:/usr/bin/droidc")
+          for s in $(echo "$SPEC" | jq -r '.data.shims[]'); do base+=(-b "$B:$s"); done
+          envs=(/usr/bin/env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/usr/sbin LANG=C.UTF-8
+                XDG_RUNTIME_DIR=/run/user/$(id -u) DROIDC_ROOT=/run/droidc/root DROIDC_SPAWNER=flatpak-probe)
+          # Fake root for sudo: the same guest with -0 (the spawner appends -w and the command).
+          root=(proot --link2symlink -0 "${base[@]:2}")
+          "$B" spawn-server --socket flatpak-probe --uid "$(id -u)" -- "${root[@]}" > spawner.log 2>&1 &
+          SPAWNER=$!
+          sleep 2
+          set +e
+          # To a file, not a pipe: daemons the probe starts keep a pipe open after it ends.
+          timeout -k 30 9000 "${base[@]}" "${envs[@]}" /bin/sh /tmp/probe.sh > probe.log 2>&1
+          echo "exit=$?"
+          cat probe.log
+          set -e
+          kill $SPAWNER || true
+          { echo "### Flatpak under droidc (Bluefin LTS, x86_64, Selkie proot, no userns)"; echo '```'; cat probe.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          tail -n 3 probe.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: flatpak-probe
+          path: |
+            probe.log
+            spawner.log
+            switch.ndjson
