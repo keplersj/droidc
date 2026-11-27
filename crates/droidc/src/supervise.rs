@@ -140,13 +140,21 @@ const SYSTEM_SERVICES_DIR: &str = "/usr/share/dbus-1/system-services";
 /// real polkitd...) expect root and a system manager, and would start broken on the first client
 /// that asks. `flatpak-system-helper` deploys into the system installation for the user's own
 /// `flatpak install` and Bazaar (it asks `droidc polkit`, see `polkit.rs`).
-const SYSTEM_ACTIVATABLE: [&str; 1] = ["org.freedesktop.Flatpak.SystemHelper"];
+///
+/// Each comes with environment its `Exec=` gets. The helper's: no RevokeFS, a FUSE mount the app can't
+/// make (`fusermount3` is refused), so Flatpak falls back to pulling into a child repo as the user
+/// and handing it to the helper, checked by its GPG signatures.
+const SYSTEM_ACTIVATABLE: [(&str, &[&str]); 1] = [(
+    "org.freedesktop.Flatpak.SystemHelper",
+    &["FLATPAK_DISABLE_REVOKEFS=1"],
+)];
 
 /// Writes the configuration of the system bus on `socket` beside it: a session-style policy
 /// (everyone may own and call anything; it is all one uid), typed `system` so activated services get
 /// `DBUS_SYSTEM_BUS_ADDRESS`, and a service directory with copies of the image's `.service` files for
 /// `SYSTEM_ACTIVATABLE` from `services`, without `User=` (only a setuid launch helper could honour it)
-/// and `SystemdService=` (there is no system manager). Returns the configuration's path.
+/// and `SystemdService=` (there is no system manager), and with their environment put in front of
+/// `Exec=` through `/usr/bin/env`. Returns the configuration's path.
 fn system_bus_config(
     socket: &std::path::Path,
     services: &std::path::Path,
@@ -158,7 +166,7 @@ fn system_bus_config(
     let svc_dir = dir.join("droidc-system-services");
     let _ = fs::remove_dir_all(&svc_dir);
     fs::create_dir_all(&svc_dir).context(svc_dir.display())?;
-    for name in SYSTEM_ACTIVATABLE {
+    for (name, env) in SYSTEM_ACTIVATABLE {
         let file = format!("{name}.service");
         let Ok(text) = fs::read_to_string(services.join(&file)) else {
             continue;
@@ -169,7 +177,12 @@ fn system_bus_config(
                 let k = l.split('=').next().unwrap_or("").trim();
                 k != "User" && k != "SystemdService"
             })
-            .map(|l| format!("{l}\n"))
+            .map(|l| match l.trim_start().strip_prefix("Exec=") {
+                Some(cmd) if !env.is_empty() => {
+                    format!("Exec=/usr/bin/env {} {}\n", env.join(" "), cmd.trim_start())
+                }
+                _ => format!("{l}\n"),
+            })
             .collect();
         fs::write(svc_dir.join(&file), kept).context(&file)?;
     }
@@ -1495,7 +1508,7 @@ mod tests {
             services.join("org.freedesktop.Flatpak.SystemHelper.service"),
             format!(
                 "[D-BUS Service]\nName=org.freedesktop.Flatpak.SystemHelper\n\
-                 Exec=/bin/sh -c 'echo \"$DBUS_SYSTEM_BUS_ADDRESS $(id -u)\" > {}'\n\
+                 Exec=/bin/sh -c 'echo \"$FLATPAK_DISABLE_REVOKEFS $DBUS_SYSTEM_BUS_ADDRESS $(id -u)\" > {}'\n\
                  User=root\nSystemdService=flatpak-system-helper.service\n",
                 out.display()
             ),
@@ -1514,7 +1527,10 @@ mod tests {
             run.join("droidc-system-services/org.freedesktop.Flatpak.SystemHelper.service"),
         )
         .unwrap();
-        assert!(copied.contains("Exec=/bin/sh"), "{copied}");
+        assert!(
+            copied.contains("Exec=/usr/bin/env FLATPAK_DISABLE_REVOKEFS=1 /bin/sh"),
+            "{copied}"
+        );
         assert!(
             !copied.contains("User=") && !copied.contains("SystemdService="),
             "{copied}"
@@ -1554,7 +1570,7 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        let addr = format!("unix:path={},", sock.display());
+        let addr = format!("1 unix:path={},", sock.display());
         let uid = format!(" {}", rustix::process::getuid().as_raw());
         assert!(
             got.starts_with(&addr) && got.trim_end().ends_with(&uid),
