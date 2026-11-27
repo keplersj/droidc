@@ -50,6 +50,18 @@ T=600 run flatpak install --system -y --noninteractive flathub "$APP"
 kill $HELPER 2>/dev/null
 run cat /tmp/helper.log
 
+step "system install as the user, droidc polkit and the helper without RevokeFS (as supervise starts them)"
+droidc polkit > /tmp/polkit.log 2>&1 &
+POLKIT=$!
+FLATPAK_DISABLE_REVOKEFS=1 /usr/libexec/flatpak-system-helper -r > /tmp/helper3.log 2>&1 &
+HELPER=$!
+sleep 3
+T=1200 TAIL=60 run flatpak install --system -y --noninteractive flathub "$APP"
+run flatpak list --system --columns=application,branch,installation
+T=120 run flatpak run --command=true "$APP"
+kill $HELPER $POLKIT 2>/dev/null
+run cat /tmp/polkit.log /tmp/helper3.log
+
 step "system install as the user, helper in session mode (skips polkit)"
 dbus-daemon --session --address=unix:path=/tmp/session_bus --fork --print-pid=1 >/dev/null
 DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/session_bus /usr/libexec/flatpak-system-helper --session -r > /tmp/helper2.log 2>&1 &
