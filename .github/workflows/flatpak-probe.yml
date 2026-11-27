@@ -92,6 +92,10 @@ jobs:
           for s in $(echo "$SPEC" | jq -r '.data.shims[]'); do base+=(-b "$B:$s"); done
           envs=(/usr/bin/env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/usr/sbin LANG=C.UTF-8
                 XDG_RUNTIME_DIR=/run/user/$(id -u) DROIDC_ROOT=/run/droidc/root DROIDC_SPAWNER=flatpak-probe)
+          # link2symlink keeps the files behind a faked hard link in one directory of their own, not
+          # next to the link: there "rm -rf" lists them and cannot remove them, which left Flatpak's
+          # child repo behind after a system install. The spawner passes PROOT_* on to its proot.
+          export PROOT_L2S_DIR=$R/l2s; mkdir -p "$PROOT_L2S_DIR"
           # Fake root for sudo: the same guest with -0 (the spawner appends -w and the command).
           root=(proot --link2symlink -0 "${base[@]:2}")
           "$B" spawn-server --socket flatpak-probe --uid "$(id -u)" -- "${root[@]}" > spawner.log 2>&1 &
