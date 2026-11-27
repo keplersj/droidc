@@ -155,6 +155,25 @@ enum Cmd {
         #[arg(long, default_value_t = 120)]
         timeout: u64,
     },
+    /// (inside the guest) stream the guest's sound as raw S16LE PCM on stdout, from a PipeWire sink
+    /// made the default; status goes to stderr
+    #[command(name = "audio-out")]
+    AudioOut {
+        /// `node.name` of the sink to create (or reuse)
+        #[arg(long, default_value = "selkie-out")]
+        sink: String,
+        #[arg(long, default_value_t = 48_000)]
+        rate: u32,
+        /// 1, 2, 4 or 6
+        #[arg(long, default_value_t = 2)]
+        channels: u32,
+        /// Recorder latency, as pw-record takes it
+        #[arg(long, default_value = "20ms")]
+        latency: String,
+        /// Seconds to wait for the guest's PipeWire
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+    },
     /// Write one message to Android's log (logcat), from the guest or the host
     Log {
         /// debug, info, warn or error
@@ -372,6 +391,7 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
         | Cmd::SpawnServer { .. }
         | Cmd::Spawn { .. }
         | Cmd::Bridge { .. }
+        | Cmd::AudioOut { .. }
         | Cmd::Login1
         | Cmd::Log { .. }
         | Cmd::Enter { .. }
@@ -491,6 +511,29 @@ fn main() {
             Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("droidc bridge: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Cmd::AudioOut {
+        sink,
+        rate,
+        channels,
+        latency,
+        timeout,
+    } = &cli.cmd
+    {
+        let opts = droidc::audio::Opts {
+            sink: sink.clone(),
+            rate: *rate,
+            channels: *channels,
+            latency: latency.clone(),
+            timeout: std::time::Duration::from_secs(*timeout),
+        };
+        match droidc::audio::run(&opts) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("droidc audio-out: {e}");
                 std::process::exit(1);
             }
         }
