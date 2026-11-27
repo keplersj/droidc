@@ -28,6 +28,7 @@ pub mod login1;
 pub mod open;
 pub mod ownership;
 pub mod platform;
+pub mod polkit;
 pub mod record;
 pub mod registry;
 pub mod session;

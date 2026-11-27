@@ -7,7 +7,7 @@ use droidc::link::{LinkKind, DEFAULT_L2S_PREFIX};
 use droidc::platform::Platform;
 use droidc::registry::HttpConfig;
 use droidc::session::{self, Renderer, SessionSpec};
-use droidc::{apps, bridge, enter, logcat, login1, ownership, status, supervise};
+use droidc::{apps, bridge, enter, logcat, login1, ownership, polkit, status, supervise};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -195,6 +195,8 @@ enum Cmd {
         /// The link, e.g. https://example.org or mailto:someone@example.org
         uri: String,
     },
+    /// (inside the guest) answer org.freedesktop.PolicyKit1 on the system bus (stand-in for polkitd)
+    Polkit,
     /// (on the host) run commands as fake root for the guest's sudo/su/pkexec shims
     #[command(name = "spawn-server", hide = true)]
     SpawnServer {
@@ -404,6 +406,7 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
         | Cmd::Login1
         | Cmd::HostLink
         | Cmd::Open { .. }
+        | Cmd::Polkit
         | Cmd::Log { .. }
         | Cmd::Enter { .. }
         | Cmd::EnterInit { .. } => unreachable!(),
@@ -603,6 +606,15 @@ fn main() {
             Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("droidc login1: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Cmd::Polkit = &cli.cmd {
+        match polkit::run() {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("droidc polkit: {e}");
                 std::process::exit(1);
             }
         }

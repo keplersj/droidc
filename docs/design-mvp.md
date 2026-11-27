@@ -571,3 +571,11 @@ some to the app), and the spawn-server starts a sibling proot:
 `--session` also starts `droidc login1`, a stand-in for `systemd-logind` on the system bus (one session,
 one seat, always active; `TakeDevice` and power operations refused), and sets `XDG_SESSION_ID=1` and
 `XDG_SEAT=seat0`.
+
+The system bus also has `droidc polkit`, a stand-in for `polkitd` (`polkit.rs`): it authorizes the
+app's uid and root, which is every process in the guest, never asks for a password and keeps no
+temporary authorizations. It is no more than the guest already has through `sudo`. Its point is
+`flatpak-system-helper`, the only system service the system bus starts on demand (`SYSTEM_ACTIVATABLE`
+in `supervise.rs`; the bus has a configuration of its own, typed `system`, with a service directory
+holding just that file): Bazaar and `flatpak install` run as the user and ask the helper to deploy into
+the system installation, and the helper asks polkit first.
