@@ -19,7 +19,24 @@ permissions:
   contents: read
 
 jobs:
+  # Selkie's own proot (Termux's fork plus Selkie's patch set), built for the runner: Ubuntu's
+  # upstream proot fails link2symlink for linkat() of an O_TMPFILE, which Flatpak's repo needs.
+  # Built on 24.04: proot's compat.h redefines SYS_SECCOMP, which 26.04's glibc headers declare.
+  proot:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: keplersj/selkie
+      - run: sudo apt-get update -qq && sudo apt-get install -y lld >/dev/null
+      - run: third_party/proot/build.sh "$RUNNER_TEMP/proot" host
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: selkie-proot
+          path: ${{ runner.temp }}/proot/proot*
+
   probe:
+    needs: proot
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 240
     env:
@@ -32,17 +49,15 @@ jobs:
           targets: aarch64-unknown-linux-musl
       - run: pip install --break-system-packages ziglang==0.13.0 cargo-zigbuild
       - run: cargo zigbuild --release --target aarch64-unknown-linux-musl -p droidc
-      # Selkie's own proot (Termux's fork plus Selkie's patch set), built for the runner: Ubuntu's
-      # upstream proot fails link2symlink for linkat() of an O_TMPFILE, which Flatpak's repo needs.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          repository: keplersj/selkie
-          path: selkie
-      - name: Free disk space, build Selkie's proot
+          name: selkie-proot
+          path: ${{ runner.temp }}/proot
+      - name: Free disk space, install Selkie's proot
         run: |
           sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift || true
-          sudo apt-get update -qq && sudo apt-get install -y jq lld >/dev/null
-          selkie/third_party/proot/build.sh "$RUNNER_TEMP/proot" host
+          sudo apt-get update -qq && sudo apt-get install -y jq >/dev/null
+          chmod +x "$RUNNER_TEMP/proot/proot" "$RUNNER_TEMP/proot/proot-loader"
           sudo install -m 755 "$RUNNER_TEMP/proot/proot" /usr/local/bin/proot
           echo "PROOT_LOADER=$RUNNER_TEMP/proot/proot-loader" >> "$GITHUB_ENV"
           proot --version | head -3
