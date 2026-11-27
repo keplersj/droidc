@@ -1252,6 +1252,8 @@ fn start_session(
                     params.width.to_string(),
                     "--height".into(),
                     params.height.to_string(),
+                    "--scale".into(),
+                    params.scale.to_string(),
                 ]);
                 argv
             } else {
@@ -2079,7 +2081,7 @@ mod tests {
         assert_eq!(supervise_with(&[], &opts).unwrap(), 3);
         assert_eq!(
             fs::read_to_string(o("bridge.out")).unwrap().trim(),
-            "--width 640 --height 480 wayland-0"
+            "--width 640 --height 480 --scale 1 wayland-0"
         );
         assert!(fs::read_to_string(o("comp.out"))
             .unwrap()

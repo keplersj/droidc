@@ -13,6 +13,13 @@
 //!    through RemoteDesktop.
 //!
 //! `--dump-frame <png>` writes one frame and exits, with no Wayland connection (used by CI).
+//!
+//! `--scale <s>` sets the monitor's scale before recording (the closest one Mutter supports),
+//! unless the user's own display settings (`monitors.xml`) already cover this monitor and size.
+//!
+//! Mutter stops a monitor stream when the monitor's logical size changes, as it does when the
+//! scale changes with fractional scaling on (GNOME Settings > Displays). The bridge then records
+//! the monitor again in the same window, so changing the scale does not end the session.
 
 use crate::error::{Error, Result};
 use std::collections::HashMap;
@@ -20,6 +27,7 @@ use std::io::Read;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wayland_client::protocol::{
@@ -34,6 +42,14 @@ const SCREEN_CAST: &str = "org.gnome.Mutter.ScreenCast";
 const REMOTE_DESKTOP: &str = "org.gnome.Mutter.RemoteDesktop";
 const RD_SESSION: &str = "org.gnome.Mutter.RemoteDesktop.Session";
 const SC_SESSION: &str = "org.gnome.Mutter.ScreenCast.Session";
+const SC_STREAM: &str = "org.gnome.Mutter.ScreenCast.Stream";
+const DISPLAY_CONFIG: &str = "org.gnome.Mutter.DisplayConfig";
+const DISPLAY_CONFIG_PATH: &str = "/org/gnome/Mutter/DisplayConfig";
+
+/// How often the bridge checks that its stream is still there.
+const CHECK_EVERY: Duration = Duration::from_secs(2);
+/// Re-recording more often than this many times a minute ends the bridge instead.
+const MAX_RESTARTS_PER_MINUTE: usize = 5;
 
 #[derive(Debug, Clone)]
 pub struct Opts {
@@ -44,6 +60,8 @@ pub struct Opts {
     pub dump_frame: Option<PathBuf>,
     /// How long to wait for the session compositor's ScreenCast service.
     pub timeout: Duration,
+    /// Monitor scale to set before recording; 0 or less leaves it alone.
+    pub scale: f64,
 }
 
 fn dbus_err(e: zbus::Error) -> Error {
@@ -58,21 +76,26 @@ struct Remote {
     node: u32,
 }
 
+/// Waits up to `timeout` for the session compositor's ScreenCast service.
+fn wait_for_screen_cast(conn: &zbus::blocking::Connection, timeout: Duration) -> Result<()> {
+    let dbus = zbus::blocking::fdo::DBusProxy::new(conn).map_err(dbus_err)?;
+    let deadline = Instant::now() + timeout;
+    let name = zbus::names::BusName::try_from(SCREEN_CAST).unwrap();
+    while !dbus.name_has_owner(name.clone()).unwrap_or(false) {
+        if Instant::now() > deadline {
+            return Err(Error::not_found(format!(
+                "{SCREEN_CAST} did not appear on the session bus within {timeout:?}"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Ok(())
+}
+
 impl Remote {
     fn open(opts: &Opts) -> Result<Remote> {
         let conn = zbus::blocking::Connection::session().map_err(dbus_err)?;
-        let dbus = zbus::blocking::fdo::DBusProxy::new(&conn).map_err(dbus_err)?;
-        let deadline = Instant::now() + opts.timeout;
-        let name = zbus::names::BusName::try_from(SCREEN_CAST).unwrap();
-        while !dbus.name_has_owner(name.clone()).unwrap_or(false) {
-            if Instant::now() > deadline {
-                return Err(Error::not_found(format!(
-                    "{SCREEN_CAST} did not appear on the session bus within {:?}",
-                    opts.timeout
-                )));
-            }
-            std::thread::sleep(Duration::from_millis(250));
-        }
+        wait_for_screen_cast(&conn, opts.timeout)?;
         let call = |dest: &str, path: &str, iface: &str, m: &str, body: &dyn DynBody| {
             body.call(&conn, dest, path, iface, m)
         };
@@ -170,6 +193,19 @@ impl Remote {
             }
             Err(e) => eprintln!("bridge: {method}: {e}"),
         }
+    }
+
+    /// Whether Mutter still has our stream (it drops it when the monitor's logical size changes).
+    fn alive(&self) -> bool {
+        self.conn
+            .call_method(
+                Some(SCREEN_CAST),
+                self.stream.as_str(),
+                Some("org.freedesktop.DBus.Properties"),
+                "Get",
+                &(SC_STREAM, "Parameters"),
+            )
+            .is_ok()
     }
 
     fn stop(&self) {
@@ -300,11 +336,118 @@ fn dump_frame(node: u32, out: &std::path::Path) -> Result<i32> {
     Ok(st.code().unwrap_or(1))
 }
 
+type Props = HashMap<String, OwnedValue>;
+type Spec = (String, String, String, String);
+/// id, width, height, refresh, preferred scale, supported scales, properties
+type Mode = (String, i32, i32, f64, f64, Vec<f64>, Props);
+/// x, y, scale, transform, primary, monitors, properties
+type Logical = (i32, i32, f64, u32, bool, Vec<Spec>, Props);
+type CurrentState = (u32, Vec<(Spec, Vec<Mode>, Props)>, Vec<Logical>, Props);
+
+/// The supported scale closest to `want` (Mutter only takes scales from this list).
+fn closest_scale(supported: &[f64], want: f64) -> Option<f64> {
+    supported
+        .iter()
+        .copied()
+        .min_by(|a, b| (a - want).abs().total_cmp(&(b - want).abs()))
+}
+
+/// Whether the user's saved display settings (`monitors.xml`) have a layout for `connector` at
+/// `width`x`height`: Mutter applies those itself, and they win over the bridge's default.
+fn has_saved_layout(xml: &str, connector: &str, width: i32, height: i32) -> bool {
+    let conn = format!("<connector>{connector}</connector>");
+    let (w, h) = (
+        format!("<width>{width}</width>"),
+        format!("<height>{height}</height>"),
+    );
+    xml.split("<configuration>")
+        .skip(1)
+        .any(|c| c.contains(&conn) && c.contains(&w) && c.contains(&h))
+}
+
+fn monitors_xml() -> Option<String> {
+    let dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    std::fs::read_to_string(dir.join("monitors.xml")).ok()
+}
+
+/// Sets `opts.connector` to the supported scale closest to `opts.scale`, for this run of the
+/// session only (Mutter's "temporary" config: nothing is saved and no confirmation is asked).
+/// Leaves the scale alone when it is already not 1, when the user saved a layout for this monitor
+/// and size, or when there is more than one monitor. Returns the scale it set.
+fn set_scale(conn: &zbus::blocking::Connection, opts: &Opts) -> Result<Option<f64>> {
+    let reply = conn
+        .call_method(
+            Some(DISPLAY_CONFIG),
+            DISPLAY_CONFIG_PATH,
+            Some(DISPLAY_CONFIG),
+            "GetCurrentState",
+            &(),
+        )
+        .map_err(dbus_err)?;
+    let (serial, monitors, logical, _): CurrentState =
+        reply.body().deserialize().map_err(dbus_err)?;
+    let [lm] = logical.as_slice() else {
+        return Ok(None);
+    };
+    let Some((spec, modes, _)) = monitors.iter().find(|(s, _, _)| s.0 == opts.connector) else {
+        return Err(Error::not_found(format!("no monitor {}", opts.connector)));
+    };
+    if !lm.5.iter().any(|s| s.0 == opts.connector) || (lm.2 - 1.0).abs() > 0.01 {
+        return Ok(None);
+    }
+    let current = |m: &&Mode| {
+        m.6.get("is-current")
+            .and_then(|v| bool::try_from(v).ok())
+            .unwrap_or(false)
+    };
+    let Some(mode) = modes.iter().find(current) else {
+        return Ok(None);
+    };
+    if monitors_xml().is_some_and(|x| has_saved_layout(&x, &opts.connector, mode.1, mode.2)) {
+        return Ok(None);
+    }
+    let Some(scale) = closest_scale(&mode.5, opts.scale) else {
+        return Ok(None);
+    };
+    if (scale - lm.2).abs() < 0.01 {
+        return Ok(None);
+    }
+    let mons: Vec<(&str, &str, HashMap<&str, Value>)> =
+        vec![(spec.0.as_str(), mode.0.as_str(), HashMap::new())];
+    // 1 = temporary: applied now, not written to monitors.xml.
+    let body = (
+        serial,
+        1u32,
+        vec![(lm.0, lm.1, scale, lm.3, lm.4, mons)],
+        HashMap::<&str, Value>::new(),
+    );
+    conn.call_method(
+        Some(DISPLAY_CONFIG),
+        DISPLAY_CONFIG_PATH,
+        Some(DISPLAY_CONFIG),
+        "ApplyMonitorsConfig",
+        &body,
+    )
+    .map_err(dbus_err)?;
+    Ok(Some(scale))
+}
+
 pub fn run(opts: &Opts) -> Result<i32> {
     if opts.width == 0 || opts.height == 0 {
         return Err(Error::invalid(
             "bridge needs a non-zero --width and --height",
         ));
+    }
+    if opts.scale > 0.0 {
+        let conn = zbus::blocking::Connection::session().map_err(dbus_err)?;
+        wait_for_screen_cast(&conn, opts.timeout)?;
+        match set_scale(&conn, opts) {
+            Ok(Some(s)) => eprintln!("bridge: set {} to scale {s}", opts.connector),
+            Ok(None) => {}
+            Err(e) => eprintln!("bridge: could not set the scale: {e}"),
+        }
     }
     let remote = Arc::new(Remote::open(opts)?);
     eprintln!(
@@ -326,68 +469,167 @@ struct Frames {
     ended: bool,
 }
 
+/// One gst capture of the recorded monitor, scaled to the window size.
+struct Capture {
+    gst: std::process::Child,
+    frames: Arc<Mutex<Frames>>,
+}
+
+impl Capture {
+    fn start(node: u32, w: u32, h: u32, wake: Arc<OwnedFd>) -> Result<Capture> {
+        let frame_len = (w * h * 4) as usize;
+        let mut tail: Vec<String> = ["videoconvert", "!", "videoscale", "!"]
+            .map(String::from)
+            .to_vec();
+        tail.push(format!("video/x-raw,format=BGRx,width={w},height={h}"));
+        tail.extend(["!", "fdsink", "fd=1"].map(String::from));
+        let mut gst = spawn_capture(node, &[], &tail, Stdio::piped())?;
+        let mut stdout = gst.stdout.take().unwrap();
+        let frames = Arc::new(Mutex::new(Frames::default()));
+        {
+            let frames = frames.clone();
+            std::thread::spawn(move || loop {
+                let mut buf = vec![0u8; frame_len];
+                let ok = stdout.read_exact(&mut buf).is_ok();
+                {
+                    let mut f = frames.lock().unwrap();
+                    if ok {
+                        f.latest = Some(buf);
+                    } else {
+                        f.ended = true;
+                    }
+                }
+                let _ = rustix::io::write(&*wake, &[1]);
+                if !ok {
+                    break;
+                }
+            });
+        }
+        Ok(Capture { gst, frames })
+    }
+
+    fn stop(&mut self) {
+        let _ = self.gst.kill();
+        let _ = self.gst.wait();
+    }
+}
+
+/// Wakes the present loop whenever Mutter's monitor configuration changes, so a stream it
+/// dropped is noticed at once. Best effort: the periodic check covers a failure here.
+fn watch_monitors(changed: Arc<AtomicBool>, wake: Arc<OwnedFd>) {
+    std::thread::spawn(move || {
+        let Ok(conn) = zbus::blocking::Connection::session() else {
+            return;
+        };
+        let Ok(rule) = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .interface(DISPLAY_CONFIG)
+            .and_then(|b| b.member("MonitorsChanged"))
+            .map(|b| b.build())
+        else {
+            return;
+        };
+        let Ok(signals) = zbus::blocking::MessageIterator::for_match_rule(rule, &conn, Some(8))
+        else {
+            return;
+        };
+        for _ in signals.flatten() {
+            changed.store(true, Ordering::SeqCst);
+            let _ = rustix::io::write(&*wake, &[1]);
+        }
+    });
+}
+
 fn present(opts: &Opts, remote: Arc<Remote>) -> Result<i32> {
     let (w, h) = (opts.width, opts.height);
-    let frame_len = (w * h * 4) as usize;
-    let mut tail: Vec<String> = ["videoconvert", "!", "videoscale", "!"]
-        .map(String::from)
-        .to_vec();
-    tail.push(format!("video/x-raw,format=BGRx,width={w},height={h}"));
-    tail.extend(["!", "fdsink", "fd=1"].map(String::from));
-    let mut gst = spawn_capture(remote.node, &[], &tail, Stdio::piped())?;
-    let mut stdout = gst.stdout.take().unwrap();
-
     let (wake_r, wake_w) =
         rustix::pipe::pipe().map_err(|e| Error::internal(format!("pipe: {e}")))?;
-    let frames = Arc::new(Mutex::new(Frames::default()));
-    {
-        let frames = frames.clone();
-        std::thread::spawn(move || loop {
-            let mut buf = vec![0u8; frame_len];
-            let ok = stdout.read_exact(&mut buf).is_ok();
-            {
-                let mut f = frames.lock().unwrap();
-                if ok {
-                    f.latest = Some(buf);
-                } else {
-                    f.ended = true;
-                }
-            }
-            let _ = rustix::io::write(&wake_w, &[1]);
-            if !ok {
-                break;
-            }
-        });
-    }
+    let wake_w = Arc::new(wake_w);
+    let mut cap = Capture::start(remote.node, w, h, wake_w.clone())?;
+    let changed = Arc::new(AtomicBool::new(false));
+    watch_monitors(changed.clone(), wake_w.clone());
 
     let conn = Connection::connect_to_env()
         .map_err(|e| Error::not_found(format!("host compositor (WAYLAND_DISPLAY): {e}")))?;
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
     conn.display().get_registry(&qh, ());
-    let mut st = State::new(remote.clone(), w, h);
+    let mut st = State::new(remote, w, h);
     queue.roundtrip(&mut st).map_err(wl_err)?;
     st.create_window(&qh)?;
     queue.roundtrip(&mut st).map_err(wl_err)?;
 
+    let mut next_check = Instant::now() + CHECK_EVERY;
+    // Quick re-checks after a monitor change: Mutter may drop the stream a moment later.
+    let mut quick_checks = 0u32;
+    let mut restarts: Vec<Instant> = Vec::new();
     let code = loop {
         queue.dispatch_pending(&mut st).map_err(wl_err)?;
         if st.closed {
             break 0;
         }
+        if changed.swap(false, Ordering::SeqCst) {
+            quick_checks = 4;
+            next_check = Instant::now() + Duration::from_millis(250);
+        }
         let (frame, ended) = {
-            let mut f = frames.lock().unwrap();
+            let mut f = cap.frames.lock().unwrap();
             (f.latest.take(), f.ended)
         };
-        if ended {
-            let s = gst.wait().ok().and_then(|s| s.code()).unwrap_or(1);
+        let lost = if ended {
+            let s = cap.gst.wait().ok().and_then(|s| s.code()).unwrap_or(1);
             eprintln!("bridge: capture ended (gst-launch-1.0 exited with {s})");
-            break if s == 0 { 1 } else { s };
+            Some(if s == 0 { 1 } else { s })
+        } else if Instant::now() >= next_check {
+            if quick_checks > 0 {
+                quick_checks -= 1;
+                next_check = Instant::now() + Duration::from_millis(500);
+            } else {
+                next_check = Instant::now() + CHECK_EVERY;
+            }
+            (!st.remote.alive()).then(|| {
+                eprintln!("bridge: Mutter dropped the stream of {}", opts.connector);
+                1
+            })
+        } else {
+            None
+        };
+        if let Some(code) = lost {
+            restarts.retain(|t| t.elapsed() < Duration::from_secs(60));
+            if restarts.len() >= MAX_RESTARTS_PER_MINUTE {
+                eprintln!("bridge: the stream ended {MAX_RESTARTS_PER_MINUTE} times within a minute; giving up");
+                break code;
+            }
+            restarts.push(Instant::now());
+            cap.stop();
+            st.remote.stop();
+            let remote = match Remote::open(opts) {
+                Ok(r) => Arc::new(r),
+                Err(e) => {
+                    eprintln!("bridge: could not record {} again: {e}", opts.connector);
+                    break code;
+                }
+            };
+            eprintln!(
+                "bridge: recording {} again as PipeWire node {}",
+                opts.connector, remote.node
+            );
+            cap = match Capture::start(remote.node, w, h, wake_w.clone()) {
+                Ok(c) => c,
+                Err(e) => {
+                    remote.stop();
+                    return Err(e);
+                }
+            };
+            st.remote = remote;
+            st.touches.clear();
+            next_check = Instant::now() + CHECK_EVERY;
+            continue;
         }
         if let Some(frame) = frame {
             if !st.present(&qh, &frame) {
                 // No free buffer or the last frame isn't shown yet: keep it for the next wakeup.
-                frames.lock().unwrap().latest.get_or_insert(frame);
+                cap.frames.lock().unwrap().latest.get_or_insert(frame);
             }
         }
         conn.flush()
@@ -400,7 +642,12 @@ fn present(opts: &Opts, remote: Arc<Remote>) -> Result<i32> {
             rustix::event::PollFd::new(&wl_fd, rustix::event::PollFlags::IN),
             rustix::event::PollFd::new(&wake_r, rustix::event::PollFlags::IN),
         ];
-        match rustix::event::poll(&mut fds, None) {
+        let wait = next_check.saturating_duration_since(Instant::now());
+        let timeout = rustix::event::Timespec {
+            tv_sec: wait.as_secs() as _,
+            tv_nsec: wait.subsec_nanos() as _,
+        };
+        match rustix::event::poll(&mut fds, Some(&timeout)) {
             Ok(_) | Err(rustix::io::Errno::INTR) => {}
             Err(e) => return Err(Error::internal(format!("poll: {e}"))),
         }
@@ -417,8 +664,9 @@ fn present(opts: &Opts, remote: Arc<Remote>) -> Result<i32> {
             let _ = rustix::io::read(&wake_r, &mut b);
         }
     };
-    let _ = gst.kill();
-    let _ = gst.wait();
+    cap.stop();
+    // `run` stops the session it started; stop the one we hold if it is a later one.
+    st.remote.stop();
     Ok(code)
 }
 
@@ -791,3 +1039,54 @@ wayland_client::delegate_noop!(State: ignore wl_compositor::WlCompositor);
 wayland_client::delegate_noop!(State: ignore wl_shm::WlShm);
 wayland_client::delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 wayland_client::delegate_noop!(State: ignore wl_surface::WlSurface);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closest_supported_scale() {
+        let tablet = [
+            1.0,
+            1.25,
+            1.502347469329834,
+            1.748633861541748,
+            2.0,
+            2.253521203994751,
+        ];
+        assert_eq!(closest_scale(&tablet, 2.0), Some(2.0));
+        assert_eq!(closest_scale(&tablet, 1.5), Some(1.502347469329834));
+        assert_eq!(closest_scale(&tablet, 2.125), Some(2.0));
+        assert_eq!(closest_scale(&[1.0, 2.0, 3.0], 2.625), Some(3.0));
+        assert_eq!(closest_scale(&[1.0, 2.0], 1.4), Some(1.0));
+        assert_eq!(closest_scale(&[], 2.0), None);
+    }
+
+    #[test]
+    fn saved_layout() {
+        let xml = r#"<monitors version="2">
+  <configuration>
+    <layoutmode>logical</layoutmode>
+    <logicalmonitor>
+      <x>0</x><y>0</y><scale>1.5023474693298340</scale><primary>yes</primary>
+      <monitor>
+        <monitorspec>
+          <connector>Meta-0</connector><vendor>MetaVendor</vendor>
+          <product>MetaVirtualMonitor</product><serial>0x00</serial>
+        </monitorspec>
+        <mode><width>2560</width><height>1600</height><rate>60.000</rate></mode>
+      </monitor>
+    </logicalmonitor>
+  </configuration>
+</monitors>"#;
+        assert!(has_saved_layout(xml, "Meta-0", 2560, 1600));
+        assert!(!has_saved_layout(xml, "Meta-0", 1600, 2560));
+        assert!(!has_saved_layout(xml, "Meta-1", 2560, 1600));
+        assert!(!has_saved_layout(
+            "<monitors version=\"2\"/>",
+            "Meta-0",
+            2560,
+            1600
+        ));
+    }
+}

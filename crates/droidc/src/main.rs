@@ -154,6 +154,10 @@ enum Cmd {
         /// Seconds to wait for the session compositor's ScreenCast service
         #[arg(long, default_value_t = 120)]
         timeout: u64,
+        /// Monitor scale to set first (closest supported; 0 leaves it alone). The user's saved
+        /// GNOME display settings for this monitor and size win over it.
+        #[arg(long, default_value_t = 0.0)]
+        scale: f64,
     },
     /// (inside the guest) stream the guest's sound as raw S16LE PCM on stdout, from a PipeWire sink
     /// made the default; status goes to stderr
@@ -517,6 +521,7 @@ fn main() {
         connector,
         dump_frame,
         timeout,
+        scale,
     } = &cli.cmd
     {
         let opts = bridge::Opts {
@@ -525,6 +530,7 @@ fn main() {
             connector: connector.clone(),
             dump_frame: dump_frame.clone(),
             timeout: std::time::Duration::from_secs(*timeout),
+            scale: *scale,
         };
         match bridge::run(&opts) {
             Ok(code) => std::process::exit(code),
