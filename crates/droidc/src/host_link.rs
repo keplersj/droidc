@@ -7,8 +7,12 @@
 //!
 //! - **stdin, host to guest:** Android state the guest should follow. `appearance` sets GNOME's color
 //!   scheme, accent color, text size, animations and contrast from Android's.
-//! - **stdout, guest to host:** `ready` once the link is up, then requests the host acts on (later
-//!   kinds: links to open, notifications, files to pick).
+//! - **stdout, guest to host:** `ready` once the link is up, then requests the host acts on:
+//!   `open-uri` for a link the desktop opened (served on the session bus as `dev.droidc.HostLink1`,
+//!   see [`crate::open`]), and `keep-awake` while a desktop app holds an idle inhibitor
+//!   (see [`crate::awake`]). From the host, `screen-lock` leaves locking and blanking to Android, and
+//!   `battery` feeds the UPower stand-in on the system bus (see [`crate::upower`]), and `network`
+//!   the NetworkManager connectivity stand-in beside it (see [`crate::network`]).
 //!
 //! A line that doesn't parse, or a kind this droidc doesn't know, is reported on stderr and skipped, so
 //! a newer host can talk to an older droidc. Status and errors go to stderr. Closing stdin ends the link.
@@ -22,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 const INTERFACE: &str = "org.gnome.desktop.interface";
 const A11Y: &str = "org.gnome.desktop.a11y.interface";
@@ -46,6 +51,16 @@ pub struct Appearance {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum HostMsg {
     Appearance(Appearance),
+    /// Android locks and blanks the device: turn GNOME's own lock screen and idle blank off
+    /// (see [`crate::awake`]). `by_android: false` leaves GNOME's settings as they are.
+    ScreenLock {
+        by_android: bool,
+    },
+    /// Android's battery, served to GNOME as UPower (see [`crate::upower`]).
+    Battery(crate::upower::Battery),
+    /// Android's default network, served to GLib's network monitor as NetworkManager
+    /// (see [`crate::network`]).
+    Network(crate::network::Network),
 }
 
 /// One line to the host.
@@ -54,6 +69,10 @@ pub enum HostMsg {
 pub enum GuestMsg {
     /// The link is up: the host can send state.
     Ready { version: &'static str },
+    /// Open this link on Android (see [`crate::open`]).
+    OpenUri { uri: String },
+    /// Keep the screen on (a desktop app holds an idle inhibitor), or let it sleep again.
+    KeepAwake { on: bool },
 }
 
 /// GNOME's accent colors (libadwaita 1.6 / GNOME 47), in `accent-color`'s spelling, with their
@@ -211,11 +230,19 @@ impl Settings {
 /// The link's state between lines.
 pub struct Link {
     pub settings: Settings,
+    /// The UPower stand-in, when there is a system bus to serve it on.
+    pub upower: Option<crate::upower::Server>,
+    /// The NetworkManager stand-in, likewise.
+    pub network: Option<crate::network::Server>,
 }
 
 impl Link {
     pub fn new(settings: Settings) -> Self {
-        Link { settings }
+        Link {
+            settings,
+            upower: None,
+            network: None,
+        }
     }
 
     /// Acts on one line from the host. Unknown or malformed lines are reported, not fatal.
@@ -231,6 +258,23 @@ impl Link {
                     eprintln!("host-link: appearance: {n} setting(s) changed");
                 }
             }
+            Ok(HostMsg::ScreenLock { by_android: true }) => {
+                let n = self.settings.apply(&crate::awake::android_locks_settings());
+                if n > 0 {
+                    eprintln!("host-link: screen lock: left to Android ({n} setting(s) changed)");
+                }
+            }
+            Ok(HostMsg::ScreenLock { by_android: false }) => {}
+            Ok(HostMsg::Battery(b)) => {
+                if let Some(Err(e)) = self.upower.as_ref().map(|u| u.set(&b)) {
+                    eprintln!("host-link: warn: battery: {e}");
+                }
+            }
+            Ok(HostMsg::Network(n)) => {
+                if let Some(Err(e)) = self.network.as_ref().map(|s| s.set(&n)) {
+                    eprintln!("host-link: warn: network: {e}");
+                }
+            }
             Err(e) => eprintln!("host-link: warn: skipped a line from the host: {e}"),
         }
     }
@@ -243,6 +287,20 @@ fn emit(out: &mut impl Write, msg: &GuestMsg) -> Result<()> {
         .map_err(|e| Error::internal(format!("stdout: {e}")))
 }
 
+/// The container's system bus (`DBUS_SYSTEM_BUS_ADDRESS`, set by the supervisor).
+fn system_bus() -> Result<zbus::blocking::Connection> {
+    let addr = std::env::var("DBUS_SYSTEM_BUS_ADDRESS")
+        .ok()
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| Error::not_found("no system bus (DBUS_SYSTEM_BUS_ADDRESS is not set)"))?;
+    zbus::blocking::connection::Builder::address(addr.as_str())
+        .and_then(|b| b.build())
+        .map_err(|e| Error::internal(format!("system bus: {e}")))
+}
+
+/// Writes one line to the host, from any thread.
+type SendLine = Arc<dyn Fn(&GuestMsg) -> Result<()> + Send + Sync>;
+
 /// Runs the link until stdin closes. Returns the exit code.
 pub fn run() -> Result<i32> {
     // A closed stdout must surface as a write error, not kill us.
@@ -250,13 +308,72 @@ pub fn run() -> Result<i32> {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
+    let out: crate::open::Out = Arc::new(Mutex::new(Box::new(std::io::stdout())));
     let mut link = Link::new(Settings::from_env());
-    emit(
-        &mut std::io::stdout().lock(),
-        &GuestMsg::Ready {
-            version: crate::VERSION,
-        },
-    )?;
+
+    // Links: the bus method writes `open-uri` lines through the same stdout.
+    match crate::open::install_handler() {
+        Ok(took) if !took.is_empty() => {
+            eprintln!("host-link: links: now the default for {}", took.join(", "))
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("host-link: warn: links: no handler: {e}"),
+    }
+    let send: SendLine = {
+        let out = out.clone();
+        Arc::new(move |m: &GuestMsg| {
+            let mut o = out
+                .lock()
+                .map_err(|_| Error::internal("stdout lock poisoned"))?;
+            emit(&mut *o, m)
+        })
+    };
+    let sink: crate::open::Sink = {
+        let send = send.clone();
+        Arc::new(move |uri: &str| {
+            send(&GuestMsg::OpenUri {
+                uri: uri.to_string(),
+            })
+        })
+    };
+    let bus = match crate::open::serve(sink) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("host-link: warn: links: {e}");
+            None
+        }
+    };
+
+    // Battery and network: UPower and NetworkManager on the container's system bus, unless the real
+    // services are there.
+    match system_bus() {
+        Ok(conn) => {
+            link.upower = crate::upower::Server::serve(conn.clone())
+                .map_err(|e| eprintln!("host-link: warn: battery: {e}"))
+                .ok();
+            link.network = crate::network::Server::serve(conn)
+                .map_err(|e| eprintln!("host-link: warn: network: {e}"))
+                .ok();
+        }
+        Err(e) => eprintln!("host-link: warn: battery and network: {e}"),
+    }
+
+    send(&GuestMsg::Ready {
+        version: crate::VERSION,
+    })?;
+    // Keep-awake: follows gnome-session's idle inhibitors, on the same connection. After `ready`, so
+    // that line always comes first.
+    if let Some(conn) = bus.clone() {
+        let send = send.clone();
+        let watched = crate::awake::watch(conn, move |on| {
+            if let Err(e) = send(&GuestMsg::KeepAwake { on }) {
+                eprintln!("host-link: warn: keep-awake: {e}");
+            }
+        });
+        if let Err(e) = watched {
+            eprintln!("host-link: warn: keep-awake: {e}");
+        }
+    }
     eprintln!("host-link: ready");
     for line in std::io::stdin().lock().lines() {
         match line {
@@ -294,7 +411,9 @@ mod tests {
             r##"{"kind":"appearance","dark":true,"accent":"#3584e4","text_scale":1.15,"animations":false,"high_contrast":false}"##,
         )
         .unwrap();
-        let HostMsg::Appearance(a) = a;
+        let HostMsg::Appearance(a) = a else {
+            panic!("{a:?}")
+        };
         let s = settings_for(&a);
         assert_eq!(
             s,
