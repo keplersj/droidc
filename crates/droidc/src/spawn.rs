@@ -409,10 +409,11 @@ pub fn serve(name: &str, allow_uid: Option<u32>, launcher: &[String]) -> Result<
 }
 
 /// The environment a root command gets: the caller's, without what `sudo` drops, and with root's own
-/// `HOME`, `USER` and `LOGNAME`.
+/// `HOME`, `USER` and `LOGNAME`. `DROIDC_SPAWNER` stays: a root Flatpak runs its install triggers
+/// under the bwrap shim, which needs the spawner too.
 fn root_env() -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = std::env::vars()
-        .filter(|(k, _)| !UNSAFE_ENV.contains(&k.as_str()) && k != SOCKET_ENV)
+        .filter(|(k, _)| !UNSAFE_ENV.contains(&k.as_str()))
         .collect();
     if let Some(user) = env.get("USER").cloned() {
         env.insert("SUDO_USER".into(), user);
@@ -498,6 +499,46 @@ pub fn client(name: &str, args: &[String]) -> Result<i32> {
     request(name, &req, &[], |_| {})
 }
 
+/// The spawner's socket name: `$DROIDC_SPAWNER`, else the nearest ancestor's. Flatpak starts
+/// bubblewrap with an empty environment, so the bwrap shim finds it in the flatpak that started it.
+fn spawner_socket() -> Option<std::ffi::OsString> {
+    if let Some(v) = std::env::var_os(SOCKET_ENV).filter(|v| !v.is_empty()) {
+        return Some(v);
+    }
+    let mut pid = std::os::unix::process::parent_id();
+    for _ in 0..16 {
+        if pid <= 1 {
+            break;
+        }
+        if let Some(v) = environ_var(&format!("/proc/{pid}/environ"), SOCKET_ENV) {
+            return Some(v);
+        }
+        pid = parent_of(pid)?;
+    }
+    None
+}
+
+/// `key`'s non-empty value in a `/proc/PID/environ` file, if it can be read.
+fn environ_var(path: &str, key: &str) -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStringExt;
+    let data = std::fs::read(path).ok()?;
+    let prefix = format!("{key}=");
+    data.split(|b| *b == 0)
+        .find_map(|e| e.strip_prefix(prefix.as_bytes()))
+        .filter(|v| !v.is_empty())
+        .map(|v| std::ffi::OsString::from_vec(v.to_vec()))
+}
+
+/// The parent pid in `/proc/PID/stat` (the field after the state, past the command's last `)`).
+fn parent_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat[stat.rfind(')')? + 1..]
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
 /// Sends `req` with our stdin, stdout, stderr and `extra` descriptors, forwards terminal signals, and
 /// returns the command's status. `started` gets a sandbox's pid when the server reports it.
 pub fn request(
@@ -506,7 +547,7 @@ pub fn request(
     extra: &[i32],
     mut started: impl FnMut(u32),
 ) -> Result<i32> {
-    let Some(socket) = std::env::var_os(SOCKET_ENV).filter(|v| !v.is_empty()) else {
+    let Some(socket) = spawner_socket() else {
         return Err(Error::not_found(format!(
             "{name} needs droidc's spawner, which this session does not have ({SOCKET_ENV} is unset)"
         )));
@@ -639,13 +680,32 @@ mod tests {
     }
 
     #[test]
+    fn the_spawner_is_found_in_an_ancestor_environment() {
+        let me = std::process::id();
+        assert_eq!(parent_of(me), Some(std::os::unix::process::parent_id()));
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("environ");
+        std::fs::write(
+            &f,
+            b"A=1\0DROIDC_SPAWNERX=no\0DROIDC_SPAWNER=droidc-box\0B=2\0",
+        )
+        .unwrap();
+        assert_eq!(
+            environ_var(f.to_str().unwrap(), SOCKET_ENV),
+            Some("droidc-box".into())
+        );
+        std::fs::write(&f, b"A=1\0DROIDC_SPAWNER=\0").unwrap();
+        assert_eq!(environ_var(f.to_str().unwrap(), SOCKET_ENV), None);
+    }
+
+    #[test]
     fn the_root_environment_drops_what_sudo_drops() {
         std::env::set_var("LD_PRELOAD", "/x.so");
         std::env::set_var("USER", "selkie");
         std::env::set_var(SOCKET_ENV, "droidc-test");
         let env = root_env();
         assert!(!env.contains_key("LD_PRELOAD"));
-        assert!(!env.contains_key(SOCKET_ENV));
+        assert_eq!(env[SOCKET_ENV], "droidc-test");
         assert_eq!(env["USER"], "root");
         assert_eq!(env["SUDO_USER"], "selkie");
         assert_eq!(env["HOME"], "/root");
