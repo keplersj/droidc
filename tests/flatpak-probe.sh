@@ -39,17 +39,6 @@ step "run Bazaar as the user (bwrap)"
 T=120 run flatpak run --command=bazaar io.github.kolunmi.Bazaar --help
 T=120 run flatpak -v run --command=true io.github.kolunmi.Bazaar
 
-step "system install as the user, no helper on the bus (what Bazaar does)"
-T=300 run flatpak install --system -y --noninteractive flathub "$APP"
-
-step "system install as the user, flatpak-system-helper started by hand on the system bus (no polkit)"
-/usr/libexec/flatpak-system-helper -r > /tmp/helper.log 2>&1 &
-HELPER=$!
-sleep 3
-T=600 run flatpak install --system -y --noninteractive flathub "$APP"
-kill $HELPER 2>/dev/null
-run cat /tmp/helper.log
-
 step "system install as the user, droidc polkit and the helper without RevokeFS (as supervise starts them)"
 droidc polkit > /tmp/polkit.log 2>&1 &
 POLKIT=$!
@@ -60,19 +49,13 @@ HELPER=$!
 sleep 3
 T=1200 TAIL=80 run flatpak install -v --system -y --noninteractive flathub "$APP"
 run sh -c 'ls -la /var/tmp/ /var/tmp/flatpak-cache-*/ 2>&1 | tail -30'
+# What the client left of a child repo it removed after a deploy (it reuses the directory next).
+run sh -c 'for r in /var/tmp/flatpak-cache-*/repo-*/; do echo "== $r"; ls -la "$r"; find "$r" -maxdepth 3 -type d | head -20; find "$r" -type f | wc -l; find "$r" ! -perm -u+w | head -5; done'
+run sh -c 'cp -a /var/tmp/flatpak-cache-* /tmp/ 2>&1 | tail -3; for r in /tmp/flatpak-cache-*/repo-*/; do rm -rf "$r" 2>&1 | head -10; echo "rm $r: $?"; ls -la "$r" 2>&1 | head -5; done'
 run flatpak list --system --columns=application,branch,installation
 T=120 run flatpak run --command=true "$APP"
 kill $HELPER $POLKIT 2>/dev/null
 run sh -c 'tail -n 80 /tmp/polkit.log; tail -n 120 /tmp/helper3.log'
-
-step "system install as the user, helper in session mode (skips polkit)"
-dbus-daemon --session --address=unix:path=/tmp/session_bus --fork --print-pid=1 >/dev/null
-DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/session_bus /usr/libexec/flatpak-system-helper --session -r > /tmp/helper2.log 2>&1 &
-HELPER=$!
-sleep 3
-DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/session_bus FLATPAK_SYSTEM_HELPER_ON_SESSION=1 T=600 run flatpak install --system -y --noninteractive flathub "$APP"
-kill $HELPER 2>/dev/null
-run cat /tmp/helper2.log
 
 step "user installation"
 run flatpak --user remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
@@ -84,3 +67,6 @@ step "appstream refresh (system, fake root) and Bazaar's data"
 T=600 run sudo flatpak update --appstream --system --noninteractive
 run sh -c 'ls /var/lib/flatpak/appstream/*/*/ 2>&1 | head'
 echo; echo "probe done"
+# proot waits for every process it traced: stop the daemons the probe started.
+pkill -f flatpak-system-helper; pkill -f "droidc polkit"; pkill xdg-dbus-proxy; pkill dbus-daemon
+exit 0
