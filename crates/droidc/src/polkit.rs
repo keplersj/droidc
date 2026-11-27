@@ -38,8 +38,8 @@ type ActionDescription = (
     HashMap<String, String>,
 );
 
-/// polkit's `(bba{ss})` authorization result: is_authorized, is_challenge, details. One struct, so
-/// the reply is a single `(bba{ss})` argument as libpolkit reads it, not three arguments.
+/// polkit's `(bba{ss})` authorization result: is_authorized, is_challenge, details. Returned wrapped
+/// in a one-element tuple, so the reply is a single `(bba{ss})` argument as libpolkit reads it.
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, zbus::zvariant::Type)]
 struct AuthorizationResult(bool, bool, HashMap<String, String>);
 
@@ -104,7 +104,7 @@ impl Authority {
         _details: HashMap<String, String>,
         _flags: u32,
         _cancellation_id: String,
-    ) -> AuthorizationResult {
+    ) -> (AuthorizationResult,) {
         let uid = self.subject_uid(conn, &subject).await;
         let ok = self.allowed(uid);
         if !ok {
@@ -113,7 +113,8 @@ impl Authority {
                 subject.0
             );
         }
-        AuthorizationResult(ok, false, HashMap::new())
+        // A one-element tuple: zbus sends a bare struct's fields as separate out arguments.
+        (AuthorizationResult(ok, false, HashMap::new()),)
     }
 
     fn cancel_check_authorization(&self, _cancellation_id: String) {}
@@ -244,6 +245,13 @@ mod tests {
             .find(|p| p.is_file())
     }
 
+    /// The body signature as sent: zbus's own `Signature` shows one struct argument and three
+    /// separate arguments alike, so read the header's signature field (code 8, type `g`).
+    fn wire_signature(raw: &[u8]) -> &str {
+        let at = raw.windows(4).position(|w| w == b"\x08\x01g\x00").unwrap() + 4;
+        std::str::from_utf8(&raw[at + 1..at + 1 + raw[at] as usize]).unwrap()
+    }
+
     fn check(
         c: &zbus::blocking::Connection,
         subject: (&str, HashMap<&str, Value>),
@@ -263,10 +271,11 @@ mod tests {
                 ),
             )
             .unwrap();
-        // One (bba{ss}) out argument: libpolkit reads the reply as "(@(bba{ss}))".
+        // One (bba{ss}) out argument, not three: libpolkit reads the reply as "(@(bba{ss}))".
         let body = reply.body();
-        assert_eq!(body.signature().to_string(), "(bba{ss})");
-        body.deserialize().unwrap()
+        assert_eq!(wire_signature(reply.data()), "(bba{ss})");
+        let (r,): (AuthorizationResult,) = body.deserialize().unwrap();
+        r
     }
 
     /// Serve on a private dbus-daemon and ask the way flatpak-system-helper and pkcheck do.
