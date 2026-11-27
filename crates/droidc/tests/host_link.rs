@@ -50,6 +50,7 @@ fn appearance_from_the_host_reaches_gsettings() {
         writeln!(stdin, "{a}").unwrap();
         writeln!(stdin, "{a}").unwrap();
         writeln!(stdin, r#"{{"kind":"appearance","dark":false}}"#).unwrap();
+        writeln!(stdin, r#"{{"kind":"screen-lock","by_android":true}}"#).unwrap();
     }
     let status = child.wait().unwrap();
     let mut err = String::new();
@@ -65,6 +66,10 @@ fn appearance_from_the_host_reaches_gsettings() {
             "set org.gnome.desktop.interface accent-color 'purple'",
             "set org.gnome.desktop.interface text-scaling-factor 1.30",
             "set org.gnome.desktop.interface color-scheme 'default'",
+            "set org.gnome.desktop.screensaver lock-enabled false",
+            "set org.gnome.desktop.session idle-delay uint32 0",
+            "set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'",
+            "set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type 'nothing'",
         ]
     );
 }
