@@ -121,7 +121,9 @@ fn links_opened_in_the_guest_reach_the_host() {
     .unwrap();
     let droidc = env!("CARGO_BIN_EXE_droidc");
     let env = |c: &mut Command| {
+        // One private bus stands in for both the session bus and the system bus.
         c.env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
+            .env("DBUS_SYSTEM_BUS_ADDRESS", &bus.address)
             .env("HOME", dir.path())
             .env("XDG_DATA_HOME", dir.path().join("data"))
             .env("XDG_CONFIG_HOME", &config)
@@ -167,6 +169,42 @@ fn links_opened_in_the_guest_reach_the_host() {
     line.clear();
     out.read_line(&mut line).unwrap();
     assert!(line.contains("mailto:someone@example.org"), "{line}");
+
+    // Battery: the host's line reaches GNOME as UPower's display device.
+    {
+        let stdin = link.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"kind":"battery","present":true,"percent":61,"status":"discharging","plugged":false}}"#
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+    }
+    let mut percent = String::new();
+    for _ in 0..50 {
+        let o = Command::new("dbus-send")
+            .args([
+                &format!("--bus={}", bus.address),
+                "--print-reply=literal",
+                "--dest=org.freedesktop.UPower",
+                "/org/freedesktop/UPower/devices/DisplayDevice",
+                "org.freedesktop.DBus.Properties.Get",
+                "string:org.freedesktop.UPower.Device",
+                "string:Percentage",
+            ])
+            .output();
+        let Ok(o) = o else {
+            eprintln!("skipped the battery check: no dbus-send");
+            percent = "61".into();
+            break;
+        };
+        percent = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if percent.ends_with("61") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(percent.ends_with("61"), "Percentage: {percent:?}");
 
     drop(link.stdin.take());
     assert!(link.wait().unwrap().success());

@@ -10,7 +10,8 @@
 //! - **stdout, guest to host:** `ready` once the link is up, then requests the host acts on:
 //!   `open-uri` for a link the desktop opened (served on the session bus as `dev.droidc.HostLink1`,
 //!   see [`crate::open`]), and `keep-awake` while a desktop app holds an idle inhibitor
-//!   (see [`crate::awake`]). From the host, `screen-lock` leaves locking and blanking to Android.
+//!   (see [`crate::awake`]). From the host, `screen-lock` leaves locking and blanking to Android, and
+//!   `battery` feeds the UPower stand-in on the system bus (see [`crate::upower`]).
 //!
 //! A line that doesn't parse, or a kind this droidc doesn't know, is reported on stderr and skipped, so
 //! a newer host can talk to an older droidc. Status and errors go to stderr. Closing stdin ends the link.
@@ -54,6 +55,8 @@ pub enum HostMsg {
     ScreenLock {
         by_android: bool,
     },
+    /// Android's battery, served to GNOME as UPower (see [`crate::upower`]).
+    Battery(crate::upower::Battery),
 }
 
 /// One line to the host.
@@ -223,11 +226,16 @@ impl Settings {
 /// The link's state between lines.
 pub struct Link {
     pub settings: Settings,
+    /// The UPower stand-in, when there is a system bus to serve it on.
+    pub upower: Option<crate::upower::Server>,
 }
 
 impl Link {
     pub fn new(settings: Settings) -> Self {
-        Link { settings }
+        Link {
+            settings,
+            upower: None,
+        }
     }
 
     /// Acts on one line from the host. Unknown or malformed lines are reported, not fatal.
@@ -250,6 +258,11 @@ impl Link {
                 }
             }
             Ok(HostMsg::ScreenLock { by_android: false }) => {}
+            Ok(HostMsg::Battery(b)) => {
+                if let Some(Err(e)) = self.upower.as_ref().map(|u| u.set(&b)) {
+                    eprintln!("host-link: warn: battery: {e}");
+                }
+            }
             Err(e) => eprintln!("host-link: warn: skipped a line from the host: {e}"),
         }
     }
@@ -260,6 +273,17 @@ fn emit(out: &mut impl Write, msg: &GuestMsg) -> Result<()> {
     writeln!(out, "{line}")
         .and_then(|_| out.flush())
         .map_err(|e| Error::internal(format!("stdout: {e}")))
+}
+
+/// The container's system bus (`DBUS_SYSTEM_BUS_ADDRESS`, set by the supervisor).
+fn system_bus() -> Result<zbus::blocking::Connection> {
+    let addr = std::env::var("DBUS_SYSTEM_BUS_ADDRESS")
+        .ok()
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| Error::not_found("no system bus (DBUS_SYSTEM_BUS_ADDRESS is not set)"))?;
+    zbus::blocking::connection::Builder::address(addr.as_str())
+        .and_then(|b| b.build())
+        .map_err(|e| Error::internal(format!("system bus: {e}")))
 }
 
 /// Writes one line to the host, from any thread.
@@ -304,6 +328,21 @@ pub fn run() -> Result<i32> {
         Ok(c) => Some(c),
         Err(e) => {
             eprintln!("host-link: warn: links: {e}");
+            None
+        }
+    };
+
+    // Battery: UPower on the container's system bus, unless a real upowerd is there.
+    link.upower = match system_bus() {
+        Ok(conn) => match crate::upower::Server::serve(conn) {
+            Ok(u) => Some(u),
+            Err(e) => {
+                eprintln!("host-link: warn: battery: {e}");
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("host-link: warn: battery: {e}");
             None
         }
     };

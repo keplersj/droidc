@@ -36,5 +36,6 @@ pub mod spawn;
 pub mod status;
 pub mod supervise;
 pub mod unpack;
+pub mod upower;
 pub mod usersvc;
 pub mod verify_glue;
