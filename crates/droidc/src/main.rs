@@ -379,7 +379,12 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
 /// Run a guest sudo/su/pkexec/spawn shim and exit with the root command's status; 127 if it could
 /// not run. `name` is how the user invoked it, for the error.
 fn run_shim(name: &str, args: &[String]) -> i32 {
-    match droidc::spawn::client(name, args) {
+    let done = if name == "bwrap" {
+        droidc::bwrap::client(args)
+    } else {
+        droidc::spawn::client(name, args)
+    };
+    match done {
         Ok(code) => code,
         Err(e) => {
             eprintln!("{name}: {e}");

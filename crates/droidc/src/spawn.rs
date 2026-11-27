@@ -31,7 +31,15 @@ use std::process::{Command, Stdio};
 /// The guest environment variable naming the server's abstract socket (without the leading NUL).
 pub const SOCKET_ENV: &str = "DROIDC_SPAWNER";
 /// Where the shims are bound in the guest (`shell-spec`), all of them the guest droidc binary.
-pub const SHIMS: [&str; 3] = ["/usr/bin/sudo", "/usr/bin/su", "/usr/bin/pkexec"];
+/// `bwrap` is `crate::bwrap`, the rest are root commands.
+pub const SHIMS: [&str; 4] = [
+    "/usr/bin/sudo",
+    "/usr/bin/su",
+    "/usr/bin/pkexec",
+    crate::bwrap::SHIM,
+];
+/// Descriptors one request may carry (stdin, stdout, stderr and a sandbox's).
+const MAX_FDS: usize = 3 + crate::bwrap::MAX_FDS;
 /// Variables a request never carries, as `sudo` also refuses to pass them on.
 const UNSAFE_ENV: [&str; 6] = [
     "LD_PRELOAD",
@@ -48,6 +56,10 @@ pub struct Request {
     pub argv: Vec<String>,
     pub cwd: String,
     pub env: BTreeMap<String, String>,
+    /// A `bwrap` request: run in a sandbox of its own, as the caller, instead of in the container as
+    /// root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<crate::bwrap::Sandbox>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -64,6 +76,10 @@ enum Message {
     Failed {
         error: String,
     },
+    /// A sandbox started (its host pid, for `bwrap --info-fd`).
+    Started {
+        pid: u32,
+    },
 }
 
 fn abstract_addr(name: &str) -> Result<SocketAddrUnix> {
@@ -72,7 +88,8 @@ fn abstract_addr(name: &str) -> Result<SocketAddrUnix> {
 }
 
 fn send_fds(sock: &UnixStream, line: &str, fds: &[BorrowedFd]) -> Result<()> {
-    let mut space = [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(3))];
+    let mut space =
+        [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS))];
     let mut buf = SendAncillaryBuffer::new(&mut space);
     buf.push(SendAncillaryMessage::ScmRights(fds));
     let bytes = format!("{line}\n");
@@ -94,7 +111,8 @@ fn send_fds(sock: &UnixStream, line: &str, fds: &[BorrowedFd]) -> Result<()> {
 
 /// Reads one line and the fds that came with it.
 fn recv_with_fds(sock: &UnixStream) -> Result<(String, Vec<OwnedFd>)> {
-    let mut space = [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(3))];
+    let mut space =
+        [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS))];
     let mut line = Vec::new();
     let mut fds = Vec::new();
     loop {
@@ -104,7 +122,8 @@ fn recv_with_fds(sock: &UnixStream) -> Result<(String, Vec<OwnedFd>)> {
             sock.as_fd(),
             &mut [std::io::IoSliceMut::new(&mut byte)],
             &mut anc,
-            RecvFlags::empty(),
+            // Not inherited by other requests' children; a sandbox's are placed on purpose.
+            RecvFlags::CMSG_CLOEXEC,
         )
         .map_err(|e| Error::internal(format!("recvmsg: {e}")))?;
         for m in anc.drain() {
@@ -119,7 +138,7 @@ fn recv_with_fds(sock: &UnixStream) -> Result<(String, Vec<OwnedFd>)> {
             break;
         }
         line.push(byte[0]);
-        if line.len() > 1 << 20 {
+        if line.len() > 16 << 20 {
             return Err(Error::invalid("request too long"));
         }
     }
@@ -171,6 +190,57 @@ fn peer_uid(sock: &UnixStream) -> Option<u32> {
         .map(|c| c.uid.as_raw())
 }
 
+/// Removes a sandbox's staging directory when the request ends.
+struct Staging(std::path::PathBuf);
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn staging_dir() -> Result<Staging> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let base = std::env::var_os("DROIDC_SANDBOX_DIR")
+        .or_else(|| std::env::var_os("PROOT_TMP_DIR"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join(format!(
+        "droidc-sandbox-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).context(dir.display().to_string())?;
+    Ok(Staging(dir))
+}
+
+/// The command for a `bwrap` request (a sibling proot over the sandbox's own root and binds), the
+/// environment to start it with, and its staging directory.
+fn sandbox_argv(
+    launcher: &[String],
+    req: &Request,
+    sb: &crate::bwrap::Sandbox,
+) -> Result<(Vec<String>, BTreeMap<String, String>, Staging)> {
+    let l = crate::bwrap::Launcher::parse(launcher)?;
+    let staging = staging_dir()?;
+    // A bind may only resolve to what the guest itself sees.
+    let mut allowed = vec![l.rootfs.clone()];
+    allowed.extend(l.binds.iter().map(|(h, _)| h.clone()));
+    let plan = crate::bwrap::plan(&l, &sb.ops, &staging.0, &allowed)?;
+    let mut argv = plan.argv(&l, &req.cwd, sb.root);
+    argv.extend(req.argv.iter().cloned());
+    // proot passes its environment to the command: the request's, plus proot's own settings (which
+    // the server has, as every proot it starts does). No `env -i` as for root commands: the sandbox
+    // need not have `/usr/bin/env`.
+    let mut env: BTreeMap<String, String> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("PROOT_"))
+        .collect();
+    env.extend(req.env.clone());
+    Ok((argv, env, staging))
+}
+
 fn run_request(
     launcher: &[String],
     sock: &UnixStream,
@@ -180,45 +250,93 @@ fn run_request(
     if req.argv.is_empty() {
         return Err(Error::invalid("no command"));
     }
-    if fds.len() != 3 {
+    let extra = req.sandbox.as_ref().map_or(0, |sb| sb.fds.len());
+    if fds.len() != 3 + extra {
         return Err(Error::invalid(format!(
-            "expected stdin, stdout and stderr, got {} descriptor(s)",
+            "expected stdin, stdout, stderr and {extra} more, got {} descriptor(s)",
             fds.len()
         )));
     }
-    let argv = child_argv(launcher, req);
+    let (argv, env, _staging) = match &req.sandbox {
+        None => (child_argv(launcher, req), None, None),
+        Some(sb) => {
+            if sb.fds.iter().any(|fd| *fd < 3) {
+                return Err(Error::invalid("a sandbox descriptor below 3"));
+            }
+            let (argv, env, staging) = sandbox_argv(launcher, req, sb)?;
+            // The spawner's own log: what a sandbox was started as, for when it fails.
+            eprintln!("droidc spawn-server: bwrap: {}", argv.join(" "));
+            (argv, Some(env), Some(staging))
+        }
+    };
     let (stdin, stdout, stderr) = (fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd());
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
+    if let Some(env) = &env {
+        cmd.env_clear().envs(env);
+    }
+    // A sandbox's descriptors, at the numbers the shim had them.
+    let placed: Vec<(i32, i32)> = req.sandbox.as_ref().map_or_else(Vec::new, |sb| {
+        fds[3..]
+            .iter()
+            .map(|f| f.as_raw_fd())
+            .zip(sb.fds.iter().copied())
+            .collect()
+    });
+    let mut high = vec![-1; placed.len()];
     // SAFETY: the child's own descriptors; `Stdio::from` would take ownership of ours.
     unsafe {
         cmd.stdin(Stdio::from_raw_fd(libc::dup(stdin)))
             .stdout(Stdio::from_raw_fd(libc::dup(stdout)))
             .stderr(Stdio::from_raw_fd(libc::dup(stderr)));
         // Its own process group, so a forwarded signal reaches the whole root command and not us.
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             let _ = rustix::process::setsid();
+            // Out of the way first (a target may be another's source), then into place; dup2 leaves
+            // the target open across exec. Only async-signal-safe calls, no allocation.
+            for (i, (src, _)) in placed.iter().enumerate() {
+                high[i] = libc::fcntl(*src, libc::F_DUPFD_CLOEXEC, 1000);
+                if high[i] < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            for (i, (_, to)) in placed.iter().enumerate() {
+                if libc::dup2(high[i], *to) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
             Ok(())
         });
     }
     let mut child = cmd.spawn().context(&argv[0])?;
     let pid = child.id();
+    let sandboxed = req.sandbox.is_some();
+    if sandboxed {
+        reply(sock, &Message::Started { pid });
+    }
+    let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // While it runs, the shim may send signals (it has the terminal, we do not).
     let signals = sock.try_clone().context("socket")?;
+    let gone = exited.clone();
     std::thread::spawn(move || {
         for line in BufReader::new(signals)
             .lines()
             .map_while(std::result::Result::ok)
         {
             if let Ok(Message::Signal { signal }) = serde_json::from_str::<Message>(&line) {
-                if (1..=31).contains(&signal) {
+                if (1..=31).contains(&signal) && !gone.load(std::sync::atomic::Ordering::SeqCst) {
                     // The child is a session leader: signal its group.
                     unsafe { libc::kill(-(pid as i32), signal) };
                 }
             }
         }
+        // The shim went. A sandbox goes with its bwrap, as it would with --die-with-parent.
+        if sandboxed && !gone.load(std::sync::atomic::Ordering::SeqCst) {
+            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        }
     });
     let st = child.wait().context("wait")?;
+    exited.store(true, std::sync::atomic::Ordering::SeqCst);
     Ok(st
         .code()
         .or_else(|| st.signal().map(|s| 128 + s))
@@ -369,17 +487,29 @@ pub fn client(name: &str, args: &[String]) -> Result<i32> {
     if argv.is_empty() {
         return Ok(0); // `sudo -v`
     }
-    let Some(socket) = std::env::var_os(SOCKET_ENV).filter(|v| !v.is_empty()) else {
-        return Err(Error::not_found(format!(
-            "{name} needs droidc's spawner, which this session does not have ({SOCKET_ENV} is unset)"
-        )));
-    };
     let req = Request {
         argv,
         cwd: std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "/".into()),
         env: root_env(),
+        sandbox: None,
+    };
+    request(name, &req, &[], |_| {})
+}
+
+/// Sends `req` with our stdin, stdout, stderr and `extra` descriptors, forwards terminal signals, and
+/// returns the command's status. `started` gets a sandbox's pid when the server reports it.
+pub fn request(
+    name: &str,
+    req: &Request,
+    extra: &[i32],
+    mut started: impl FnMut(u32),
+) -> Result<i32> {
+    let Some(socket) = std::env::var_os(SOCKET_ENV).filter(|v| !v.is_empty()) else {
+        return Err(Error::not_found(format!(
+            "{name} needs droidc's spawner, which this session does not have ({SOCKET_ENV} is unset)"
+        )));
     };
     let name_str = socket.to_string_lossy().into_owned();
     let sock = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)
@@ -387,16 +517,14 @@ pub fn client(name: &str, args: &[String]) -> Result<i32> {
     rustix::net::connect(&sock, &abstract_addr(&name_str)?)
         .map_err(|e| Error::internal(format!("connect @{name_str}: {e}")))?;
     let stream = UnixStream::from(sock);
-    let line = serde_json::to_string(&req).map_err(|e| Error::internal(e.to_string()))?;
-    // SAFETY: borrowing our own standard descriptors for the duration of the send.
-    let (i, o, e) = unsafe {
-        (
-            BorrowedFd::borrow_raw(0),
-            BorrowedFd::borrow_raw(1),
-            BorrowedFd::borrow_raw(2),
-        )
-    };
-    send_fds(&stream, &line, &[i, o, e])?;
+    let line = serde_json::to_string(req).map_err(|e| Error::internal(e.to_string()))?;
+    // SAFETY: borrowing our own descriptors for the duration of the send.
+    let fds: Vec<BorrowedFd> = [0, 1, 2]
+        .iter()
+        .chain(extra)
+        .map(|fd| unsafe { BorrowedFd::borrow_raw(*fd) })
+        .collect();
+    send_fds(&stream, &line, &fds)?;
     forward_signals(&stream);
     for line in BufReader::new(&stream)
         .lines()
@@ -407,6 +535,7 @@ pub fn client(name: &str, args: &[String]) -> Result<i32> {
             Ok(Message::Failed { error }) => {
                 return Err(Error::internal(format!("{name}: {error}")))
             }
+            Ok(Message::Started { pid }) => started(pid),
             _ => {}
         }
     }
@@ -452,6 +581,7 @@ mod tests {
             argv: argv.iter().map(|s| s.to_string()).collect(),
             cwd: "/tmp".into(),
             env: BTreeMap::from([("A".to_string(), "b".to_string())]),
+            sandbox: None,
         }
     }
 
@@ -567,6 +697,7 @@ mod tests {
             ],
             cwd: "/tmp".into(),
             env: BTreeMap::from([("A".to_string(), "hello".to_string())]),
+            sandbox: None,
         };
         let line = serde_json::to_string(&r).unwrap();
         let null = std::fs::File::open("/dev/null").unwrap();
@@ -593,5 +724,121 @@ mod tests {
         );
         drop(stream);
         assert!(!serving.is_finished(), "the server serves more requests");
+    }
+
+    /// A `bwrap` request through a real proot, where one is installed: the sandbox's root, binds, data
+    /// files and descriptors, and its staging directory is gone afterwards.
+    #[test]
+    fn a_sandbox_request_runs_under_proot() {
+        use crate::bwrap::{Op, Sandbox};
+        let Some(proot) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|d| d.join("proot"))
+            .find(|p| p.is_file())
+        else {
+            eprintln!("skipping: no proot");
+            return;
+        };
+        let staging = tempfile::tempdir().unwrap();
+        std::env::set_var("DROIDC_SANDBOX_DIR", staging.path());
+        // proot 5.4's seccomp acceleration misses path translation on recent kernels (Ubuntu 26.04
+        // runners): the tracee then sees the host's root, not the sandbox's. The server passes
+        // PROOT_* on to the proot it starts, as Selkie's own settings are passed.
+        std::env::set_var("PROOT_NO_SECCOMP", "1");
+        let name = format!("droidc-sandbox-test-{}", std::process::id());
+        let launcher: Vec<String> = [
+            proot.to_str().unwrap(),
+            "-0",
+            "-r",
+            "/",
+            "-b",
+            "/proc",
+            "-b",
+            "/dev",
+            "-w",
+            "/",
+        ]
+        .map(String::from)
+        .to_vec();
+        {
+            let (name, launcher) = (name.clone(), launcher.clone());
+            std::thread::spawn(move || serve(&name, None, &launcher));
+        }
+        let mut stream = None;
+        for _ in 0..100 {
+            let sock = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+            if rustix::net::connect(&sock, &abstract_addr(&name).unwrap()).is_ok() {
+                stream = Some(UnixStream::from(sock));
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let stream = stream.expect("the server bound its socket");
+        let bind = |p: &str| Op::Bind {
+            src: p.into(),
+            dest: p.into(),
+        };
+        let mut ops: Vec<Op> = ["/usr", "/etc"].iter().map(|p| bind(p)).collect();
+        for l in ["bin", "lib", "lib64", "sbin"] {
+            if std::path::Path::new(&format!("/usr/{l}")).exists() {
+                ops.push(Op::Symlink {
+                    target: format!("usr/{l}"),
+                    dest: format!("/{l}"),
+                });
+            }
+        }
+        ops.extend([
+            bind("/proc"),
+            Op::Tmpfs {
+                dest: "/tmp".into(),
+            },
+            Op::Data {
+                dest: "/hello".into(),
+                data: b"data\n".to_vec(),
+            },
+        ]);
+        let r = Request {
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                // Shell builtins only: some hosts' coreutils (uutils, one multicall binary) refuse
+                // to run under proot with the host as the rootfs.
+                "read -r a </hello; read -r b <&9; set -- /tmp/*; [ -e \"$1\" ] && n=1 || n=0; \
+                 [ -e /home ] && h=home || h=no-home; echo \"$a $b $n $h $PATH\"; exit 4"
+                    .into(),
+            ],
+            cwd: "/".into(),
+            env: BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
+            sandbox: Some(Sandbox {
+                ops,
+                fds: vec![9],
+                root: false,
+            }),
+        };
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let extra = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(extra.path(), "fd nine\n").unwrap();
+        let extra_r = std::fs::File::open(extra.path()).unwrap();
+        let null = std::fs::File::open("/dev/null").unwrap();
+        send_fds(
+            &stream,
+            &serde_json::to_string(&r).unwrap(),
+            &[
+                null.as_fd(),
+                out.as_file().as_fd(),
+                out.as_file().as_fd(),
+                extra_r.as_fd(),
+            ],
+        )
+        .unwrap();
+        let mut lines = BufReader::new(&stream).lines();
+        let started: serde_json::Value =
+            serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        assert!(started["pid"].as_u64().unwrap() > 0, "{started}");
+        let done: serde_json::Value =
+            serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        let written = std::fs::read_to_string(out.path()).unwrap();
+        assert_eq!(done["status"], 4, "{done} {written}");
+        assert_eq!(written, "data fd nine 0 no-home /usr/bin:/bin\n");
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
     }
 }

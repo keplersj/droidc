@@ -1445,10 +1445,15 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with("/root/current/rootfs"));
-        // under proot the launcher binds the guest droidc over sudo/su/pkexec (the spawner shims)
+        // under proot the launcher binds the guest droidc over sudo/su/pkexec/bwrap (the spawner shims)
         assert_eq!(
             sp["shims"],
-            serde_json::json!(["/usr/bin/sudo", "/usr/bin/su", "/usr/bin/pkexec"])
+            serde_json::json!([
+                "/usr/bin/sudo",
+                "/usr/bin/su",
+                "/usr/bin/pkexec",
+                "/usr/bin/bwrap"
+            ])
         );
         assert_eq!(sp["binds"].as_array().unwrap().len(), 3);
         // reading through a different absolute path (as the guest does) works

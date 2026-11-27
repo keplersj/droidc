@@ -8,6 +8,7 @@ pub fn git_rev() -> Option<&'static str> {
 }
 
 pub mod bridge;
+pub mod bwrap;
 pub mod cgroups;
 pub mod deploy;
 pub mod displays;

@@ -539,10 +539,34 @@ it across the proot boundary:
 - This is proot's fake root, as DroidDeck already uses, not real privilege: nothing escapes the app's
   uid. On chroot (real root) the shims are not bound, so the image's own setuid binaries are used.
 
-Per container there is one spawn-server, on a socket named for the container. Flatpak's `bwrap` and
-rootless podman are not yet handled: `bwrap` needs its argv translated to a proot bind list (a later
-change on this base), and rootless podman sets up a user namespace before any runtime, which proot
-cannot give.
+Per container there is one spawn-server, on a socket named for the container. Rootless podman is not
+handled: it sets up a user namespace before any runtime, which proot cannot give.
+
+Flatpak's `bwrap` is the fourth shim (`bwrap.rs`). Flatpak runs every app, install trigger and D-Bus
+proxy under bubblewrap, which needs user namespaces that Android does not give apps. The shim parses
+bubblewrap's argv in the guest: it expands `--args`, resolves every bind source with the guest's own
+`realpath`, reads `--file`/`--bind-data` and `--seccomp` descriptors, and applies the environment
+options. It sends that as a `sandbox` request, with every other descriptor it has open (Flatpak passes
+some to the app), and the spawn-server starts a sibling proot:
+
+- The rootfs is a fresh staging directory (`$DROIDC_SANDBOX_DIR`, else `$PROOT_TMP_DIR`, else the temp
+  dir), where `--dir` and `--symlink` are made and `--tmpfs` and data files get directories and files of
+  their own. Each bind's guest source becomes a host path through the server's own launcher (its `-r`
+  and innermost `-b`), and a bind of a guest directory carries the launcher's binds below it. A source
+  that resolves (on the host, following links) outside the rootfs and the launcher's binds is refused.
+  A later mount at or above an earlier one hides it, as in bubblewrap. Mount points the sandbox owns are
+  made before the mount, as bubblewrap makes them.
+- Under `--link2symlink` a hard link is an absolute symlink to a host path next to the first link of its
+  set, anywhere in the guest (bootc's `/usr` links into `/sysroot/ostree/repo`, a Flatpak checkout into
+  `/var/lib/flatpak/repo`). So the rootfs and the launcher's directory binds are also bound at their
+  own host paths in the sandbox, where the chains resolve and nothing else looks.
+- The launcher's own flags are kept (`--kill-on-exit`, `--link2symlink`), `-0` only when the caller is
+  (proot's) root, and descriptors are put back at their numbers. `--info-fd` gets the proot's pid,
+  `--json-status-fd` the pid and the exit code, `--sync-fd` closes when the sandbox ends, and the
+  sandbox is killed when the shim goes. The staging directory is removed afterwards.
+- It is a filesystem view, not isolation: no namespaces (`--unshare-*`, `--userns`, `--pidns` are
+  ignored), no seccomp, `--ro-*` binds are writable, overlays are refused, and portals that read
+  `/proc/PID/root` see the guest's root, not the sandbox's.
 
 `--session` also starts `droidc login1`, a stand-in for `systemd-logind` on the system bus (one session,
 one seat, always active; `TakeDevice` and power operations refused), and sets `XDG_SESSION_ID=1` and
