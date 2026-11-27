@@ -7,8 +7,12 @@
 //!
 //! - **stdin, host to guest:** Android state the guest should follow. `appearance` sets GNOME's color
 //!   scheme, accent color, text size, animations and contrast from Android's.
-//! - **stdout, guest to host:** `ready` once the link is up, then requests the host acts on (later
-//!   kinds: links to open, notifications, files to pick).
+//!   `notification-action` runs a mirrored notification's button (or its default action, with no
+//!   `action`), passing typed `text` to a reply; `notification-closed` withdraws one the user dismissed
+//!   on Android. See [`crate::notifications`].
+//! - **stdout, guest to host:** `ready` once the link is up, then requests the host acts on:
+//!   `notify` shows (or updates) a guest notification, `close-notification` withdraws one. Later
+//!   kinds: links to open, files to pick.
 //!
 //! A line that doesn't parse, or a kind this droidc doesn't know, is reported on stderr and skipped, so
 //! a newer host can talk to an older droidc. Status and errors go to stderr. Closing stdin ends the link.
@@ -22,6 +26,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+
+use crate::notifications::Mirror;
 
 const INTERFACE: &str = "org.gnome.desktop.interface";
 const A11Y: &str = "org.gnome.desktop.a11y.interface";
@@ -46,6 +53,19 @@ pub struct Appearance {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum HostMsg {
     Appearance(Appearance),
+    /// A tap on a mirrored notification: a button by its id, or the notification itself.
+    NotificationAction {
+        key: String,
+        #[serde(default)]
+        action: Option<String>,
+        /// What the user typed, for a reply button.
+        #[serde(default)]
+        text: Option<String>,
+    },
+    /// The user dismissed a mirrored notification on Android.
+    NotificationClosed {
+        key: String,
+    },
 }
 
 /// One line to the host.
@@ -54,6 +74,10 @@ pub enum HostMsg {
 pub enum GuestMsg {
     /// The link is up: the host can send state.
     Ready { version: &'static str },
+    /// Show a guest notification, or update the one with the same key.
+    Notify(crate::notifications::Notification),
+    /// Take a guest notification down.
+    CloseNotification { key: String },
 }
 
 /// GNOME's accent colors (libadwaita 1.6 / GNOME 47), in `accent-color`'s spelling, with their
@@ -211,11 +235,15 @@ impl Settings {
 /// The link's state between lines.
 pub struct Link {
     pub settings: Settings,
+    pub notifications: Option<Arc<Mirror>>,
 }
 
 impl Link {
     pub fn new(settings: Settings) -> Self {
-        Link { settings }
+        Link {
+            settings,
+            notifications: None,
+        }
     }
 
     /// Acts on one line from the host. Unknown or malformed lines are reported, not fatal.
@@ -231,12 +259,33 @@ impl Link {
                     eprintln!("host-link: appearance: {n} setting(s) changed");
                 }
             }
+            Ok(HostMsg::NotificationAction { key, action, text }) => {
+                let r = self
+                    .mirror()
+                    .and_then(|m| m.activate(&key, action.as_deref(), text.as_deref()));
+                if let Err(e) = r {
+                    eprintln!("host-link: warn: notification action: {e}");
+                }
+            }
+            Ok(HostMsg::NotificationClosed { key }) => {
+                if let Err(e) = self.mirror().and_then(|m| m.dismiss(&key)) {
+                    eprintln!("host-link: warn: closing {key}: {e}");
+                }
+            }
             Err(e) => eprintln!("host-link: warn: skipped a line from the host: {e}"),
         }
     }
 }
 
-fn emit(out: &mut impl Write, msg: &GuestMsg) -> Result<()> {
+impl Link {
+    fn mirror(&self) -> std::result::Result<&Mirror, String> {
+        self.notifications
+            .as_deref()
+            .ok_or_else(|| "notifications aren't mirrored".to_string())
+    }
+}
+
+fn emit(out: &mut (impl Write + ?Sized), msg: &GuestMsg) -> Result<()> {
     let line = serde_json::to_string(msg).map_err(|e| Error::internal(e.to_string()))?;
     writeln!(out, "{line}")
         .and_then(|_| out.flush())
@@ -250,14 +299,22 @@ pub fn run() -> Result<i32> {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
+    let out: Arc<Mutex<dyn Write + Send>> = Arc::new(Mutex::new(std::io::stdout()));
     let mut link = Link::new(Settings::from_env());
-    emit(
-        &mut std::io::stdout().lock(),
-        &GuestMsg::Ready {
-            version: crate::VERSION,
-        },
-    )?;
+    {
+        let mut o = out
+            .lock()
+            .map_err(|e| Error::internal(format!("stdout: {e}")))?;
+        emit(
+            &mut *o,
+            &GuestMsg::Ready {
+                version: crate::VERSION,
+            },
+        )?;
+    }
     eprintln!("host-link: ready");
+    // Lines from the bus thread share stdout with ours, one whole line at a time.
+    link.notifications = Some(crate::notifications::start(out));
     for line in std::io::stdin().lock().lines() {
         match line {
             Ok(l) => link.handle_line(&l),
@@ -294,7 +351,9 @@ mod tests {
             r##"{"kind":"appearance","dark":true,"accent":"#3584e4","text_scale":1.15,"animations":false,"high_contrast":false}"##,
         )
         .unwrap();
-        let HostMsg::Appearance(a) = a;
+        let HostMsg::Appearance(a) = a else {
+            panic!("not appearance");
+        };
         let s = settings_for(&a);
         assert_eq!(
             s,

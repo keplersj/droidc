@@ -51,7 +51,7 @@ Value for effort, cheapest first. "Code" names where it would attach in the curr
 | 5 | **Battery and power** | `BatteryManager`, power-save mode | `org.freedesktop.UPower`, `power-profiles-daemon` stand-ins | B |
 | 6 | **Network state** | `ConnectivityManager` | `org.freedesktop.NetworkManager` stand-in (shell indicator, GIO network monitor) | B |
 | 7 | **Memory pressure** | `onTrimMemory`, lmkd | `org.freedesktop.LowMemoryMonitor` (GNOME and portals watch it) fed by trim events; Android's own kill policy is the real limit | B |
-| 8 | **Notifications** | `NotificationManager` | mirror `org.freedesktop.Notifications` calls (a bus monitor, since the shell owns the name) with actions routed back | B/C |
+| 8 | **Notifications** | `NotificationManager` (and through it Wear OS) | `droidc host-link` watches the bus as a monitor (the shell owns both names) and reports `org.freedesktop.Notifications` and `org.gtk.Notifications` (GNotification, portal) calls as `notify`/`close-notification`; taps and replies on `GNotification` buttons go back to the app (**done**) | `notifications.rs` |
 | 9 | **File chooser** | storage access framework | `FileChooser` portal returning fds; `xdg-user-dirs` bound to shared storage (Selkie) | C |
 | 10 | **Brightness, sensors, location, haptics** | `SensorManager`, `LocationManager`, `Vibrator` | `login1` `SetBrightness` (refused today), `iio-sensor-proxy` (auto-rotate, ambient light), GeoClue (Weather, Maps, automatic time zone), `feedbackd` | B |
 | 11 | **App launcher** | launcher shortcuts | `droidc apps --json`: read the deployment's `.desktop` files (name, icon path, categories, `NoDisplay`) with no guest process, so Selkie can list and launch guest apps | new, host side |
@@ -69,7 +69,17 @@ the host already owns the process, so there is no peer to check and nothing to l
 - Host to guest (stdin): `appearance` (`dark`, `accent` as `#rrggbb`, `text_scale`, `animations`,
   `high_contrast`; each optional). Settings are written with the image's `gsettings` (or
   `DROIDC_GSETTINGS`), only when they change; a key the image's GNOME lacks is tried once.
-- Guest to host (stdout): `ready` with droidc's version, first.
+- Host to guest (stdin): `notification-action` (`key`, optional `action` id, optional `text` for a
+  reply) and `notification-closed` (`key`), for a mirrored notification tapped or dismissed on Android.
+- Guest to host (stdout): `ready` with droidc's version, first; then `notify` (`key`, `app_id`,
+  `app_name`, `title`, `body`, `icon` as `names` or a guest `path`, `priority`, `category`, `actions`
+  with `id`, `label` and `reply`) and `close-notification` (`key`) as the guest's notifications come
+  and go.
+
+Notifications: only `GNotification` actions can be run from the host, since only the server may emit
+`org.freedesktop.Notifications.ActionInvoked`; a tap on any other notification should just bring the
+desktop up. A `GNotification` the user closes in GNOME's own list sends nothing on the bus, so it stays
+on Android until the app withdraws it; notifications showing before the link started aren't seen.
 
 Unknown kinds and bad lines are skipped with a warning on stderr, so the host and droidc can be updated
 separately. Later integration points add kinds in both directions.

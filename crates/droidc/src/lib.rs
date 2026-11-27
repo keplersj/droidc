@@ -25,6 +25,7 @@ pub mod layout;
 pub mod link;
 pub mod logcat;
 pub mod login1;
+pub mod notifications;
 pub mod ownership;
 pub mod platform;
 pub mod record;
