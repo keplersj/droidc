@@ -152,6 +152,10 @@ enum Cmd {
         /// Seconds to wait for the session compositor's ScreenCast service
         #[arg(long, default_value_t = 120)]
         timeout: u64,
+        /// Monitor scale to set first (closest supported; 0 leaves it alone). The user's saved
+        /// GNOME display settings for this monitor and size win over it.
+        #[arg(long, default_value_t = 0.0)]
+        scale: f64,
     },
     /// Write one message to Android's log (logcat), from the guest or the host
     Log {
@@ -475,6 +479,7 @@ fn main() {
         connector,
         dump_frame,
         timeout,
+        scale,
     } = &cli.cmd
     {
         let opts = bridge::Opts {
@@ -483,6 +488,7 @@ fn main() {
             connector: connector.clone(),
             dump_frame: dump_frame.clone(),
             timeout: std::time::Duration::from_secs(*timeout),
+            scale: *scale,
         };
         match bridge::run(&opts) {
             Ok(code) => std::process::exit(code),
