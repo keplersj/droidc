@@ -345,6 +345,25 @@ fn run_request(
 
 /// `droidc spawn-server --socket NAME [--uid N] -- launcher...`: the host side. Serves one request per
 /// connection, for as long as it runs.
+/// The launcher with its program found on the server's own `PATH`. A sandbox starts with the
+/// request's environment, which may have no `PATH` at all (Flatpak starts bwrap with an empty one),
+/// so a bare `proot` would otherwise not be found.
+fn resolve_launcher(launcher: &[String]) -> Vec<String> {
+    let mut out = launcher.to_vec();
+    if let Some(prog) = out.first_mut() {
+        if !prog.contains('/') {
+            if let Some(found) =
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                    .map(|d| d.join(&*prog))
+                    .find(|p| p.is_file())
+            {
+                *prog = found.to_string_lossy().into_owned();
+            }
+        }
+    }
+    out
+}
+
 pub fn serve(name: &str, allow_uid: Option<u32>, launcher: &[String]) -> Result<i32> {
     if launcher.is_empty() {
         return Err(Error::invalid(
@@ -358,6 +377,7 @@ pub fn serve(name: &str, allow_uid: Option<u32>, launcher: &[String]) -> Result<
     rustix::net::listen(&sock, 16).map_err(|e| Error::internal(format!("listen: {e}")))?;
     let listener = UnixListener::from(sock);
     let allow = allow_uid.unwrap_or_else(|| rustix::process::getuid().as_raw());
+    let launcher = &resolve_launcher(launcher);
     eprintln!("droidc spawn-server: listening on @{name} for uid {allow}");
     for conn in listener.incoming() {
         let conn = match conn {
@@ -699,6 +719,17 @@ mod tests {
     }
 
     #[test]
+    fn the_launcher_is_found_on_the_servers_path() {
+        let sh = resolve_launcher(&["sh".to_string(), "-c".to_string()]);
+        assert!(sh[0].starts_with('/') && sh[0].ends_with("/sh"), "{sh:?}");
+        assert_eq!(sh[1], "-c");
+        let abs = vec!["/opt/proot".to_string()];
+        assert_eq!(resolve_launcher(&abs), abs);
+        let missing = vec!["droidc-no-such-launcher".to_string()];
+        assert_eq!(resolve_launcher(&missing), missing);
+    }
+
+    #[test]
     fn the_root_environment_drops_what_sudo_drops() {
         std::env::set_var("LD_PRELOAD", "/x.so");
         std::env::set_var("USER", "selkie");
@@ -805,8 +836,19 @@ mod tests {
         // PROOT_* on to the proot it starts, as Selkie's own settings are passed.
         std::env::set_var("PROOT_NO_SECCOMP", "1");
         let name = format!("droidc-sandbox-test-{}", std::process::id());
+        // The launcher by a name found only on the server's PATH, and a request with no
+        // environment, as Flatpak sends: the server must find the launcher on its own PATH.
+        let bin = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&proot, bin.path().join("droidc-test-proot")).unwrap();
+        std::env::set_var(
+            "PATH",
+            std::env::join_paths(std::iter::once(bin.path().to_path_buf()).chain(
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+            ))
+            .unwrap(),
+        );
         let launcher: Vec<String> = [
-            proot.to_str().unwrap(),
+            "droidc-test-proot",
             "-0",
             "-r",
             "/",
@@ -867,7 +909,7 @@ mod tests {
                     .into(),
             ],
             cwd: "/".into(),
-            env: BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
+            env: BTreeMap::new(),
             sandbox: Some(Sandbox {
                 ops,
                 fds: vec![9],
@@ -898,7 +940,11 @@ mod tests {
             serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
         let written = std::fs::read_to_string(out.path()).unwrap();
         assert_eq!(done["status"], 4, "{done} {written}");
-        assert_eq!(written, "data fd nine 0 no-home /usr/bin:/bin\n");
+        // The shell sets a default PATH of its own when it is given none.
+        assert!(
+            written.starts_with("data fd nine 0 no-home "),
+            "{written:?}"
+        );
         assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
     }
 }
