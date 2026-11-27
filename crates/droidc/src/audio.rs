@@ -116,15 +116,13 @@ pub fn record_argv(o: &Opts, raw: bool) -> Vec<String> {
 
 /// Whether this `pw-record` takes `--raw`.
 fn has_raw() -> bool {
-    Command::new("pw-record")
-        .arg("--help")
-        .stdin(Stdio::null())
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout).contains("--raw")
-                || String::from_utf8_lossy(&o.stderr).contains("--raw")
-        })
-        .unwrap_or(false)
+    // `--help` exits 0 on PipeWire's tools; the option list is on stdout.
+    let argv = [
+        "sh".to_string(),
+        "-c".into(),
+        "pw-record --help 2>&1".into(),
+    ];
+    run_tool(&argv).is_ok_and(|h| h.contains("--raw"))
 }
 
 /// The id of the node named `name` in `pw-dump`'s JSON, if there is one.
@@ -197,21 +195,60 @@ impl Default for WavStrip {
     }
 }
 
+/// How long one PipeWire tool call may take. A `pw-dump` that connects while PipeWire is still
+/// starting can wait forever for its reply (seen under proot on Android), so each call is bounded
+/// and the caller retries.
+const TOOL_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn run_tool(argv: &[String]) -> Result<String> {
-    let out = Command::new(&argv[0])
+    run_tool_within(argv, TOOL_TIMEOUT)
+}
+
+/// Runs `argv` and returns its stdout, killing it if it takes longer than `limit`.
+fn run_tool_within(argv: &[String], limit: Duration) -> Result<String> {
+    let mut child = Command::new(&argv[0])
         .args(&argv[1..])
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| Error::not_found(format!("{}: {e}", argv[0])))?;
-    if !out.status.success() {
+    // Read both pipes on threads so a large dump can't fill a pipe while we wait.
+    let read = |mut r: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = r.read_to_end(&mut b);
+            b
+        })
+    };
+    let out = read(Box::new(child.stdout.take().expect("piped")));
+    let err = read(Box::new(child.stderr.take().expect("piped")));
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::internal(format!(
+                "{} did not finish within {limit:?}",
+                argv[0]
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let out = out.join().unwrap_or_default();
+    let err = err.join().unwrap_or_default();
+    if !status.success() {
         return Err(Error::internal(format!(
             "{} exited with {}: {}",
             argv[0],
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
+            status,
+            String::from_utf8_lossy(&err).trim()
         )));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 fn dump() -> Result<String> {
@@ -221,9 +258,15 @@ fn dump() -> Result<String> {
 /// Waits until the guest's PipeWire answers `pw-dump`.
 fn wait_for_pipewire(timeout: Duration) -> Result<String> {
     let deadline = Instant::now() + timeout;
+    let mut said = false;
     loop {
         match dump() {
             Ok(d) => return Ok(d),
+            Err(e) if !said && Instant::now() <= deadline => {
+                eprintln!("audio-out: waiting for PipeWire: {e}");
+                said = true;
+                std::thread::sleep(Duration::from_millis(250));
+            }
             Err(e) if Instant::now() > deadline => {
                 return Err(Error::not_found(format!(
                     "PipeWire did not answer within {timeout:?}: {e}"
@@ -344,6 +387,35 @@ pub fn run(o: &Opts) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_tool_that_hangs_is_killed_and_reported() {
+        let t = Instant::now();
+        let e = run_tool_within(&["sleep".into(), "30".into()], Duration::from_millis(200))
+            .unwrap_err();
+        assert!(t.elapsed() < Duration::from_secs(5));
+        assert!(e.to_string().contains("did not finish"), "{e}");
+    }
+
+    #[test]
+    fn a_tool_returns_its_stdout_and_its_stderr_on_failure() {
+        let ok = run_tool_within(
+            &[
+                "sh".into(),
+                "-c".into(),
+                "head -c 200000 /dev/zero | tr '\\0' x".into(),
+            ],
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(ok.len(), 200_000);
+        let e = run_tool_within(
+            &["sh".into(), "-c".into(), "echo nope >&2; exit 3".into()],
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("nope"), "{e}");
+    }
+
     use super::*;
 
     fn wav_header(extra_chunk: bool) -> Vec<u8> {
