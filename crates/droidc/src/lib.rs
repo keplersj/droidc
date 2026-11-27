@@ -7,6 +7,8 @@ pub fn git_rev() -> Option<&'static str> {
     Some(env!("DROIDC_GIT_REV")).filter(|r| !r.is_empty())
 }
 
+pub mod apps;
+pub mod audio;
 pub mod bridge;
 pub mod bwrap;
 pub mod cgroups;

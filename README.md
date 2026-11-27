@@ -46,6 +46,7 @@ droidc --root ~/droidc --json switch ghcr.io/projectbluefin/bluefin-lts:stable [
 droidc --root ~/droidc switch quay.io/centos-bootc/centos-bootc:stream10 --insecure-allow-unsigned
 droidc switch <ref> --verify-only      # resolve + verify signature, download no layers
 droidc upgrade | rollback | status | gc | shell-spec | platform
+droidc --json apps                     # the image's and user's apps from their desktop entries, with icon files
 droidc --container dev switch <ref>    # a second container: shares downloaded images, own /var, /home, session
 droidc container list | rm <name>
 droidc supervise -- bash -l            # inside the guest
@@ -90,7 +91,7 @@ Try a deployment under proot: `proot -r <root>/current/rootfs -w / /usr/bin/cat 
 
 `registry` (OCI client), `unpack` (layers, whiteouts, drop rules, metadata), `link` (hardlink /
 link2symlink / copy / auto), `etcmerge` (3-way /etc), `deploy` (staging, PENDING, recovery, switch,
-upgrade, rollback, gc), `status` (status, shell-spec), `supervise` (in-guest supervisor, graphical session), `session` (session labels and override),
+upgrade, rollback, gc), `status` (status, shell-spec), `apps` (desktop entries and icons), `supervise` (in-guest supervisor, graphical session), `session` (session labels and override),
 `bridge` (headless compositor → host compositor), `events` (NDJSON), `platform`,
 `verify_glue` (single seam to `droidc-verify`).
 

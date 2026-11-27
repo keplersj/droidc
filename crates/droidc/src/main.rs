@@ -7,7 +7,7 @@ use droidc::link::{LinkKind, DEFAULT_L2S_PREFIX};
 use droidc::platform::Platform;
 use droidc::registry::HttpConfig;
 use droidc::session::{self, Renderer, SessionSpec};
-use droidc::{bridge, enter, logcat, login1, ownership, status, supervise};
+use droidc::{apps, bridge, enter, logcat, login1, ownership, status, supervise};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -62,6 +62,8 @@ enum Cmd {
     Rollback,
     /// Show current, previous and staged
     Status,
+    /// Applications in the current deployment, from its desktop entries
+    Apps,
     /// Remove unreferenced deployments and blobs
     Gc,
     /// How to enter the current deployment
@@ -156,6 +158,25 @@ enum Cmd {
         /// GNOME display settings for this monitor and size win over it.
         #[arg(long, default_value_t = 0.0)]
         scale: f64,
+    },
+    /// (inside the guest) stream the guest's sound as raw S16LE PCM on stdout, from a PipeWire sink
+    /// made the default; status goes to stderr
+    #[command(name = "audio-out")]
+    AudioOut {
+        /// `node.name` of the sink to create (or reuse)
+        #[arg(long, default_value = "selkie-out")]
+        sink: String,
+        #[arg(long, default_value_t = 48_000)]
+        rate: u32,
+        /// 1, 2, 4 or 6
+        #[arg(long, default_value_t = 2)]
+        channels: u32,
+        /// Recorder latency, as pw-record takes it
+        #[arg(long, default_value = "20ms")]
+        latency: String,
+        /// Seconds to wait for the guest's PipeWire
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
     },
     /// Write one message to Android's log (logcat), from the guest or the host
     Log {
@@ -343,6 +364,7 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
         Cmd::Upgrade => Ok(("upgrade", deploy::upgrade(&root, em, http, &l2s)?)),
         Cmd::Rollback => Ok(("rollback", deploy::rollback(&root, em)?)),
         Cmd::Status => Ok(("status", status::status(&root)?)),
+        Cmd::Apps => Ok(("apps", apps::list(&root)?)),
         Cmd::Gc => Ok(("gc", deploy::gc(&root, em)?)),
         Cmd::ShellSpec { launcher } => {
             let l = status::Launcher::parse(launcher)
@@ -373,6 +395,7 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
         | Cmd::SpawnServer { .. }
         | Cmd::Spawn { .. }
         | Cmd::Bridge { .. }
+        | Cmd::AudioOut { .. }
         | Cmd::Login1
         | Cmd::Log { .. }
         | Cmd::Enter { .. }
@@ -494,6 +517,29 @@ fn main() {
             Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("droidc bridge: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Cmd::AudioOut {
+        sink,
+        rate,
+        channels,
+        latency,
+        timeout,
+    } = &cli.cmd
+    {
+        let opts = droidc::audio::Opts {
+            sink: sink.clone(),
+            rate: *rate,
+            channels: *channels,
+            latency: latency.clone(),
+            timeout: std::time::Duration::from_secs(*timeout),
+        };
+        match droidc::audio::run(&opts) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("droidc audio-out: {e}");
                 std::process::exit(1);
             }
         }
