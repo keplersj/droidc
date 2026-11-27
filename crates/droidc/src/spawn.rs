@@ -656,6 +656,25 @@ fn run_request(
         .unwrap_or(1))
 }
 
+/// The launcher with its program found on the server's own `PATH`. A sandbox starts with the
+/// request's environment, which may have no `PATH` at all (Flatpak starts bwrap with an empty one),
+/// so a bare `proot` would otherwise not be found.
+fn resolve_launcher(launcher: &[String]) -> Vec<String> {
+    let mut out = launcher.to_vec();
+    if let Some(prog) = out.first_mut() {
+        if !prog.contains('/') {
+            if let Some(found) =
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                    .map(|d| d.join(&*prog))
+                    .find(|p| p.is_file())
+            {
+                *prog = found.to_string_lossy().into_owned();
+            }
+        }
+    }
+    out
+}
+
 /// `droidc spawn-server --socket NAME [--uid N] -- launcher...`: the host side. Serves one request per
 /// connection, for as long as it runs. With `DROIDC_SPAWNER_ASK` set, it asks the host first (see
 /// the module docs).
@@ -682,6 +701,7 @@ pub fn serve_asking(
     rustix::net::listen(&sock, 16).map_err(|e| Error::internal(format!("listen: {e}")))?;
     let listener = UnixListener::from(sock);
     let allow = allow_uid.unwrap_or_else(|| rustix::process::getuid().as_raw());
+    let launcher = &resolve_launcher(launcher);
     eprintln!(
         "droidc spawn-server: listening on @{name} for uid {allow}{}",
         if asker.is_some() {
@@ -757,10 +777,11 @@ pub fn serve_asking(
 }
 
 /// The environment a root command gets: the caller's, without what `sudo` drops, and with root's own
-/// `HOME`, `USER` and `LOGNAME`.
+/// `HOME`, `USER` and `LOGNAME`. `DROIDC_SPAWNER` stays: a root Flatpak runs its install triggers
+/// under the bwrap shim, which needs the spawner too.
 fn root_env() -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = std::env::vars()
-        .filter(|(k, _)| !UNSAFE_ENV.contains(&k.as_str()) && k != SOCKET_ENV)
+        .filter(|(k, _)| !UNSAFE_ENV.contains(&k.as_str()))
         .collect();
     if let Some(user) = env.get("USER").cloned() {
         env.insert("SUDO_USER".into(), user);
@@ -847,6 +868,46 @@ pub fn client(name: &str, args: &[String]) -> Result<i32> {
     request(name, &req, &[], |_| {})
 }
 
+/// The spawner's socket name: `$DROIDC_SPAWNER`, else the nearest ancestor's. Flatpak starts
+/// bubblewrap with an empty environment, so the bwrap shim finds it in the flatpak that started it.
+fn spawner_socket() -> Option<std::ffi::OsString> {
+    if let Some(v) = std::env::var_os(SOCKET_ENV).filter(|v| !v.is_empty()) {
+        return Some(v);
+    }
+    let mut pid = std::os::unix::process::parent_id();
+    for _ in 0..16 {
+        if pid <= 1 {
+            break;
+        }
+        if let Some(v) = environ_var(&format!("/proc/{pid}/environ"), SOCKET_ENV) {
+            return Some(v);
+        }
+        pid = parent_of(pid)?;
+    }
+    None
+}
+
+/// `key`'s non-empty value in a `/proc/PID/environ` file, if it can be read.
+fn environ_var(path: &str, key: &str) -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStringExt;
+    let data = std::fs::read(path).ok()?;
+    let prefix = format!("{key}=");
+    data.split(|b| *b == 0)
+        .find_map(|e| e.strip_prefix(prefix.as_bytes()))
+        .filter(|v| !v.is_empty())
+        .map(|v| std::ffi::OsString::from_vec(v.to_vec()))
+}
+
+/// The parent pid in `/proc/PID/stat` (the field after the state, past the command's last `)`).
+fn parent_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat[stat.rfind(')')? + 1..]
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
 /// Sends `req` with our stdin, stdout, stderr and `extra` descriptors, forwards terminal signals, and
 /// returns the command's status. `started` gets a sandbox's pid when the server reports it.
 pub fn request(
@@ -855,7 +916,7 @@ pub fn request(
     extra: &[i32],
     mut started: impl FnMut(u32),
 ) -> Result<i32> {
-    let Some(socket) = std::env::var_os(SOCKET_ENV).filter(|v| !v.is_empty()) else {
+    let Some(socket) = spawner_socket() else {
         return Err(Error::not_found(format!(
             "{name} needs droidc's spawner, which this session does not have ({SOCKET_ENV} is unset)"
         )));
@@ -995,13 +1056,43 @@ mod tests {
     }
 
     #[test]
+    fn the_spawner_is_found_in_an_ancestor_environment() {
+        let me = std::process::id();
+        assert_eq!(parent_of(me), Some(std::os::unix::process::parent_id()));
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("environ");
+        std::fs::write(
+            &f,
+            b"A=1\0DROIDC_SPAWNERX=no\0DROIDC_SPAWNER=droidc-box\0B=2\0",
+        )
+        .unwrap();
+        assert_eq!(
+            environ_var(f.to_str().unwrap(), SOCKET_ENV),
+            Some("droidc-box".into())
+        );
+        std::fs::write(&f, b"A=1\0DROIDC_SPAWNER=\0").unwrap();
+        assert_eq!(environ_var(f.to_str().unwrap(), SOCKET_ENV), None);
+    }
+
+    #[test]
+    fn the_launcher_is_found_on_the_servers_path() {
+        let sh = resolve_launcher(&["sh".to_string(), "-c".to_string()]);
+        assert!(sh[0].starts_with('/') && sh[0].ends_with("/sh"), "{sh:?}");
+        assert_eq!(sh[1], "-c");
+        let abs = vec!["/opt/proot".to_string()];
+        assert_eq!(resolve_launcher(&abs), abs);
+        let missing = vec!["droidc-no-such-launcher".to_string()];
+        assert_eq!(resolve_launcher(&missing), missing);
+    }
+
+    #[test]
     fn the_root_environment_drops_what_sudo_drops() {
         std::env::set_var("LD_PRELOAD", "/x.so");
         std::env::set_var("USER", "selkie");
         std::env::set_var(SOCKET_ENV, "droidc-test");
         let env = root_env();
         assert!(!env.contains_key("LD_PRELOAD"));
-        assert!(!env.contains_key(SOCKET_ENV));
+        assert_eq!(env[SOCKET_ENV], "droidc-test");
         assert_eq!(env["USER"], "root");
         assert_eq!(env["SUDO_USER"], "selkie");
         assert_eq!(env["HOME"], "/root");
@@ -1248,8 +1339,19 @@ mod tests {
         // PROOT_* on to the proot it starts, as Selkie's own settings are passed.
         std::env::set_var("PROOT_NO_SECCOMP", "1");
         let name = format!("droidc-sandbox-test-{}", std::process::id());
+        // The launcher by a name found only on the server's PATH, and a request with no
+        // environment, as Flatpak sends: the server must find the launcher on its own PATH.
+        let bin = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&proot, bin.path().join("droidc-test-proot")).unwrap();
+        std::env::set_var(
+            "PATH",
+            std::env::join_paths(std::iter::once(bin.path().to_path_buf()).chain(
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+            ))
+            .unwrap(),
+        );
         let launcher: Vec<String> = [
-            proot.to_str().unwrap(),
+            "droidc-test-proot",
             "-0",
             "-r",
             "/",
@@ -1310,7 +1412,7 @@ mod tests {
                     .into(),
             ],
             cwd: "/".into(),
-            env: BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
+            env: BTreeMap::new(),
             sandbox: Some(Sandbox {
                 ops,
                 fds: vec![9],
@@ -1342,7 +1444,11 @@ mod tests {
             serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
         let written = std::fs::read_to_string(out.path()).unwrap();
         assert_eq!(done["status"], 4, "{done} {written}");
-        assert_eq!(written, "data fd nine 0 no-home /usr/bin:/bin\n");
+        // The shell sets a default PATH of its own when it is given none.
+        assert!(
+            written.starts_with("data fd nine 0 no-home "),
+            "{written:?}"
+        );
         assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
     }
 }
