@@ -112,7 +112,7 @@ jobs:
             /usr/bin/droidc bridge --width 1280 --height 800 --dump-frame /tmp/gnome.png > session.log 2>&1
           echo "exit=$?"
           set -e
-          grep -E "bridge|droidc|warn" session.log | head -20 || true
+          tail -n 200 session.log || true
           cp $W/tmp/gnome.png gnome.png
           python3 -c "from PIL import Image; im=Image.open('gnome.png').convert('RGB'); n=len(set(im.resize((160,100)).getdata())); print('distinct colors', n); assert n > 50, 'uniform frame'"
           echo "- GNOME headless frame: captured (see artifact gnome-frame)" >> "$GITHUB_STEP_SUMMARY"
