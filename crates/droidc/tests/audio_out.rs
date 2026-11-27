@@ -93,8 +93,10 @@ fn a_tone_played_in_the_guest_comes_out_as_pcm() {
         "a WAV header got through; log:\n{log}"
     );
     let loud = bytes
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]).unsigned_abs())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| i16::from_le_bytes(*c).unsigned_abs())
         .filter(|&s| s > 8_000)
         .count();
     assert!(
