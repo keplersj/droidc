@@ -47,7 +47,7 @@ Value for effort, cheapest first. "Code" names where it would attach in the curr
 | 1 | **Logs** | logd | journal sockets → `adb logcat` (**done**, `DROIDC_LOGCAT`) | `journal.rs`, `logcat.rs` |
 | 2 | **Appearance, locale, time zone, hostname** | night mode, accent, font scale, animation scale, contrast, `Locale`, `TimeZone`, device name | `droidc host-link`: an `appearance` line sets GNOME's `color-scheme`, `accent-color`, `text-scaling-factor`, `enable-animations` and `high-contrast` (**appearance done**), which the GNOME portal hands on as `org.freedesktop.portal.Settings`; still open: `timedate1`, `localed`, `hostname1` stand-ins (GNOME Settings and `gsd-datetime` ask them); `TZ`/`LANG` in the `shell-spec` env (today fixed to `C.UTF-8`, no `TZ`) | `host_link.rs`, B, `status.rs` |
 | 3 | **Open links and files** | `ACTION_VIEW` intents | `droidc open` and a hidden `dev.droidc.AndroidOpen` desktop entry, the default `x-scheme-handler` for http, https, mailto, tel, sms and geo where the user has none, so `xdg-open`, GNOME apps and the GNOME `OpenURI` portal open links on Android (**links done**); still open: files (`file:` paths need a copy into shared storage first) | `open.rs` |
-| 4 | **Suspend, lock, inhibit** | Activity pause/resume, `KeyguardManager`, wake locks | `login1`: emit `PrepareForSleep`, drive `LockedHint`/`IdleHint`, make `Inhibit` hold a wake lock; `CanSuspend`/`CanPowerOff` return `yes` where they map (today `na`, and the power calls are refused) | `login1.rs` |
+| 4 | **Suspend, lock, inhibit** | Activity pause/resume, `KeyguardManager`, wake locks | `droidc host-link`: `keep-awake` while a desktop app holds a gnome-session idle inhibitor (the host keeps the screen on), and the host's `screen-lock` turns GNOME's lock screen, idle blank and idle suspend off since Android locks the device (**done**); still open in `login1`: `PrepareForSleep`, `LockedHint`/`IdleHint`, `CanSuspend`/`CanPowerOff` (today `na`, and the power calls are refused) | `awake.rs`, `login1.rs` |
 | 5 | **Battery and power** | `BatteryManager`, power-save mode | `org.freedesktop.UPower`, `power-profiles-daemon` stand-ins | B |
 | 6 | **Network state** | `ConnectivityManager` | `org.freedesktop.NetworkManager` stand-in (shell indicator, GIO network monitor) | B |
 | 7 | **Memory pressure** | `onTrimMemory`, lmkd | `org.freedesktop.LowMemoryMonitor` (GNOME and portals watch it) fed by trim events; Android's own kill policy is the real limit | B |
@@ -73,7 +73,10 @@ the host already owns the process, so there is no peer to check and nothing to l
   the desktop opens. host-link serves `dev.droidc.HostLink1.OpenUri` on the session bus for
   `droidc open` to call, and only passes the schemes in `open::SCHEMES` (no `file:`, no `intent:`).
   The host opens it with `ACTION_VIEW`. `ready` comes after the bus name is taken, so a host that has
-  seen it can rely on links working.
+  seen it can rely on links working. `keep-awake` (`on`) follows bit 8 (idle) of gnome-session's
+  `InhibitedActions`; it is sent only when it changes, starting from off.
+- Host to guest also: `screen-lock` (`by_android: true`) writes `lock-enabled=false`,
+  `idle-delay=0` and the power plugin's `sleep-inactive-*-type='nothing'`.
 
 Unknown kinds and bad lines are skipped with a warning on stderr, so the host and droidc can be updated
 separately. Later integration points add kinds in both directions.

@@ -9,7 +9,8 @@
 //!   scheme, accent color, text size, animations and contrast from Android's.
 //! - **stdout, guest to host:** `ready` once the link is up, then requests the host acts on:
 //!   `open-uri` for a link the desktop opened (served on the session bus as `dev.droidc.HostLink1`,
-//!   see [`crate::open`]).
+//!   see [`crate::open`]), and `keep-awake` while a desktop app holds an idle inhibitor
+//!   (see [`crate::awake`]). From the host, `screen-lock` leaves locking and blanking to Android.
 //!
 //! A line that doesn't parse, or a kind this droidc doesn't know, is reported on stderr and skipped, so
 //! a newer host can talk to an older droidc. Status and errors go to stderr. Closing stdin ends the link.
@@ -48,6 +49,11 @@ pub struct Appearance {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum HostMsg {
     Appearance(Appearance),
+    /// Android locks and blanks the device: turn GNOME's own lock screen and idle blank off
+    /// (see [`crate::awake`]). `by_android: false` leaves GNOME's settings as they are.
+    ScreenLock {
+        by_android: bool,
+    },
 }
 
 /// One line to the host.
@@ -58,6 +64,8 @@ pub enum GuestMsg {
     Ready { version: &'static str },
     /// Open this link on Android (see [`crate::open`]).
     OpenUri { uri: String },
+    /// Keep the screen on (a desktop app holds an idle inhibitor), or let it sleep again.
+    KeepAwake { on: bool },
 }
 
 /// GNOME's accent colors (libadwaita 1.6 / GNOME 47), in `accent-color`'s spelling, with their
@@ -235,6 +243,13 @@ impl Link {
                     eprintln!("host-link: appearance: {n} setting(s) changed");
                 }
             }
+            Ok(HostMsg::ScreenLock { by_android: true }) => {
+                let n = self.settings.apply(&crate::awake::android_locks_settings());
+                if n > 0 {
+                    eprintln!("host-link: screen lock: left to Android ({n} setting(s) changed)");
+                }
+            }
+            Ok(HostMsg::ScreenLock { by_android: false }) => {}
             Err(e) => eprintln!("host-link: warn: skipped a line from the host: {e}"),
         }
     }
@@ -246,6 +261,9 @@ fn emit(out: &mut impl Write, msg: &GuestMsg) -> Result<()> {
         .and_then(|_| out.flush())
         .map_err(|e| Error::internal(format!("stdout: {e}")))
 }
+
+/// Writes one line to the host, from any thread.
+type SendLine = Arc<dyn Fn(&GuestMsg) -> Result<()> + Send + Sync>;
 
 /// Runs the link until stdin closes. Returns the exit code.
 pub fn run() -> Result<i32> {
@@ -265,19 +283,24 @@ pub fn run() -> Result<i32> {
         Ok(_) => {}
         Err(e) => eprintln!("host-link: warn: links: no handler: {e}"),
     }
-    let sink_out = out.clone();
-    let sink: crate::open::Sink = Arc::new(move |uri: &str| {
-        let mut o = sink_out
-            .lock()
-            .map_err(|_| Error::internal("stdout lock poisoned"))?;
-        emit(
-            &mut *o,
-            &GuestMsg::OpenUri {
+    let send: SendLine = {
+        let out = out.clone();
+        Arc::new(move |m: &GuestMsg| {
+            let mut o = out
+                .lock()
+                .map_err(|_| Error::internal("stdout lock poisoned"))?;
+            emit(&mut *o, m)
+        })
+    };
+    let sink: crate::open::Sink = {
+        let send = send.clone();
+        Arc::new(move |uri: &str| {
+            send(&GuestMsg::OpenUri {
                 uri: uri.to_string(),
-            },
-        )
-    });
-    let _bus = match crate::open::serve(sink) {
+            })
+        })
+    };
+    let bus = match crate::open::serve(sink) {
         Ok(c) => Some(c),
         Err(e) => {
             eprintln!("host-link: warn: links: {e}");
@@ -285,16 +308,21 @@ pub fn run() -> Result<i32> {
         }
     };
 
-    {
-        let mut o = out
-            .lock()
-            .map_err(|_| Error::internal("stdout lock poisoned"))?;
-        emit(
-            &mut *o,
-            &GuestMsg::Ready {
-                version: crate::VERSION,
-            },
-        )?;
+    send(&GuestMsg::Ready {
+        version: crate::VERSION,
+    })?;
+    // Keep-awake: follows gnome-session's idle inhibitors, on the same connection. After `ready`, so
+    // that line always comes first.
+    if let Some(conn) = bus.clone() {
+        let send = send.clone();
+        let watched = crate::awake::watch(conn, move |on| {
+            if let Err(e) = send(&GuestMsg::KeepAwake { on }) {
+                eprintln!("host-link: warn: keep-awake: {e}");
+            }
+        });
+        if let Err(e) = watched {
+            eprintln!("host-link: warn: keep-awake: {e}");
+        }
     }
     eprintln!("host-link: ready");
     for line in std::io::stdin().lock().lines() {
@@ -333,7 +361,9 @@ mod tests {
             r##"{"kind":"appearance","dark":true,"accent":"#3584e4","text_scale":1.15,"animations":false,"high_contrast":false}"##,
         )
         .unwrap();
-        let HostMsg::Appearance(a) = a;
+        let HostMsg::Appearance(a) = a else {
+            panic!("{a:?}")
+        };
         let s = settings_for(&a);
         assert_eq!(
             s,
