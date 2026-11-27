@@ -47,10 +47,15 @@ pub(crate) fn runtime_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Start `dbus-daemon` with the session configuration listening on `socket` (also used for the
-/// system bus: the system configuration switches to the `dbus` user, which an app uid can't).
-/// Runs in the foreground so it is our child and stops with the session; returns its address.
-fn start_dbus(socket: &std::path::Path, bin: &std::path::Path) -> Result<(String, Child)> {
+/// Start `dbus-daemon` with `config` listening on `socket`, `var` set to its address for what it
+/// activates. Runs in the foreground so it is our child and stops with the session; returns its
+/// address.
+fn start_dbus(
+    socket: &std::path::Path,
+    bin: &std::path::Path,
+    config: &std::path::Path,
+    var: &str,
+) -> Result<(String, Child)> {
     use std::io::BufRead;
     let _ = fs::remove_file(socket);
     if let Some(parent) = socket.parent() {
@@ -58,7 +63,8 @@ fn start_dbus(socket: &std::path::Path, bin: &std::path::Path) -> Result<(String
     }
     let mut child = Command::new(bin)
         .env_remove("WAYLAND_DISPLAY")
-        .arg("--config-file=/usr/share/dbus-1/session.conf")
+        .env(var, format!("unix:path={}", socket.display()))
+        .arg(format!("--config-file={}", config.display()))
         .arg(format!("--address=unix:path={}", socket.display()))
         .arg("--nofork")
         .arg("--print-address=1")
@@ -98,7 +104,17 @@ fn start_bus(socket: &std::path::Path, scope: &str, var: &str) -> Option<Child> 
         return None;
     }
     let started = if let Some(bin) = find_in_path("dbus-daemon") {
-        start_dbus(socket, &bin)
+        // The system configuration switches to the `dbus` user, which an app uid can't: the system
+        // bus gets a configuration of its own (see `system_bus_config`), the session bus the image's.
+        let config = if scope == "system" {
+            socket
+                .parent()
+                .ok_or_else(|| Error::invalid("system bus socket has no directory"))
+                .and_then(|dir| system_bus_config(dir, std::path::Path::new(SYSTEM_SERVICES_DIR)))
+        } else {
+            Ok(std::path::PathBuf::from("/usr/share/dbus-1/session.conf"))
+        };
+        config.and_then(|config| start_dbus(socket, &bin, &config, var))
     } else {
         let bin = find_in_path("dbus-broker-launch")?;
         crate::journal::start(false);
@@ -114,6 +130,85 @@ fn start_bus(socket: &std::path::Path, scope: &str, var: &str) -> Option<Child> 
             None
         }
     }
+}
+
+/// The image's system bus services, of which `SYSTEM_ACTIVATABLE` may be started on demand.
+const SYSTEM_SERVICES_DIR: &str = "/usr/share/dbus-1/system-services";
+
+/// System services the system bus here starts when first called, as the user like everything else.
+/// Only these: the rest of the image's system services (NetworkManager, udisks, accounts-daemon, the
+/// real polkitd...) expect root and a system manager, and would start broken on the first client
+/// that asks. `flatpak-system-helper` deploys into the system installation for the user's own
+/// `flatpak install` and Bazaar (it asks `droidc polkit`, see `polkit.rs`).
+///
+/// Each comes with environment its `Exec=` gets. The helper's: no RevokeFS, a FUSE mount the app can't
+/// make (`fusermount3` is refused), so Flatpak falls back to pulling into a child repo as the user
+/// and handing it to the helper, checked by its GPG signatures.
+const SYSTEM_ACTIVATABLE: [(&str, &[&str]); 1] = [(
+    "org.freedesktop.Flatpak.SystemHelper",
+    &["FLATPAK_DISABLE_REVOKEFS=1"],
+)];
+
+/// Writes the configuration of the system bus on `socket` beside it: a session-style policy
+/// (everyone may own and call anything; it is all one uid), typed `system` so activated services get
+/// `DBUS_SYSTEM_BUS_ADDRESS`, and a service directory with copies of the image's `.service` files for
+/// `SYSTEM_ACTIVATABLE` from `services`, without `User=` (only a setuid launch helper could honour it)
+/// and `SystemdService=` (there is no system manager), and with their environment put in front of
+/// `Exec=` through `/usr/bin/env`. Returns the configuration's path.
+fn system_bus_config(
+    socket: &std::path::Path,
+    services: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let dir = socket
+        .parent()
+        .ok_or_else(|| Error::invalid("system bus socket has no directory"))?;
+    fs::create_dir_all(dir).context(dir.display())?;
+    let svc_dir = dir.join("droidc-system-services");
+    let _ = fs::remove_dir_all(&svc_dir);
+    fs::create_dir_all(&svc_dir).context(svc_dir.display())?;
+    for (name, env) in SYSTEM_ACTIVATABLE {
+        let file = format!("{name}.service");
+        let Ok(text) = fs::read_to_string(services.join(&file)) else {
+            continue;
+        };
+        let kept: String = text
+            .lines()
+            .filter(|l| {
+                let k = l.split('=').next().unwrap_or("").trim();
+                k != "User" && k != "SystemdService"
+            })
+            .map(|l| match l.trim_start().strip_prefix("Exec=") {
+                Some(cmd) if !env.is_empty() => {
+                    format!("Exec=/usr/bin/env {} {}\n", env.join(" "), cmd.trim_start())
+                }
+                _ => format!("{l}\n"),
+            })
+            .collect();
+        fs::write(svc_dir.join(&file), kept).context(&file)?;
+    }
+    let config = dir.join("droidc-system.conf");
+    let xml = format!(
+        r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<!-- Written by droidc (supervise.rs, system_bus_config). -->
+<busconfig>
+  <type>system</type>
+  <keep_umask/>
+  <listen>unix:path={}</listen>
+  <auth>EXTERNAL</auth>
+  <servicedir>{}</servicedir>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"#,
+        socket.display(),
+        svc_dir.display()
+    );
+    fs::write(&config, xml).context(config.display())?;
+    Ok(config)
 }
 
 const MACHINE_ID: &str = "/etc/machine-id";
@@ -752,37 +847,39 @@ pub(crate) fn become_subreaper() {
     }
 }
 
-/// `droidc login1` (this binary; `DROIDC_LOGIN1` replaces it in tests): the logind stand-in on the
-/// system bus. It leaves a real logind in charge if one owns the name.
-fn start_login1() -> Option<Child> {
-    let argv = match std::env::var("DROIDC_LOGIN1") {
+/// A stand-in on the system bus: `droidc <name>` (this binary; `env`, if set, replaces it in tests).
+/// `login1` stands in for logind, `polkit` for polkitd; each leaves a real one in charge if it owns
+/// the name.
+fn start_standin(name: &str, env: &str) -> Option<Child> {
+    let argv = match std::env::var(env) {
         Ok(b) => vec![b],
         Err(_) => vec![
             std::env::current_exe()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "droidc".into()),
-            "login1".into(),
+            name.into(),
         ],
     };
     match spawn(&argv, &[]) {
         Ok(c) => Some(c),
         Err(e) => {
-            eprintln!("warn: login1: {e}");
+            eprintln!("warn: {name}: {e}");
             None
         }
     }
 }
 
-/// The system bus (unless one is given) and the logind stand-in on it.
+/// The system bus (unless one is given) and the logind and polkit stand-ins on it.
 fn start_system_services() -> Vec<Child> {
     let mut out = Vec::new();
     if std::env::var_os("DBUS_SYSTEM_BUS_ADDRESS").is_none() {
         out.extend(start_system_bus());
     }
-    // logind answers on that bus; without one (a dbus-broker-only image has no dbus-daemon to run a
+    // They answer on that bus; without one (a dbus-broker-only image has no dbus-daemon to run a
     // system bus on, and dbus-broker's system scope needs systemd and root) there is nothing to serve.
     if std::env::var_os("DBUS_SYSTEM_BUS_ADDRESS").is_some() {
-        out.extend(start_login1());
+        out.extend(start_standin("login1", "DROIDC_LOGIN1"));
+        out.extend(start_standin("polkit", "DROIDC_POLKIT"));
     }
     out
 }
@@ -1438,6 +1535,88 @@ mod tests {
     }
 
     #[test]
+    fn the_system_bus_activates_only_the_listed_services_as_us() {
+        let d = tempfile::tempdir().unwrap();
+        let services = d.path().join("system-services");
+        fs::create_dir_all(&services).unwrap();
+        let out = d.path().join("activated");
+        fs::write(
+            services.join("org.freedesktop.Flatpak.SystemHelper.service"),
+            format!(
+                "[D-BUS Service]\nName=org.freedesktop.Flatpak.SystemHelper\n\
+                 Exec=/bin/sh -c 'echo \"$FLATPAK_DISABLE_REVOKEFS $DBUS_SYSTEM_BUS_ADDRESS $(id -u)\" > {}'\n\
+                 User=root\nSystemdService=flatpak-system-helper.service\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            services.join("org.freedesktop.UDisks2.service"),
+            "[D-BUS Service]\nName=org.freedesktop.UDisks2\nExec=/bin/false\nUser=root\n",
+        )
+        .unwrap();
+        let run = d.path().join("run");
+        fs::create_dir_all(&run).unwrap();
+        let sock = run.join("system_bus_socket");
+        let config = system_bus_config(&sock, &services).unwrap();
+        let copied = fs::read_to_string(
+            run.join("droidc-system-services/org.freedesktop.Flatpak.SystemHelper.service"),
+        )
+        .unwrap();
+        assert!(
+            copied.contains("Exec=/usr/bin/env FLATPAK_DISABLE_REVOKEFS=1 /bin/sh"),
+            "{copied}"
+        );
+        assert!(
+            !copied.contains("User=") && !copied.contains("SystemdService="),
+            "{copied}"
+        );
+        assert!(!run
+            .join("droidc-system-services/org.freedesktop.UDisks2.service")
+            .exists());
+
+        let Some(bin) = find_in_path("dbus-daemon") else {
+            eprintln!("skipping activation: no dbus-daemon");
+            return;
+        };
+        let (addr, mut bus) = start_dbus(&sock, &bin, &config, "DBUS_SYSTEM_BUS_ADDRESS").unwrap();
+        let c = zbus::blocking::connection::Builder::address(addr.as_str())
+            .unwrap()
+            .build()
+            .unwrap();
+        let name = |n: &'static str| zbus::names::WellKnownName::try_from(n).unwrap();
+        // The stand-in exits without taking the name, so the call only fails at the bus's start
+        // timeout; it is enough that it ran, as us, told where the system bus is.
+        {
+            let c = c.clone();
+            std::thread::spawn(move || {
+                let dbus = zbus::blocking::fdo::DBusProxy::new(&c).unwrap();
+                let _ = dbus.start_service_by_name(name("org.freedesktop.Flatpak.SystemHelper"), 0);
+            });
+        }
+        let dbus = zbus::blocking::fdo::DBusProxy::new(&c).unwrap();
+        assert!(dbus
+            .start_service_by_name(name("org.freedesktop.UDisks2"), 0)
+            .is_err());
+        let mut got = String::new();
+        for _ in 0..100 {
+            got = fs::read_to_string(&out).unwrap_or_default();
+            if !got.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let addr = format!("1 unix:path={},", sock.display());
+        let uid = format!(" {}", rustix::process::getuid().as_raw());
+        assert!(
+            got.starts_with(&addr) && got.trim_end().ends_with(&uid),
+            "the helper's service ran with {got:?}"
+        );
+        let _ = bus.kill();
+        let _ = bus.wait();
+    }
+
+    #[test]
     fn machine_id_is_filled_once() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("machine-id");
@@ -1850,6 +2029,7 @@ mod tests {
                 ),
             ),
         );
+        std::env::set_var("DROIDC_POLKIT", script(d.path(), "polkit", "exec sleep 30"));
         let opts = session_opts(
             d.path(),
             SessionSpec {
@@ -1885,6 +2065,7 @@ mod tests {
         );
         std::env::remove_var("DROIDC_BRIDGE");
         std::env::remove_var("DROIDC_LOGIN1");
+        std::env::remove_var("DROIDC_POLKIT");
 
         // --session without a configured session is not-found
         let empty = tempfile::tempdir().unwrap();
