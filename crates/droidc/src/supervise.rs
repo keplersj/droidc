@@ -518,6 +518,8 @@ fn prefer_dbus_daemon(runtime: &std::path::Path, unit_dir: &std::path::Path) -> 
 /// manager socket. The image's socket-activated `pipewire.service` does not give that (Mutter's
 /// screen-cast stream never appears), so under `systemd --user` these units are masked and droidc's
 /// copies run, exactly as without systemd. `pipewire-pulse` needs `pipewire`, so it goes with it.
+/// A service that is a shell wrapper (`sh -c '... exec pipewire -c "$c"'`, as Selkie's is) stands for
+/// the programs its script `exec`s: masking `sh.service` would leave the image's PipeWire to race it.
 fn units_replaced_by_services(services: &[Vec<String>]) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let mut add = |base: &str| {
@@ -529,19 +531,53 @@ fn units_replaced_by_services(services: &[Vec<String>]) -> Vec<String> {
         }
     };
     for svc in services {
-        let Some(base) = svc
-            .first()
-            .and_then(|a| std::path::Path::new(a).file_name())
-            .and_then(|n| n.to_str())
-        else {
-            continue;
-        };
-        add(base);
-        if base == "pipewire" {
-            add("pipewire-pulse");
+        for base in service_programs(svc) {
+            add(&base);
+            if base == "pipewire" {
+                add("pipewire-pulse");
+            }
         }
     }
     names
+}
+
+/// The base names of the programs a session service runs: its own, or for a shell wrapper
+/// (`sh -c <script>`), each program its script `exec`s.
+fn service_programs(svc: &[String]) -> Vec<String> {
+    let base = |a: &str| {
+        std::path::Path::new(a.trim_matches(|c| c == '"' || c == '\''))
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+    };
+    let Some(first) = svc.first().and_then(|a| base(a)) else {
+        return Vec::new();
+    };
+    let shell = matches!(first.as_str(), "sh" | "bash" | "dash" | "ash");
+    let Some(script) = svc
+        .get(2)
+        .filter(|_| shell && svc.get(1).map(String::as_str) == Some("-c"))
+    else {
+        return vec![first];
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut words = script
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')'))
+        .filter(|w| !w.is_empty());
+    while let Some(w) = words.next() {
+        if w == "exec" {
+            if let Some(b) = words.next().and_then(base) {
+                if !b.starts_with('-') && !b.starts_with('$') && !out.contains(&b) {
+                    out.push(b);
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(first);
+    }
+    out
 }
 
 /// Mask `units` for the user manager (`$XDG_RUNTIME_DIR/systemd/user/<unit>` -> `/dev/null`).
@@ -1586,6 +1622,42 @@ mod tests {
             std::path::PathBuf::from("/dev/null")
         );
         assert_eq!(mask_units(d.path(), &names), 6, "idempotent");
+    }
+
+    #[test]
+    fn a_shell_wrapper_replaces_the_units_of_what_it_execs() {
+        // Selkie's PipeWire service: a copy of the config with the access socket opened, then exec.
+        let script = r#"for f in /etc/pipewire/pipewire.conf /usr/share/pipewire/pipewire.conf; do [ -r "$f" ] || continue; c="${XDG_RUNTIME_DIR:-/tmp}/pipewire-selkie.conf"; sed 's/x/y/' "$f" > "$c" && grep -q '^access' "$c" && exec pipewire -c "$c"; done; exec pipewire"#;
+        let svcs = vec![
+            vec!["sh".to_string(), "-c".into(), script.into()],
+            vec!["wireplumber".to_string()],
+        ];
+        assert_eq!(
+            units_replaced_by_services(&svcs),
+            [
+                "pipewire.service",
+                "pipewire.socket",
+                "pipewire-pulse.service",
+                "pipewire-pulse.socket",
+                "wireplumber.service",
+                "wireplumber.socket",
+            ]
+        );
+        assert_eq!(
+            service_programs(&[
+                "/bin/sh".into(),
+                "-c".into(),
+                "exec /usr/bin/foo --x".into()
+            ]),
+            ["foo"]
+        );
+        // A shell that execs nothing, or is not run with -c, is itself.
+        assert_eq!(
+            service_programs(&["sh".into(), "-c".into(), "true".into()]),
+            ["sh"]
+        );
+        assert_eq!(service_programs(&["sh".into(), "script.sh".into()]), ["sh"]);
+        assert!(service_programs(&[]).is_empty());
     }
 
     #[test]
