@@ -49,7 +49,7 @@ Value for effort, cheapest first. "Code" names where it would attach in the curr
 | 3 | **Open links and files** | `ACTION_VIEW` intents | `droidc open` and a hidden `dev.droidc.AndroidOpen` desktop entry, the default `x-scheme-handler` for http, https, mailto, tel, sms and geo where the user has none, so `xdg-open`, GNOME apps and the GNOME `OpenURI` portal open links on Android (**links done**); still open: files (`file:` paths need a copy into shared storage first) | `open.rs` |
 | 4 | **Suspend, lock, inhibit** | Activity pause/resume, `KeyguardManager`, wake locks | `droidc host-link`: `keep-awake` while a desktop app holds a gnome-session idle inhibitor (the host keeps the screen on), and the host's `screen-lock` turns GNOME's lock screen, idle blank and idle suspend off since Android locks the device (**done**); still open in `login1`: `PrepareForSleep`, `LockedHint`/`IdleHint`, `CanSuspend`/`CanPowerOff` (today `na`, and the power calls are refused) | `awake.rs`, `login1.rs` |
 | 5 | **Battery and power** | `BatteryManager`, power-save mode | `droidc host-link` serves `org.freedesktop.UPower` on the container's system bus (one battery and the display device), fed by the host's `battery` lines (**battery done**); still open: `power-profiles-daemon` from power-save mode | `upower.rs` |
-| 6 | **Network state** | `ConnectivityManager` | `org.freedesktop.NetworkManager` stand-in (shell indicator, GIO network monitor) | B |
+| 6 | **Network state** | `ConnectivityManager` | `droidc host-link` serves the `org.freedesktop.NetworkManager` manager object on the container's system bus (`Connectivity`, `Metered`, `State`, `PrimaryConnectionType`), fed by the host's `network` lines, so GLib's network monitor, and the NetworkMonitor portal behind it, sees Android's captive portals, lost connections and metered networks (**done**); not served: devices and connections, so gnome-shell's network menu stays hidden and Android's Quick Settings stay in charge | `network.rs` |
 | 7 | **Memory pressure** | `onTrimMemory`, lmkd | `org.freedesktop.LowMemoryMonitor` (GNOME and portals watch it) fed by trim events; Android's own kill policy is the real limit | B |
 | 8 | **Notifications** | `NotificationManager` | mirror `org.freedesktop.Notifications` calls (a bus monitor, since the shell owns the name) with actions routed back | B/C |
 | 9 | **File chooser** | storage access framework | `FileChooser` portal returning fds; `xdg-user-dirs` bound to shared storage (Selkie) | C |
@@ -78,6 +78,9 @@ the host already owns the process, so there is no peer to check and nothing to l
 - Host to guest also: `battery` (`present`, `percent`, `status` as `charging`, `discharging`, `full` or
   `not-charging`, `plugged`, `time_to_full` in seconds) updates the UPower stand-in, which host-link
   serves on `$DBUS_SYSTEM_BUS_ADDRESS` unless a real upowerd owns the name.
+- Host to guest also: `network` (`connected`, `validated`, `portal`, `metered`, `transport` as `wifi`,
+  `cellular`, `ethernet`, `bluetooth` or `vpn`) updates the NetworkManager stand-in beside it, unless a
+  real NetworkManager owns the name.
 - Host to guest also: `screen-lock` (`by_android: true`) writes `lock-enabled=false`,
   `idle-delay=0` and the power plugin's `sleep-inactive-*-type='nothing'`.
 

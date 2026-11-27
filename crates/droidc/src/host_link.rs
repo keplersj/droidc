@@ -11,7 +11,8 @@
 //!   `open-uri` for a link the desktop opened (served on the session bus as `dev.droidc.HostLink1`,
 //!   see [`crate::open`]), and `keep-awake` while a desktop app holds an idle inhibitor
 //!   (see [`crate::awake`]). From the host, `screen-lock` leaves locking and blanking to Android, and
-//!   `battery` feeds the UPower stand-in on the system bus (see [`crate::upower`]).
+//!   `battery` feeds the UPower stand-in on the system bus (see [`crate::upower`]), and `network`
+//!   the NetworkManager connectivity stand-in beside it (see [`crate::network`]).
 //!
 //! A line that doesn't parse, or a kind this droidc doesn't know, is reported on stderr and skipped, so
 //! a newer host can talk to an older droidc. Status and errors go to stderr. Closing stdin ends the link.
@@ -57,6 +58,9 @@ pub enum HostMsg {
     },
     /// Android's battery, served to GNOME as UPower (see [`crate::upower`]).
     Battery(crate::upower::Battery),
+    /// Android's default network, served to GLib's network monitor as NetworkManager
+    /// (see [`crate::network`]).
+    Network(crate::network::Network),
 }
 
 /// One line to the host.
@@ -228,6 +232,8 @@ pub struct Link {
     pub settings: Settings,
     /// The UPower stand-in, when there is a system bus to serve it on.
     pub upower: Option<crate::upower::Server>,
+    /// The NetworkManager stand-in, likewise.
+    pub network: Option<crate::network::Server>,
 }
 
 impl Link {
@@ -235,6 +241,7 @@ impl Link {
         Link {
             settings,
             upower: None,
+            network: None,
         }
     }
 
@@ -261,6 +268,11 @@ impl Link {
             Ok(HostMsg::Battery(b)) => {
                 if let Some(Err(e)) = self.upower.as_ref().map(|u| u.set(&b)) {
                     eprintln!("host-link: warn: battery: {e}");
+                }
+            }
+            Ok(HostMsg::Network(n)) => {
+                if let Some(Err(e)) = self.network.as_ref().map(|s| s.set(&n)) {
+                    eprintln!("host-link: warn: network: {e}");
                 }
             }
             Err(e) => eprintln!("host-link: warn: skipped a line from the host: {e}"),
@@ -332,20 +344,19 @@ pub fn run() -> Result<i32> {
         }
     };
 
-    // Battery: UPower on the container's system bus, unless a real upowerd is there.
-    link.upower = match system_bus() {
-        Ok(conn) => match crate::upower::Server::serve(conn) {
-            Ok(u) => Some(u),
-            Err(e) => {
-                eprintln!("host-link: warn: battery: {e}");
-                None
-            }
-        },
-        Err(e) => {
-            eprintln!("host-link: warn: battery: {e}");
-            None
+    // Battery and network: UPower and NetworkManager on the container's system bus, unless the real
+    // services are there.
+    match system_bus() {
+        Ok(conn) => {
+            link.upower = crate::upower::Server::serve(conn.clone())
+                .map_err(|e| eprintln!("host-link: warn: battery: {e}"))
+                .ok();
+            link.network = crate::network::Server::serve(conn)
+                .map_err(|e| eprintln!("host-link: warn: network: {e}"))
+                .ok();
         }
-    };
+        Err(e) => eprintln!("host-link: warn: battery and network: {e}"),
+    }
 
     send(&GuestMsg::Ready {
         version: crate::VERSION,
