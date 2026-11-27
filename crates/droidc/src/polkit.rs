@@ -38,6 +38,11 @@ type ActionDescription = (
     HashMap<String, String>,
 );
 
+/// polkit's `(bba{ss})` authorization result: is_authorized, is_challenge, details. One struct, so
+/// the reply is a single `(bba{ss})` argument as libpolkit reads it, not three arguments.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, zbus::zvariant::Type)]
+struct AuthorizationResult(bool, bool, HashMap<String, String>);
+
 struct Authority {
     /// The uid allowed besides root: the app's, which is the guest's only user.
     uid: u32,
@@ -90,8 +95,7 @@ impl Authority {
 
 #[zbus::interface(name = "org.freedesktop.PolicyKit1.Authority")]
 impl Authority {
-    /// `(bba{ss})`: is_authorized, is_challenge, details. Never a challenge: there is no password to
-    /// ask for here.
+    /// Never a challenge: there is no password to ask for here.
     async fn check_authorization(
         &self,
         #[zbus(connection)] conn: &zbus::Connection,
@@ -100,7 +104,7 @@ impl Authority {
         _details: HashMap<String, String>,
         _flags: u32,
         _cancellation_id: String,
-    ) -> (bool, bool, HashMap<String, String>) {
+    ) -> AuthorizationResult {
         let uid = self.subject_uid(conn, &subject).await;
         let ok = self.allowed(uid);
         if !ok {
@@ -109,7 +113,7 @@ impl Authority {
                 subject.0
             );
         }
-        (ok, false, HashMap::new())
+        AuthorizationResult(ok, false, HashMap::new())
     }
 
     fn cancel_check_authorization(&self, _cancellation_id: String) {}
@@ -243,24 +247,26 @@ mod tests {
     fn check(
         c: &zbus::blocking::Connection,
         subject: (&str, HashMap<&str, Value>),
-    ) -> (bool, bool, HashMap<String, String>) {
-        c.call_method(
-            Some(NAME),
-            AUTHORITY_PATH,
-            Some("org.freedesktop.PolicyKit1.Authority"),
-            "CheckAuthorization",
-            &(
-                subject,
-                "org.freedesktop.Flatpak.app-install",
-                HashMap::<&str, &str>::new(),
-                1u32,
-                "",
-            ),
-        )
-        .unwrap()
-        .body()
-        .deserialize()
-        .unwrap()
+    ) -> AuthorizationResult {
+        let reply = c
+            .call_method(
+                Some(NAME),
+                AUTHORITY_PATH,
+                Some("org.freedesktop.PolicyKit1.Authority"),
+                "CheckAuthorization",
+                &(
+                    subject,
+                    "org.freedesktop.Flatpak.app-install",
+                    HashMap::<&str, &str>::new(),
+                    1u32,
+                    "",
+                ),
+            )
+            .unwrap();
+        // One (bba{ss}) out argument: libpolkit reads the reply as "(@(bba{ss}))".
+        let body = reply.body();
+        assert_eq!(body.signature().to_string(), "(bba{ss})");
+        body.deserialize().unwrap()
     }
 
     /// Serve on a private dbus-daemon and ask the way flatpak-system-helper and pkcheck do.
@@ -305,7 +311,7 @@ mod tests {
                 HashMap::from([("name", Value::from(name))]),
             ),
         );
-        assert_eq!(r, (true, false, HashMap::new()));
+        assert_eq!(r, AuthorizationResult(true, false, HashMap::new()));
         // pkcheck --process: a pid (ours), with or without its uid
         let pid = std::process::id();
         assert!(
