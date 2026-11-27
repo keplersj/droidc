@@ -190,6 +190,13 @@ enum Cmd {
     /// (appearance), requests out on stdout; status goes to stderr
     #[command(name = "host-link")]
     HostLink,
+    /// (inside the guest) the container's adb, connected to this Android device; `droidc adb pair`
+    /// pairs it with Wireless debugging from a notification
+    #[command(disable_help_flag = true)]
+    Adb {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// (on the host) run commands as fake root for the guest's sudo/su/pkexec shims
     #[command(name = "spawn-server", hide = true)]
     SpawnServer {
@@ -398,6 +405,7 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
         | Cmd::AudioOut { .. }
         | Cmd::Login1
         | Cmd::HostLink
+        | Cmd::Adb { .. }
         | Cmd::Log { .. }
         | Cmd::Enter { .. }
         | Cmd::EnterInit { .. } => unreachable!(),
@@ -579,6 +587,15 @@ fn main() {
             Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("droidc host-link: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Cmd::Adb { args } = &cli.cmd {
+        match droidc::adb::run(args) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("droidc adb: {e}");
                 std::process::exit(1);
             }
         }

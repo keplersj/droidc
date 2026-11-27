@@ -70,6 +70,13 @@ the host already owns the process, so there is no peer to check and nothing to l
   `high_contrast`; each optional). Settings are written with the image's `gsettings` (or
   `DROIDC_GSETTINGS`), only when they change; a key the image's GNOME lacks is tried once.
 - Guest to host (stdout): `ready` with droidc's version, first.
+- Guest commands: the link listens on `/run/droidc-host-link.sock` (`DROIDC_HOST_LINK_SOCKET`) and passes
+  one request line per connection to the host with an `id`; the host answers with `progress` lines and one
+  `reply` carrying that `id`, which go back to that command. Only `adb-pair` and `adb-port` are passed on.
+  `droidc adb pair` asks the host to open Wireless debugging and take the pairing code in a notification,
+  then the guest's own `adb` pairs, so the key stays in the guest. Every other `droidc adb ARGS` asks for
+  Wireless debugging's current port, connects, then runs `adb ARGS`. The adb server listens on
+  `localfilesystem:/run/droidc-adb.sock` unless `ADB_SERVER_SOCKET` is set, never TCP 5037.
 
 Unknown kinds and bad lines are skipped with a warning on stderr, so the host and droidc can be updated
 separately. Later integration points add kinds in both directions.

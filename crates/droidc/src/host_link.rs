@@ -10,6 +10,12 @@
 //! - **stdout, guest to host:** `ready` once the link is up, then requests the host acts on (later
 //!   kinds: links to open, notifications, files to pick).
 //!
+//! Commands in the guest reach the host through the link too: it listens on a Unix socket in the
+//! container's `/run` ([`SOCKET`], or `DROIDC_HOST_LINK_SOCKET`), and passes a client's one request line on
+//! with an `id`. The host answers with `progress` lines (shown to the user while it waits on them) and one
+//! `reply`, each carrying that `id`, which go back to that client. Only the kinds in [`CLIENT_KINDS`] are
+//! passed on. `droidc adb` is the first client ([`crate::adb`]).
+//!
 //! A line that doesn't parse, or a kind this droidc doesn't know, is reported on stderr and skipped, so
 //! a newer host can talk to an older droidc. Status and errors go to stderr. Closing stdin ends the link.
 //!
@@ -20,8 +26,26 @@
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// Where the link listens for commands in the guest: `/run` is the container's own, so only this app's
+/// processes can reach it.
+pub const SOCKET: &str = "/run/droidc-host-link.sock";
+/// Overrides [`SOCKET`] (tests).
+pub const SOCKET_ENV: &str = "DROIDC_HOST_LINK_SOCKET";
+/// Requests a guest command may send the host. Anything else is refused at the socket.
+pub const CLIENT_KINDS: [&str; 2] = ["adb-pair", "adb-port"];
+/// The longest request line a client may send.
+const MAX_REQUEST: u64 = 4096;
+
+/// The socket path this guest uses.
+pub fn socket_path() -> String {
+    std::env::var(SOCKET_ENV).unwrap_or_else(|_| SOCKET.into())
+}
 
 const INTERFACE: &str = "org.gnome.desktop.interface";
 const A11Y: &str = "org.gnome.desktop.a11y.interface";
@@ -208,14 +232,125 @@ impl Settings {
     }
 }
 
+/// Guest commands waiting on the host, by request id, and the host's stdout they write to.
+pub struct Clients {
+    out: Mutex<Box<dyn Write + Send>>,
+    pending: Mutex<HashMap<u64, UnixStream>>,
+    next: AtomicU64,
+}
+
+impl Clients {
+    pub fn new(out: Box<dyn Write + Send>) -> Arc<Self> {
+        Arc::new(Clients {
+            out: Mutex::new(out),
+            pending: Mutex::new(HashMap::new()),
+            next: AtomicU64::new(1),
+        })
+    }
+
+    /// Writes one line to the host.
+    pub fn emit_value(&self, v: &serde_json::Value) -> Result<()> {
+        let mut out = self.out.lock().unwrap_or_else(|e| e.into_inner());
+        writeln!(out, "{v}")
+            .and_then(|_| out.flush())
+            .map_err(|e| Error::internal(format!("stdout: {e}")))
+    }
+
+    /// Reads one request from a guest command and passes it to the host, or tells the command why not.
+    pub fn accept(self: &Arc<Self>, stream: UnixStream) {
+        let mut line = String::new();
+        let read = BufReader::new((&stream).take(MAX_REQUEST)).read_line(&mut line);
+        let refuse = |mut s: &UnixStream, why: String| {
+            let v = serde_json::json!({"kind": "reply", "ok": false, "error": why});
+            let _ = writeln!(s, "{v}");
+        };
+        if let Err(e) = read {
+            return refuse(&stream, format!("reading the request: {e}"));
+        }
+        let mut obj = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(serde_json::Value::Object(o)) => o,
+            _ => return refuse(&stream, "the request isn't a JSON object".into()),
+        };
+        let kind = obj
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !CLIENT_KINDS.contains(&kind.as_str()) {
+            return refuse(&stream, format!("host-link doesn't pass on '{kind}'"));
+        }
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        obj.insert("id".into(), id.into());
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, stream);
+        if let Err(e) = self.emit_value(&serde_json::Value::Object(obj)) {
+            if let Some(s) = self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id)
+            {
+                refuse(&s, e.to_string());
+            }
+        }
+        eprintln!("host-link: {kind} request {id} passed to the host");
+    }
+
+    /// Hands a `progress` or `reply` line from the host to the command waiting on its `id`. A `reply`
+    /// ends that request. Returns false if no command waits on it (it gave up, say).
+    pub fn route(&self, v: &serde_json::Value) -> bool {
+        let Some(id) = v.get("id").and_then(|i| i.as_u64()) else {
+            return false;
+        };
+        let last = v.get("kind").and_then(|k| k.as_str()) == Some("reply");
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let ok = match pending.get(&id) {
+            Some(mut s) => writeln!(s, "{v}").is_ok(),
+            None => return false,
+        };
+        if last || !ok {
+            pending.remove(&id);
+        }
+        ok
+    }
+
+    /// How many guest commands are waiting.
+    pub fn waiting(&self) -> usize {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
+/// Listens for guest commands at `path` until the process ends, one thread per command. A stale socket
+/// file from an earlier link is replaced.
+pub fn listen(path: &str, clients: Arc<Clients>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::remove_file(path);
+    let listener = UnixListener::bind(path).map_err(|e| Error::internal(format!("{path}: {e}")))?;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let c = Arc::clone(&clients);
+            std::thread::spawn(move || c.accept(stream));
+        }
+    });
+    Ok(())
+}
+
 /// The link's state between lines.
 pub struct Link {
     pub settings: Settings,
+    /// Guest commands waiting on the host; none when the link has no socket (tests).
+    pub clients: Option<Arc<Clients>>,
 }
 
 impl Link {
     pub fn new(settings: Settings) -> Self {
-        Link { settings }
+        Link {
+            settings,
+            clients: None,
+        }
     }
 
     /// Acts on one line from the host. Unknown or malformed lines are reported, not fatal.
@@ -223,6 +358,18 @@ impl Link {
         let line = line.trim();
         if line.is_empty() {
             return;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if matches!(
+                v.get("kind").and_then(|k| k.as_str()),
+                Some("reply" | "progress")
+            ) {
+                let routed = self.clients.as_ref().is_some_and(|c| c.route(&v));
+                if !routed {
+                    eprintln!("host-link: warn: an answer for a request nobody waits on");
+                }
+                return;
+            }
         }
         match serde_json::from_str::<HostMsg>(line) {
             Ok(HostMsg::Appearance(a)) => {
@@ -236,13 +383,6 @@ impl Link {
     }
 }
 
-fn emit(out: &mut impl Write, msg: &GuestMsg) -> Result<()> {
-    let line = serde_json::to_string(msg).map_err(|e| Error::internal(e.to_string()))?;
-    writeln!(out, "{line}")
-        .and_then(|_| out.flush())
-        .map_err(|e| Error::internal(format!("stdout: {e}")))
-}
-
 /// Runs the link until stdin closes. Returns the exit code.
 pub fn run() -> Result<i32> {
     // A closed stdout must surface as a write error, not kill us.
@@ -251,12 +391,18 @@ pub fn run() -> Result<i32> {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
     let mut link = Link::new(Settings::from_env());
-    emit(
-        &mut std::io::stdout().lock(),
-        &GuestMsg::Ready {
-            version: crate::VERSION,
-        },
-    )?;
+    let clients = Clients::new(Box::new(std::io::stdout()));
+    let path = socket_path();
+    match listen(&path, Arc::clone(&clients)) {
+        Ok(()) => link.clients = Some(Arc::clone(&clients)),
+        // Appearance still works; guest commands say the link isn't there.
+        Err(e) => eprintln!("host-link: warn: no socket for guest commands: {e}"),
+    }
+    let ready = serde_json::to_value(GuestMsg::Ready {
+        version: crate::VERSION,
+    })
+    .map_err(|e| Error::internal(e.to_string()))?;
+    clients.emit_value(&ready)?;
     eprintln!("host-link: ready");
     for line in std::io::stdin().lock().lines() {
         match line {
@@ -265,6 +411,9 @@ pub fn run() -> Result<i32> {
         }
     }
     eprintln!("host-link: the host closed the link");
+    if link.clients.is_some() {
+        let _ = std::fs::remove_file(&path);
+    }
     Ok(0)
 }
 
