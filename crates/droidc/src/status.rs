@@ -131,7 +131,7 @@ pub struct ShellSpec {
     pub session: Value,
     pub launcher: LauncherSpec,
     /// Guest paths the launcher binds its guest droidc over (as it binds `/usr/bin/droidc`): the
-    /// `sudo`/`su`/`pkexec` shims, which ask the host spawner for a root command. Only under proot;
+    /// `sudo`/`su`/`pkexec` shims, which ask the host spawner for a root command, and `bwrap`, which asks it for a sandbox. Only under proot;
     /// chroot has a real root path, and binding over a setuid binary there would disable the real thing.
     pub shims: Vec<String>,
 }

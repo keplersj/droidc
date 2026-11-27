@@ -834,26 +834,54 @@ pub fn list_containers(target: &Root) -> Value {
     json!({"containers": list})
 }
 
-/// Delete a named container's state, then GC the images no other container uses. `default` is
-/// the root itself and can't be removed this way.
+/// Delete a container's state, then GC the images no other container uses. A named container's
+/// directory goes whole. `default` is the top of the root, so only its own entries go
+/// (deployments, `current`, `previous`, staging, `/var`, `/home`, cgroup and session); the
+/// shared blobs, policy, lock and the other containers stay.
 pub fn remove_container(target: &Root, em: &Emitter) -> Result<Value> {
-    if target.is_default() {
-        return Err(Error::invalid(
-            "the default container is the root itself; remove the root directory instead",
-        ));
-    }
     let (root, _lock) = open_root_existing(target)?;
-    if root.cdir.symlink_metadata().is_err() {
+    let exists = if root.is_default() {
+        root.all_containers().iter().any(Root::is_default)
+    } else {
+        root.cdir.symlink_metadata().is_ok()
+    };
+    if !exists {
         return Err(Error::not_found(format!(
             "no container named {}",
             root.container
         )));
     }
-    let freed = fsutil::disk_usage(&root.cdir);
-    fsutil::rmtree(&root.cdir)?;
-    fsync_dir(&crate::layout::containers_dir(&root.path));
+    let freed = if root.is_default() {
+        let mut freed = 0;
+        for p in default_container_entries(&root) {
+            freed += fsutil::disk_usage(&p);
+            fsutil::rmtree(&p)?;
+        }
+        fsync_dir(&root.path);
+        freed
+    } else {
+        let freed = fsutil::disk_usage(&root.cdir);
+        fsutil::rmtree(&root.cdir)?;
+        fsync_dir(&crate::layout::containers_dir(&root.path));
+        freed
+    };
     let g = gc_locked(&root, em)?;
     Ok(json!({"removed": root.container, "bytes_freed": freed, "gc": g}))
+}
+
+/// What belongs to the `default` container at the top of the root. The links go first, so an
+/// interrupted removal never leaves `current` pointing at a deleted deployment.
+fn default_container_entries(root: &Root) -> Vec<PathBuf> {
+    vec![
+        root.current_link(),
+        root.previous_link(),
+        root.staging(),
+        root.deployments(),
+        root.var(),
+        root.home(),
+        root.cgroup(),
+        crate::session::override_path(root),
+    ]
 }
 
 /// Like [`open_root`], but for a container that is about to go: nothing is created for it.
@@ -1245,10 +1273,47 @@ mod tests {
             remove_container(&dev, &em).unwrap_err().kind,
             ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn removing_the_default_container_keeps_the_root_and_the_others() {
+        let (_d, root, ld) = setup();
+        let (em, _) = capture();
+        let dev = container(&root, "dev");
+        do_install(&root, &ld, "aaaa", image("A", "x"), LinkKind::Copy);
+        do_install(&root, &ld, "cccc", image("C", "z"), LinkKind::Copy);
+        do_install(&dev, &ld, "bbbb", image("B", "y"), LinkKind::Copy);
+        let (l1, l2) = ("1".repeat(64), "2".repeat(64));
+        write_manifest(&root, "aaaa", &l1);
+        write_manifest(&root, "cccc", &l1);
+        write_manifest(&root, "bbbb", &l2);
+        fs::write(root.home().join("root/notes"), "mine").unwrap();
+        fs::write(crate::session::override_path(&root), "{}").unwrap();
+        let r = remove_container(&root, &em).unwrap();
+        assert_eq!(r["removed"], "default");
+        for p in default_container_entries(&root) {
+            assert!(p.symlink_metadata().is_err(), "{} is left", p.display());
+        }
+        // The shared parts and the other container stay; only images nobody uses go.
+        assert!(root.blobs().is_dir());
+        assert!(!root.blob(&l1).exists());
+        assert!(root.blob(&l2).exists());
+        assert_eq!(dev.current_id().as_deref(), Some("bbbb"));
+        let names: Vec<_> = list_containers(&root)["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["dev"]);
         assert_eq!(
             remove_container(&root, &em).unwrap_err().kind,
-            ErrorKind::Invalid
+            ErrorKind::NotFound
         );
+        // A fresh install brings it back (a real switch runs `init` through `open_root`).
+        root.init().unwrap();
+        do_install(&root, &ld, "aaaa", image("A", "x"), LinkKind::Copy);
+        assert_eq!(root.current_id().as_deref(), Some("aaaa"));
     }
 
     #[test]
@@ -1380,10 +1445,15 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with("/root/current/rootfs"));
-        // under proot the launcher binds the guest droidc over sudo/su/pkexec (the spawner shims)
+        // under proot the launcher binds the guest droidc over sudo/su/pkexec/bwrap (the spawner shims)
         assert_eq!(
             sp["shims"],
-            serde_json::json!(["/usr/bin/sudo", "/usr/bin/su", "/usr/bin/pkexec"])
+            serde_json::json!([
+                "/usr/bin/sudo",
+                "/usr/bin/su",
+                "/usr/bin/pkexec",
+                "/usr/bin/bwrap"
+            ])
         );
         assert_eq!(sp["binds"].as_array().unwrap().len(), 3);
         // reading through a different absolute path (as the guest does) works

@@ -202,7 +202,8 @@ enum Cmd {
 enum ContainerCmd {
     /// Every container under the root, with its current and previous deployment
     List,
-    /// Delete a container's deployments, /var, /home and session, then GC unused images
+    /// Delete a container's deployments, /var, /home and session, then GC unused images.
+    /// For `default` only its own state goes; the root and the other containers stay.
     Rm { name: String },
 }
 
@@ -381,7 +382,12 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
 /// Run a guest sudo/su/pkexec/spawn shim and exit with the root command's status; 127 if it could
 /// not run. `name` is how the user invoked it, for the error.
 fn run_shim(name: &str, args: &[String]) -> i32 {
-    match droidc::spawn::client(name, args) {
+    let done = if name == "bwrap" {
+        droidc::bwrap::client(args)
+    } else {
+        droidc::spawn::client(name, args)
+    };
+    match done {
         Ok(code) => code,
         Err(e) => {
             eprintln!("{name}: {e}");
