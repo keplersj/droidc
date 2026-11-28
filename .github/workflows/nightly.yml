@@ -7,6 +7,8 @@ name: nightly
 #   fails its job and uploads the input that caused it.
 # - Mutants: report-only. Missed mutants (code whose tests still pass when it changes) go to the job
 #   summary and the uploaded mutants.out; the job stays green unless ENFORCE is "true".
+# - Issues: after a scheduled run, a fuzz crash opens (or comments on) one issue per target, and the
+#   missed mutants are kept in one tracking issue, so neither depends on someone reading the run.
 on:
   schedule:
     - cron: "17 7 * * *" # 07:17 UTC
@@ -148,3 +150,82 @@ jobs:
           name: mutants-shard-${{ matrix.shard }}
           path: mutants-shard/mutants.out
           retention-days: 30
+
+  issues:
+    name: File nightly findings as issues
+    needs: [fuzz, mutants]
+    # Only the scheduled run on main files issues; a manual run is someone already looking.
+    if: always() && github.event_name == 'schedule' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # read this run's jobs and artifacts
+      issues: write # open and update the findings issues
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.run_id }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: mutants-shard-*
+          path: mutants
+        # A run where every mutants shard failed before uploading still files its fuzz crashes.
+        continue-on-error: true
+      - name: Label
+        run: gh label create nightly -R "$REPO" --color BFD4F2 --description "Found by the nightly fuzz or mutation run" --force
+      - name: Fuzz crashes
+        run: |
+          # One open issue per target: a new crash comments on it instead of opening another.
+          gh run view "$RUN_ID" -R "$REPO" --json jobs \
+            --jq '.jobs[] | select(.name | startswith("Fuzz ")) | select(.conclusion == "failure") | .name | ltrimstr("Fuzz ")' \
+            > crashed.txt
+          while read -r target; do
+            [ -n "$target" ] || continue
+            title="Nightly fuzz crash: $target"
+            body=$(printf 'The nightly fuzz job for `%s` failed.\n\nRun: %s\n\nIf it found a crash, the input is the run artifact `fuzz-crash-%s`; reproduce it with `cargo +nightly fuzz run %s <input>`. If there is no such artifact, the target failed to build or run.\n' \
+              "$target" "$RUN_URL" "$target" "$target")
+            num=$(gh issue list -R "$REPO" --state open --label nightly --search "\"$title\" in:title" \
+              --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -1)
+            if [ -n "$num" ]; then
+              gh issue comment "$num" -R "$REPO" --body "$body"
+              echo "- $target: commented on #$num" >> "$GITHUB_STEP_SUMMARY"
+            else
+              url=$(gh issue create -R "$REPO" --title "$title" --label nightly --body "$body")
+              echo "- $target: opened $url" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done < crashed.txt
+          [ -s crashed.txt ] || echo "No fuzz crashes" >> "$GITHUB_STEP_SUMMARY"
+      - name: Missed mutants
+        run: |
+          # One tracking issue holds the latest list; it is rewritten each night and closed when empty.
+          title="Nightly mutation testing: missed mutants"
+          find mutants -name missed.txt -exec cat {} + 2>/dev/null | sort -u > missed.txt || true
+          n=$(wc -l < missed.txt)
+          num=$(gh issue list -R "$REPO" --state open --label nightly --search "\"$title\" in:title" \
+            --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -1)
+          if [ "$n" -eq 0 ]; then
+            if [ -n "$num" ]; then gh issue close "$num" -R "$REPO" --reason completed --comment "No missed mutants in $RUN_URL"; fi
+            echo "No missed mutants" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "The nightly cargo-mutants run found $n mutants that the tests don't catch: each line is a change"
+            echo "to the code that every test still passes with. Add or tighten a test so it fails, or mark the"
+            echo "mutant as not worth testing."
+            echo
+            echo "Latest run: $RUN_URL"
+            echo
+            echo '```'
+            head -300 missed.txt
+            echo '```'
+            if [ "$n" -gt 300 ]; then echo; echo "The first 300 are shown; the rest are in the run's mutants-shard-* artifacts."; fi
+          } > body.md
+          if [ -n "$num" ]; then
+            gh issue edit "$num" -R "$REPO" --body-file body.md
+            echo "Updated #$num ($n missed)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            url=$(gh issue create -R "$REPO" --title "$title" --label nightly --body-file body.md)
+            echo "Opened $url ($n missed)" >> "$GITHUB_STEP_SUMMARY"
+          fi
