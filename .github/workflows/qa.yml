@@ -1,7 +1,8 @@
 name: qa
 
 # Extra quality gates beside ci.yml: PR title (Conventional Commits), workflow lint, dependency
-# policy (cargo-deny) and a coverage report compared against main's last run.
+# policy (cargo-deny), unused dependencies (cargo-machete), clippy's pedantic lints and a coverage
+# report compared against main's last run.
 #
 # Report-only for now: every check writes its findings to the job summary and as warnings, and the
 # job stays green. Set ENFORCE to "true" to make a check fail its job once main is clean and the
@@ -104,6 +105,63 @@ jobs:
           if [ "$status" -ne 0 ]; then
             if [ "$ENFORCE" = true ]; then exit "$status"; fi
             echo "::warning::cargo deny check $CHECKS failed (report-only)"
+          fi
+
+  machete:
+    name: Unused dependencies (cargo-machete)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: cargo-machete
+      - name: cargo machete
+        run: |
+          status=0
+          cargo machete --with-metadata > machete.log 2>&1 || status=$?
+          cat machete.log
+          {
+            echo "### cargo machete"
+            echo
+            if [ "$status" -eq 0 ]; then echo "no unused dependencies"; else echo '```'; cat machete.log; echo '```'; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            if [ "$ENFORCE" = true ]; then exit "$status"; fi
+            echo "::warning::cargo machete found unused dependencies (report-only)"
+          fi
+
+  pedantic:
+    name: Clippy pedantic lints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: pedantic
+      - name: cargo clippy -W clippy::pedantic
+        run: |
+          # ci.yml already denies clippy's default lints; this counts the stricter pedantic group by lint,
+          # so it can be cleaned up and turned on lint by lint.
+          cargo clippy --workspace --all-targets --message-format=json -- -W clippy::pedantic > clippy.json
+          jq -r 'select(.reason == "compiler-message") | .message | select(.level == "warning") | .code.code // empty' clippy.json \
+            | grep '^clippy::' | sort | uniq -c | sort -rn > pedantic.txt || true
+          total=$(awk '{s += $1} END {print s + 0}' pedantic.txt)
+          {
+            echo "### Clippy pedantic: $total warnings"
+            echo
+            if [ "$total" -gt 0 ]; then echo '| count | lint |'; echo '| --- | --- |'; awk '{print "| " $1 " | `" $2 "` |"}' pedantic.txt; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat pedantic.txt
+          if [ "$total" -gt 0 ]; then
+            if [ "$ENFORCE" = true ]; then echo "::error::$total clippy pedantic warnings"; exit 1; fi
+            echo "::warning::$total clippy pedantic warnings (report-only)"
           fi
 
   coverage:
