@@ -51,7 +51,7 @@ Value for effort, cheapest first. "Code" names where it would attach in the curr
 | 5 | **Battery and power** | `BatteryManager`, power-save mode | `droidc host-link` serves `org.freedesktop.UPower` on the container's system bus (one battery and the display device), fed by the host's `battery` lines (**battery done**); still open: `power-profiles-daemon` from power-save mode | `upower.rs` |
 | 6 | **Network state** | `ConnectivityManager` | `droidc host-link` serves the `org.freedesktop.NetworkManager` manager object on the container's system bus (`Connectivity`, `Metered`, `State`, `PrimaryConnectionType`), fed by the host's `network` lines, so GLib's network monitor, and the NetworkMonitor portal behind it, sees Android's captive portals, lost connections and metered networks (**done**); not served: devices and connections, so gnome-shell's network menu stays hidden and Android's Quick Settings stay in charge | `network.rs` |
 | 7 | **Memory pressure** | `onTrimMemory`, lmkd | `org.freedesktop.LowMemoryMonitor` (GNOME and portals watch it) fed by trim events; Android's own kill policy is the real limit | B |
-| 8 | **Notifications** | `NotificationManager` | mirror `org.freedesktop.Notifications` calls (a bus monitor, since the shell owns the name) with actions routed back | B/C |
+| 8 | **Notifications** | `NotificationManager` (and through it Wear OS) | `droidc host-link` watches the bus as a monitor (the shell owns both names) and reports `org.freedesktop.Notifications` and `org.gtk.Notifications` (GNotification, portal) calls as `notify`/`close-notification`; taps and replies on `GNotification` buttons go back to the app (**done**) | `notifications.rs` |
 | 9 | **File chooser** | storage access framework | `FileChooser` portal returning fds; `xdg-user-dirs` bound to shared storage (Selkie) | C |
 | 10 | **Brightness, sensors, location, haptics** | `SensorManager`, `LocationManager`, `Vibrator` | `login1` `SetBrightness` (refused today), `iio-sensor-proxy` (auto-rotate, ambient light), GeoClue (Weather, Maps, automatic time zone), `feedbackd` | B |
 | 11 | **App launcher** | launcher shortcuts | `droidc apps --json`: read the deployment's `.desktop` files (name, icon path, categories, `NoDisplay`) with no guest process, so Selkie can list and launch guest apps | new, host side |
@@ -84,6 +84,23 @@ the host already owns the process, so there is no peer to check and nothing to l
   real NetworkManager owns the name.
 - Host to guest also: `screen-lock` (`by_android: true`) writes `lock-enabled=false`,
   `idle-delay=0` and the power plugin's `sleep-inactive-*-type='nothing'`.
+- Host to guest also: `notification-action` (`key`, optional `action` id, optional `text` for a
+  reply) and `notification-closed` (`key`), for a mirrored notification tapped or dismissed on Android.
+- Guest to host also: `notify` (`key`, `app_id`, `app_name`, `title`, `body`, `icon` as `names` or a guest
+  `path`, `priority`, `category`, `actions` with `id`, `label` and `reply`) and `close-notification`
+  (`key`) as the guest's notifications come and go.
+- Guest commands: the link listens on `/run/droidc-host-link.sock` (`DROIDC_HOST_LINK_SOCKET`) and passes
+  one request line per connection to the host with an `id`; the host answers with `progress` lines and one
+  `reply` carrying that `id`, which go back to that command. Only `adb-pair` and `adb-port` are passed on.
+  `droidc adb pair` asks the host to open Wireless debugging and take the pairing code in a notification,
+  then the guest's own `adb` pairs, so the key stays in the guest. Every other `droidc adb ARGS` asks for
+  Wireless debugging's current port, connects, then runs `adb ARGS`. The adb server listens on
+  `localfilesystem:/run/droidc-adb.sock` unless `ADB_SERVER_SOCKET` is set, never TCP 5037.
+
+Notifications: only `GNotification` actions can be run from the host, since only the server may emit
+`org.freedesktop.Notifications.ActionInvoked`; a tap on any other notification should just bring the
+desktop up. A `GNotification` the user closes in GNOME's own list sends nothing on the bus, so it stays
+on Android until the app withdraws it; notifications showing before the link started aren't seen.
 
 Unknown kinds and bad lines are skipped with a warning on stderr, so the host and droidc can be updated
 separately. Later integration points add kinds in both directions.

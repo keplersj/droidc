@@ -203,6 +203,13 @@ enum Cmd {
     /// (appearance), requests out on stdout; status goes to stderr
     #[command(name = "host-link")]
     HostLink,
+    /// (inside the guest) the container's adb, connected to this Android device; `droidc adb pair`
+    /// pairs it with Wireless debugging from a notification
+    #[command(disable_help_flag = true)]
+    Adb {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// (inside the guest) open a web, mail, phone, sms or map link on Android, through the host link
     Open {
         /// The link, e.g. https://example.org or mailto:someone@example.org
@@ -419,6 +426,7 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
         | Cmd::Media { .. }
         | Cmd::Login1
         | Cmd::HostLink
+        | Cmd::Adb { .. }
         | Cmd::Open { .. }
         | Cmd::Polkit
         | Cmd::Log { .. }
@@ -617,6 +625,15 @@ fn main() {
             Ok(()) => std::process::exit(0),
             Err(e) => {
                 eprintln!("droidc open: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Cmd::Adb { args } = &cli.cmd {
+        match droidc::adb::run(args) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("droidc adb: {e}");
                 std::process::exit(1);
             }
         }

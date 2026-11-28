@@ -7,6 +7,7 @@ pub fn git_rev() -> Option<&'static str> {
     Some(env!("DROIDC_GIT_REV")).filter(|r| !r.is_empty())
 }
 
+pub mod adb;
 pub mod apps;
 pub mod audio;
 pub mod awake;
@@ -28,6 +29,7 @@ pub mod logcat;
 pub mod login1;
 pub mod media;
 pub mod network;
+pub mod notifications;
 pub mod open;
 pub mod ownership;
 pub mod platform;
