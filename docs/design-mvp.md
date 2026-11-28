@@ -413,13 +413,13 @@ standard keys and a few of its own:
 | `Name`, `Comment` | Shown in the session picker. |
 | `DesktopNames` | Exported, `:`-joined, as `XDG_CURRENT_DESKTOP` (else `Name`). `XDG_SESSION_DESKTOP` is the entry's id, as display managers set it. |
 | `Hidden`, `NoDisplay`, `TryExec`, `Type` | As for any session entry: hidden, not displayed, `TryExec` not installed, or a `Type` other than `Application` leave the entry out, and hide the same id in a lower-precedence directory. |
-| `X-Droidc-Renderer` | `wayland` or `screencast`, as the label. Without it the entry is listed but can't start: it is made for a display manager on a real display. |
+| `X-Droidc-Renderer` | `wayland` or `screencast`, as the label. Without it the entry is listed but can't start: it is made for a display manager on a real display. The exception is a shell droidc knows runs nested in a Wayland compositor as shipped: Phosh (`DesktopNames` has `Phosh`) gets `wayland` and, unless `X-Droidc-FormFactors` says otherwise, `phone`, so an image that installs the phosh package offers it with no extra keys. |
 | `X-Droidc-Exec` | The command for droidc, `Exec` syntax with the placeholders above. Default: `Exec`. |
 | `X-Droidc-Services` | `;`-separated commands (`Exec` syntax) started first, as the services label. |
 | `X-Droidc-FormFactors` | `;`-separated devices it suits: `phone`, `tablet`, `desktop`, `tv`, `watch`, `xr`, `car`. Frontends use it to offer the session that fits the device; droidc doesn't. The label session takes `containers.droidc.session.form-factors`. |
 
 ```ini
-# /usr/share/wayland-sessions/sm.puri.Phosh.desktop, as phosh ships it, plus droidc's keys
+# /usr/share/wayland-sessions/sm.puri.Phosh.desktop, as phosh ships it, plus droidc's keys (optional for Phosh)
 [Desktop Entry]
 Name=Phosh
 Comment=Phone Shell
