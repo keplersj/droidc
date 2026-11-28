@@ -248,7 +248,7 @@ layers) and returns `{"changed":false,"verify_only":true,"id","manifest_digest",
  "systemd":{"binds":[{"host":"<root>/cgroup","guest":"/sys/fs/cgroup"}],"shim":"/usr/lib/droidc/cgshim.so"},
  "env":{"DROIDC_ROOT":"/run/droidc/root","HOME":"/root","PATH":"...","TERM":"xterm-256color","LANG":"C.UTF-8"},
  "cwd":"/root","session_label":"gnome",
- "session":{"id":"label","name":"GNOME","renderer":"screencast","exec":["gnome-shell","--headless","--virtual-monitor","{width}x{height}"],
+ "session":{"id":"label","name":"GNOME","renderer":"screencast","exec":["gnome-shell","--headless"],
             "services":[["pipewire"],["wireplumber"]],"configured":true,"source":"label|override|xdg"},
  "sessions":[{"id":"label",...},{"id":"sm.puri.Phosh","source":"xdg",...}],
  "launcher":{"kind":"proot","requires_root":false,"link2symlink":true}}
@@ -390,7 +390,7 @@ For example, in a Containerfile:
 ```Dockerfile
 LABEL containers.droidc.session="GNOME" \
       containers.droidc.session.renderer="screencast" \
-      containers.droidc.session.exec='["gnome-shell","--headless","--virtual-monitor","{width}x{height}"]' \
+      containers.droidc.session.exec='["gnome-shell","--headless"]' \
       containers.droidc.session.services='[["pipewire"],["wireplumber"]]'
 LABEL containers.droidc.session="gamescope" \
       containers.droidc.session.renderer="wayland" \

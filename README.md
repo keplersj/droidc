@@ -52,7 +52,7 @@ droidc container list | rm <name>
 droidc supervise -- bash -l            # inside the guest
 droidc supervise --systemd=on -- bash -l   # run the image's own systemd --user (cgroup shim, see docs/systemd-on-proot.md)
 droidc supervise --session --width 1920 --height 1200   # inside the guest: the graphical session
-droidc session set --renderer screencast --exec '["gnome-shell","--headless","--virtual-monitor","{width}x{height}"]' \
+droidc session set --renderer screencast --exec '["gnome-shell","--headless"]' \
   --services '[["pipewire"],["wireplumber"]]' --name GNOME   # for images without session labels
 sudo droidc --root ~/droidc enter -- bash -l   # with root: namespaces + chroot instead of proot
 sudo droidc --root ~/droidc fix-ownership [--undo]   # apply the image's owners/setuid (root only from then on)
