@@ -63,7 +63,7 @@ jobs:
           file "$f" | grep -q 'statically linked'
           "$f" --version
           mkdir -p dist && cp "$f" dist/droidc-${{ matrix.arch }}-linux-musl
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: droidc-${{ matrix.arch }}-linux-musl
           path: dist/droidc-${{ matrix.arch }}-linux-musl
@@ -83,15 +83,15 @@ jobs:
             ! objdump -T "$so" | grep -E 'GLIBC_2\.(29|[3-9][0-9])'
             cp "$so" dist/$shim-${{ matrix.arch }}.so
           done
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: cgshim-${{ matrix.arch }}
           path: dist/cgshim-${{ matrix.arch }}.so
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ifshim-${{ matrix.arch }}
           path: dist/ifshim-${{ matrix.arch }}.so
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: usbshim-${{ matrix.arch }}
           path: dist/usbshim-${{ matrix.arch }}.so
@@ -130,11 +130,11 @@ jobs:
           done
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: droidc-aarch64-linux-android
           path: dist/droidc-aarch64-linux-android
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: droidc-x86_64-linux-android
           path: dist/droidc-x86_64-linux-android
@@ -150,7 +150,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: droidc-${{ matrix.arch }}-linux-musl
           path: bin
