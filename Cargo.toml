@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/droidc", "crates/droidc-verify", "crates/rookery", "crates/cgshim", "crates/ifshim"]
+members = ["crates/droidc", "crates/droidc-verify", "crates/rookery", "crates/cgshim", "crates/ifshim", "crates/usbshim"]
 
 [workspace.package]
 version = "0.1.0"

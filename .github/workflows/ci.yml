@@ -67,16 +67,16 @@ jobs:
         with:
           name: droidc-${{ matrix.arch }}-linux-musl
           path: dist/droidc-${{ matrix.arch }}-linux-musl
-      # LD_PRELOAD libraries for the guest: the cgroup shim for its systemd --user (crates/cgshim) and the
-      # network-interface shim for everything supervise starts (crates/ifshim). The guest is glibc, so these
+      # LD_PRELOAD libraries for the guest: the cgroup shim for its systemd --user (crates/cgshim), and the
+      # network-interface and USB shims for everything supervise starts (crates/ifshim, crates/usbshim). The guest is glibc, so these
       # are not the musl build above; target glibc 2.28 so any bootc image's libc is newer.
       - name: Test the shims (preloaded into real programs)
         if: matrix.arch == 'x86_64'
-        run: cargo test -p cgshim -p ifshim
+        run: cargo test -p cgshim -p ifshim -p usbshim
       - name: Build the shims (glibc)
         run: |
           rustup target add ${{ matrix.arch }}-unknown-linux-gnu
-          for shim in cgshim ifshim; do
+          for shim in cgshim ifshim usbshim; do
             cargo zigbuild --release --target ${{ matrix.arch }}-unknown-linux-gnu.2.28 -p $shim
             so=target/${{ matrix.arch }}-unknown-linux-gnu/release/lib$shim.so
             file "$so"
@@ -91,6 +91,10 @@ jobs:
         with:
           name: ifshim-${{ matrix.arch }}
           path: dist/ifshim-${{ matrix.arch }}.so
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: usbshim-${{ matrix.arch }}
+          path: dist/usbshim-${{ matrix.arch }}.so
 
   # Host-side Android build (bionic, NDK r27c, API 26): shipped by Selkie as libdroidc.so.
   # The musl build above is the guest-side binary (libdroidc-guest.so).

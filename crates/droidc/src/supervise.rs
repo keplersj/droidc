@@ -353,6 +353,10 @@ const CGROUP_ROOT_FILES: [&str; 5] = [
 /// `getifaddrs`/`if_nameindex` from ioctls when the sandbox refuses glibc's netlink socket.
 const DEFAULT_IFSHIM: &str = "/usr/lib/droidc/ifshim.so";
 
+/// The USB shim (`crates/usbshim`, DROIDC_USBSHIM; empty turns it off): an open of a placeholder
+/// `/dev/bus/usb` node the host wrote gets the usbfs fd Android granted (docs/design/usb.md).
+const DEFAULT_USBSHIM: &str = "/usr/lib/droidc/usbshim.so";
+
 /// `shim` in front of an existing `LD_PRELOAD` list, once.
 fn prepend_preload(shim: &std::path::Path, existing: Option<&str>) -> String {
     let shim = shim.display().to_string();
@@ -405,20 +409,35 @@ fn runs_on_glibc(exe: &std::path::Path) -> bool {
         .is_some_and(|n| n.starts_with("ld-linux"))
 }
 
-/// Puts the network-interface shim in front of everything this supervisor starts (the shell, the
-/// buses, the session), when it is installed and the guest is glibc. Done in our own environment
-/// rather than proot's: proot itself is a bionic binary.
-fn preload_ifshim() {
-    let shim = match std::env::var_os("DROIDC_IFSHIM") {
-        Some(v) if v.is_empty() => return,
-        Some(v) => PathBuf::from(v),
-        None => PathBuf::from(DEFAULT_IFSHIM),
-    };
-    if !shim.is_file() || !runs_on_glibc(std::path::Path::new("/bin/sh")) {
+/// Puts the guest shims (network interfaces, USB) in front of everything this supervisor starts
+/// (the shell, the buses, the session), when they are installed and the guest is glibc. Done in our
+/// own environment rather than proot's: proot itself is a bionic binary.
+fn preload_shims() {
+    if !runs_on_glibc(std::path::Path::new("/bin/sh")) {
         return;
     }
-    let preload = prepend_preload(&shim, std::env::var("LD_PRELOAD").ok().as_deref());
-    std::env::set_var("LD_PRELOAD", preload);
+    let mut usb = false;
+    for (var, default) in [
+        ("DROIDC_USBSHIM", DEFAULT_USBSHIM),
+        ("DROIDC_IFSHIM", DEFAULT_IFSHIM),
+    ] {
+        let shim = match std::env::var_os(var) {
+            Some(v) if v.is_empty() => continue,
+            Some(v) => PathBuf::from(v),
+            None => PathBuf::from(default),
+        };
+        if !shim.is_file() {
+            continue;
+        }
+        usb |= var == "DROIDC_USBSHIM";
+        let preload = prepend_preload(&shim, std::env::var("LD_PRELOAD").ok().as_deref());
+        std::env::set_var("LD_PRELOAD", preload);
+    }
+    // adb's libusb backend needs a hotplug netlink socket the sandbox may refuse; its own usbfs
+    // backend reads only what the shim and the host's device trees provide.
+    if usb && std::env::var_os("ADB_LIBUSB").is_none() {
+        std::env::set_var("ADB_LIBUSB", "0");
+    }
 }
 
 /// The shim to preload into `systemd --user`, when `mode` and the guest allow it.
@@ -977,7 +996,7 @@ pub(crate) fn start_user_services(
 ) -> Result<UserServices> {
     // The keeper may be its own process: give the buses and their activated services the
     // network-interface shim too (a no-op where its supervisor already did).
-    preload_ifshim();
+    preload_shims();
     if let Err(e) = ensure_machine_id(std::path::Path::new(MACHINE_ID)) {
         eprintln!("warn: could not initialise {MACHINE_ID}: {e}");
     }
@@ -1115,7 +1134,7 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
     std::env::set_var("XDG_RUNTIME_DIR", &dir);
     // Before anything is started (and before any thread): every child inherits it, the
     // container's user services included when this supervisor is the one that starts them.
-    preload_ifshim();
+    preload_shims();
     shared_tmp_dirs(&TMP_DIRS.map(std::path::Path::new));
     if let Some(e) = &entry {
         std::env::set_var("XDG_SESSION_TYPE", "wayland");
