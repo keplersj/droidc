@@ -557,10 +557,7 @@ mod tests {
         let s = SessionSpec::from_labels(&labels(&[
             (NAME_LABEL, "GNOME"),
             (RENDERER_LABEL, "screencast"),
-            (
-                EXEC_LABEL,
-                r#"["gnome-shell","--headless","--virtual-monitor","{width}x{height}"]"#,
-            ),
+            (EXEC_LABEL, r#"["gnome-shell","--headless"]"#),
             (SERVICES_LABEL, r#"[["pipewire"],["wireplumber"]]"#),
         ]))
         .unwrap()
@@ -684,7 +681,7 @@ mod tests {
             &ws.join("gnome-droidc.desktop"),
             "[Desktop Entry]\nName=GNOME\nName[de]=GNOME\nExec=gnome-session\nTryExec=gnome-shell\n\
              DesktopNames=GNOME\nX-Droidc-Renderer=screencast\n\
-             X-Droidc-Exec=gnome-shell --headless --virtual-monitor {width}x{height}\n\
+             X-Droidc-Exec=gnome-shell --headless\n\
              X-Droidc-Services=pipewire;wireplumber\nX-Droidc-FormFactors=tablet;Desktop;xr\n",
         );
         write(
@@ -730,15 +727,7 @@ mod tests {
         assert_eq!(gnome.form_factors, ["tablet", "desktop", "xr"]);
         let spec = gnome.spec.as_ref().unwrap();
         assert_eq!(spec.renderer, Renderer::Screencast);
-        assert_eq!(
-            spec.exec,
-            [
-                "gnome-shell",
-                "--headless",
-                "--virtual-monitor",
-                "{width}x{height}"
-            ]
-        );
+        assert_eq!(spec.exec, ["gnome-shell", "--headless"]);
         assert_eq!(spec.services, [vec!["pipewire"], vec!["wireplumber"]]);
         assert_eq!(gnome.current_desktop().as_deref(), Some("GNOME"));
         assert_eq!(gnome.session_desktop().as_deref(), Some("gnome-droidc"));
