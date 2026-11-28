@@ -177,8 +177,10 @@ impl Record {
             let (key, val, used) = if let Some(eq) = line.iter().position(|&b| b == b'=') {
                 (&line[..eq], &line[eq + 1..], nl + 1)
             } else {
-                let len = u64::from_le_bytes(d.get(nl + 1..nl + 9)?.try_into().ok()?) as usize;
-                (line, d.get(nl + 9..nl + 9 + len)?, nl + 9 + len + 1)
+                let len = u64::from_le_bytes(d.get(nl + 1..nl + 9)?.try_into().ok()?);
+                // A sender picks this length; one past the datagram's end is malformed, not a crash.
+                let end = usize::try_from(len).ok()?.checked_add(nl + 9)?;
+                (line, d.get(nl + 9..end)?, end.checked_add(1)?)
             };
             match key {
                 b"MESSAGE" => msg = Some(String::from_utf8_lossy(val).into_owned()),
@@ -208,6 +210,19 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::time::Duration;
+
+    #[test]
+    fn a_binary_field_longer_than_the_datagram_is_rejected() {
+        // Found by fuzz/fuzz_targets/journal_record.rs: the length used to overflow when added.
+        let mut d = b"MESSAGE\n".to_vec();
+        d.extend_from_slice(&u64::MAX.to_le_bytes());
+        d.extend_from_slice(b"hi\n");
+        assert!(Record::parse(&d).is_none());
+        let mut d = b"MESSAGE\n".to_vec();
+        d.extend_from_slice(&100u64.to_le_bytes());
+        d.extend_from_slice(b"short\n");
+        assert!(Record::parse(&d).is_none());
+    }
 
     #[test]
     fn datagrams_are_decoded() {

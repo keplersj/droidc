@@ -1,0 +1,80 @@
+name: Mutants (changed lines)
+
+# Mutation testing on just the lines a PR changes, so it takes minutes, not hours.
+# The full run is nightly (nightly.yml). Report-only until it has been quiet for a while.
+
+on:
+  pull_request:
+    paths:
+      - "crates/**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutants-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  ENFORCE: "false"
+
+jobs:
+  mutants:
+    name: Mutation testing (changed lines, cargo-mutants)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: cargo-mutants
+      - name: Diff against the base branch
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: git diff "$BASE_SHA...HEAD" -- '*.rs' > pr.diff && wc -l pr.diff
+      - name: Mutate the changed lines
+        run: |
+          if [ ! -s pr.diff ]; then
+            echo "No Rust lines changed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          status=0
+          cargo mutants --workspace --in-diff pr.diff --no-shuffle --timeout-multiplier 3 --output mutants-pr || status=$?
+          out=mutants-pr/mutants.out
+          {
+            echo "### Mutation testing on changed lines"
+            for f in caught missed timeout unviable; do
+              n=0; [ -f "$out/$f.txt" ] && n=$(wc -l < "$out/$f.txt")
+              echo "- $f: $n"
+            done
+            if [ -s "$out/missed.txt" ]; then
+              echo
+              echo "Missed mutants (a test should fail for each):"
+              echo '```'
+              head -50 "$out/missed.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          # cargo-mutants exits 2 for missed mutants and 3 for timeouts; anything else is a real failure.
+          case "$status" in
+            0) ;;
+            2|3)
+              echo "::warning::cargo-mutants found missed or timed-out mutants on changed lines (see the job summary)"
+              [ "$ENFORCE" = "true" ] && exit "$status" ;;
+            *) exit "$status" ;;
+          esac
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: mutants-pr
+          path: mutants-pr/mutants.out
+          if-no-files-found: ignore
+          retention-days: 14
