@@ -229,8 +229,7 @@ The same hole as today remains: a daemon that clears its environment and double-
   image's libc, so it needs no preload and survives images droidc has never seen.
 - Keep droidc MIT: implement from the man pages and D-Bus documentation, not from systemd's LGPL source.
   Check licences before borrowing anything from the projects above.
-- A new crate in the droidc workspace (decided; working name `crates/droidc-systemd` until the name is
-  picked), broken out into its own repository later only if that turns out to be warranted. It has no
+- A new crate in the droidc workspace (decided: `crates/rookery`), broken out into its own repository later only if that turns out to be warranted. It has no
   Android-specific code, so it can be tested on a plain Linux CI runner against real unit files and, as a **differential test**, against real systemd
   running the same units in a container with namespaces: same transactions, same `ActiveState`
   sequence, same `systemctl show` output for the supported properties.
@@ -339,11 +338,8 @@ Settled by Kepler on 2026-11-28, answering this note's open questions:
    own sockets when none are passed, inferred, to check in step 4); socket activation comes with the
    other `.socket` work. droidc's socket stand-in remains the fallback.
 5. **Crate:** a new crate in the droidc workspace, broken out later if reasonable.
-
-Still open:
-
-6. **Name.** Kepler's candidate is `dsystemd`; he also likes a seal name to match the images. The crate
-   uses the working name `droidc-systemd` until one is picked.
+6. **Name:** Rookery, a seal name to match the images. The crate is `crates/rookery`. The name also
+   fits running droidc as a Kubernetes node later (#140).
 
 ## Sources
 
