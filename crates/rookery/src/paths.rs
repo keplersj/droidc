@@ -5,6 +5,7 @@
 //! shim image can add units and drop-ins that override the image's packaged ones, while the image's
 //! `/etc` and anything written to `/run` still override droidc.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Which manager: PID 1 or a user's `user@UID.service`.
@@ -20,7 +21,7 @@ pub const DROIDC_USER_UNITS: &str = "/usr/lib/droidc/units/user";
 
 /// The environment the user search path is built from. All optional: the XDG defaults apply, as the
 /// XDG Base Directory specification says.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UserDirs {
     pub home: Option<PathBuf>,
     pub xdg_runtime_dir: Option<PathBuf>,
@@ -33,12 +34,17 @@ pub struct UserDirs {
 impl UserDirs {
     /// Reads `HOME` and the `XDG_*` variables. Empty values count as unset, as the spec says.
     pub fn from_env() -> UserDirs {
-        let path = |k: &str| {
-            std::env::var_os(k)
+        UserDirs::from_vars(|k| std::env::var_os(k))
+    }
+
+    /// As [`UserDirs::from_env`], with the variables looked up by `var`.
+    pub fn from_vars(var: impl Fn(&str) -> Option<OsString>) -> UserDirs {
+        let path = |k: &str| var(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+        let list = |k: &str| {
+            var(k)
                 .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
+                .map(|v| v.to_string_lossy().into_owned())
         };
-        let list = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         UserDirs {
             home: path("HOME"),
             xdg_runtime_dir: path("XDG_RUNTIME_DIR"),
@@ -265,6 +271,34 @@ mod tests {
         assert!(!s.iter().any(|d| d.contains("relative")));
         assert!(s.contains(&"/y/systemd/user".to_string()));
         assert!(!s.contains(&"/usr/share/systemd/user".to_string()));
+    }
+
+    #[test]
+    fn dirs_from_variables() {
+        let vars = |k: &str| -> Option<OsString> {
+            match k {
+                "HOME" => Some("/home/k".into()),
+                "XDG_RUNTIME_DIR" => Some("/run/user/1000".into()),
+                "XDG_CONFIG_DIRS" => Some("/x".into()),
+                // Empty counts as unset.
+                "XDG_CONFIG_HOME" | "XDG_DATA_DIRS" => Some("".into()),
+                _ => None,
+            }
+        };
+        let d = UserDirs::from_vars(vars);
+        assert_eq!(
+            d,
+            UserDirs {
+                home: Some("/home/k".into()),
+                xdg_runtime_dir: Some("/run/user/1000".into()),
+                xdg_config_dirs: Some("/x".into()),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            UserDirs::from_env(),
+            UserDirs::from_vars(|k| std::env::var_os(k))
+        );
     }
 
     #[test]

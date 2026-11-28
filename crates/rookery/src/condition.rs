@@ -140,7 +140,10 @@ fn test(c: &Check, host: &Host, unit: &LoadedUnit, notices: &mut Vec<Notice>) ->
         "FileIsExecutable" => is_executable(p),
         "User" => match v {
             "@system" => host.uid.is_some_and(|u| u < 1000),
-            _ => host.user_name.as_deref() == Some(v) || v.parse().ok() == host.uid,
+            _ => {
+                host.user_name.as_deref() == Some(v)
+                    || v.parse::<u32>().is_ok_and(|u| host.uid == Some(u))
+            }
         },
         "Group" => {
             host.groups.iter().any(|g| g == v)
@@ -394,9 +397,135 @@ mod tests {
         assert_eq!(evaluate(&u, &Host::default(), &mut notices), Outcome::Pass);
         assert_eq!(notices.len(), 3);
         assert_eq!(
+            notices[0].to_string(),
+            "a.service: ignoring ConditionACPower=true (not checked under droidc, assuming it holds)"
+        );
+        assert_eq!(
             notices[2].to_string(),
             "a.service: ignoring ConditionMadeUp=1 (not recognised by droidc, assuming it holds)"
         );
+    }
+
+    /// Whether `key=value`, alone in a unit, passes on `host`.
+    fn holds(t: &TempDir, key: &str, value: &str, host: &Host) -> bool {
+        let u = unit_with(t, &format!("{key}={value}"));
+        evaluate(&u, host, &mut vec![]) == Outcome::Pass
+    }
+
+    /// Every kind of check can fail. A kind the stand-in forgot would pass, as unknown kinds do.
+    #[test]
+    fn each_kind_can_fail() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = TempDir::new();
+        let root = t.path().display().to_string();
+        let file = t.write("f", "x");
+        let file = file.display().to_string();
+        let empty_dir = t.path().join("empty");
+        fs::create_dir(&empty_dir).unwrap();
+        let empty_dir = empty_dir.display().to_string();
+        let link = t.link("l", &file).display().to_string();
+        let ro = t.write("ro", "x");
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o444)).unwrap();
+        let ro = ro.display().to_string();
+        let tool = t.write("bin/tool", "#!/bin/sh\n");
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let plain = t.write("bin/plain", "x");
+        fs::set_permissions(&plain, fs::Permissions::from_mode(0o644)).unwrap();
+        let bin = format!("{root}/bin");
+        let host = Host::default();
+
+        let cases: &[(&str, &str, bool)] = &[
+            ("ConditionPathExistsGlob", &format!("{bin}/t??l"), true),
+            ("ConditionPathExistsGlob", &format!("{bin}/x*"), false),
+            ("ConditionPathExistsGlob", &format!("{bin}/*z"), false),
+            ("ConditionPathExistsGlob", &format!("{bin}/tool?"), false),
+            ("ConditionPathExistsGlob", &format!("{root}/nope*/x"), false),
+            ("ConditionPathIsDirectory", &root, true),
+            ("ConditionPathIsDirectory", &file, false),
+            ("ConditionPathIsSymbolicLink", &link, true),
+            ("ConditionPathIsSymbolicLink", &file, false),
+            ("ConditionPathIsMountPoint", "/", true),
+            ("ConditionPathIsMountPoint", &empty_dir, false),
+            ("ConditionPathIsReadWrite", &file, true),
+            ("ConditionPathIsReadWrite", &ro, false),
+            ("ConditionPathIsReadWrite", &format!("{root}/nope"), false),
+            ("ConditionDirectoryNotEmpty", &root, true),
+            ("ConditionDirectoryNotEmpty", &empty_dir, false),
+            (
+                "ConditionFileIsExecutable",
+                &tool.display().to_string(),
+                true,
+            ),
+            (
+                "ConditionFileIsExecutable",
+                &plain.display().to_string(),
+                false,
+            ),
+            ("ConditionFileIsExecutable", &bin, false),
+            ("ConditionNeedsUpdate", "/etc", false),
+            ("ConditionFirstBoot", "yes", false),
+            ("ConditionFirstBoot", "no", true),
+            ("ConditionArchitecture", "x86-64", false),
+            ("ConditionVirtualization", "container-other", true),
+            ("ConditionVirtualization", "vm", false),
+            ("ConditionVirtualization", "private-users", false),
+            ("ConditionVirtualization", "no", false),
+            ("ConditionSecurity", "selinux", false),
+            ("ConditionCapability", "CAP_SYS_ADMIN", false),
+            ("ConditionControlGroupController", "memory", false),
+            ("ConditionUser", "k", false),
+            ("ConditionGroup", "wheel", false),
+            ("ConditionEnvironment", "container", false),
+            ("ConditionKernelCommandLine", "quiet", false),
+        ];
+        for (key, value, want) in cases {
+            assert_eq!(holds(&t, key, value, &host), *want, "{key}={value}");
+        }
+    }
+
+    #[test]
+    fn host_facts_can_fail() {
+        let t = TempDir::new();
+        let host = Host {
+            user_name: Some("k".into()),
+            uid: Some(10123),
+            groups: vec!["wheel".into()],
+            gids: vec![10],
+            environment: vec![("container".into(), "droidc".into())],
+            kernel_command_line: Some("quiet root=/dev/x rw".into()),
+            needs_update: true,
+            architecture: Some("arm64".into()),
+            ..Default::default()
+        };
+        let cases: &[(&str, &str, bool)] = &[
+            ("ConditionUser", "j", false),
+            ("ConditionUser", "10123", true),
+            ("ConditionUser", "10124", false),
+            ("ConditionUser", "@system", false),
+            ("ConditionGroup", "audio", false),
+            ("ConditionGroup", "10", true),
+            ("ConditionGroup", "11", false),
+            ("ConditionEnvironment", "container=other", false),
+            ("ConditionEnvironment", "nope", false),
+            ("ConditionKernelCommandLine", "splash", false),
+            ("ConditionKernelCommandLine", "root=/dev/x", true),
+            ("ConditionKernelCommandLine", "root=/dev/y", false),
+            ("ConditionNeedsUpdate", "/etc", true),
+            ("ConditionArchitecture", "arm64", true),
+            ("ConditionArchitecture", "x86-64", false),
+        ];
+        for (key, value, want) in cases {
+            assert_eq!(holds(&t, key, value, &host), *want, "{key}={value}");
+        }
+
+        // System users are the ones below 1000.
+        for (uid, want) in [(0, true), (999, true), (1000, false)] {
+            let h = Host {
+                uid: Some(uid),
+                ..Default::default()
+            };
+            assert_eq!(holds(&t, "ConditionUser", "@system", &h), want, "uid {uid}");
+        }
     }
 
     #[test]

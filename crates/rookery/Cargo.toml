@@ -1,5 +1,5 @@
 [package]
-name = "droidc-systemd"
+name = "rookery"
 description = "droidc's systemd stand-in: unit loading for a service manager that runs without cgroups or namespaces"
 version.workspace = true
 edition.workspace = true

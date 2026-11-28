@@ -139,10 +139,7 @@ impl SpecContext {
             'E' => self
                 .user_dir(&self.xdg_config_home, ".config")
                 .ok_or_else(missing)?,
-            'T' => std::env::var("TMPDIR")
-                .ok()
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "/tmp".into()),
+            'T' => tmp_dir(std::env::var("TMPDIR").ok()),
             'V' => "/var/tmp".into(),
             'H' => text(&self.hostname)?,
             'l' => self
@@ -162,6 +159,12 @@ impl SpecContext {
             other => return Err(SpecError::Unknown(other)),
         })
     }
+}
+
+/// `%T`: `$TMPDIR`, or `/tmp` when it is unset or empty.
+fn tmp_dir(var: Option<String>) -> String {
+    var.filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "/tmp".into())
 }
 
 /// `%j`: the part of the prefix after its last dash (the whole prefix without one).
@@ -276,6 +279,13 @@ mod tests {
             expand("%y|%Y", &c).unwrap(),
             "/usr/lib/systemd/system/a.service|/usr/lib/systemd/system"
         );
+    }
+
+    #[test]
+    fn tmp_dir_falls_back() {
+        assert_eq!(tmp_dir(None), "/tmp");
+        assert_eq!(tmp_dir(Some(String::new())), "/tmp");
+        assert_eq!(tmp_dir(Some("/t".into())), "/t");
     }
 
     #[test]

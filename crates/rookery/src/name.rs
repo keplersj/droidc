@@ -273,37 +273,30 @@ pub fn escape_path(path: &str) -> String {
 /// The reverse of [`escape`]: `-` becomes `/`, `\xNN` its byte. `%I`, `%P`, `%J`.
 /// Invalid escapes are kept as written.
 pub fn unescape(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'-' => {
-                out.push(b'/');
-                i += 1;
-            }
-            b'\\' if bytes.get(i + 1) == Some(&b'x') => {
-                match s
-                    .get(i + 2..i + 4)
-                    .and_then(|h| u8::from_str_radix(h, 16).ok())
-                {
-                    Some(b) => {
-                        out.push(b);
-                        i += 4;
-                    }
-                    None => {
-                        out.push(b'\\');
-                        i += 1;
-                    }
+    let mut out = Vec::with_capacity(s.len());
+    let mut rest = s.as_bytes();
+    while let Some((&b, tail)) = rest.split_first() {
+        rest = tail;
+        match b {
+            b'-' => out.push(b'/'),
+            b'\\' => match tail {
+                [b'x', hi, lo, more @ ..] if hex_byte(*hi, *lo).is_some() => {
+                    out.extend(hex_byte(*hi, *lo));
+                    rest = more;
                 }
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
+                _ => out.push(b'\\'),
+            },
+            b => out.push(b),
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The byte two hex digits spell, if they are hex digits.
+fn hex_byte(hi: u8, lo: u8) -> Option<u8> {
+    let hi = char::from(hi).to_digit(16)?;
+    let lo = char::from(lo).to_digit(16)?;
+    u8::try_from(hi * 16 + lo).ok()
 }
 
 /// The reverse of [`escape_path`]: always absolute. `%f` for an instance that is a path.
@@ -357,7 +350,31 @@ mod tests {
             UnitName::parse(&format!("{}.service", "a".repeat(250))),
             Err(NameError::TooLong)
         );
+        // 255 bytes is the longest name allowed.
+        assert!(UnitName::parse(&format!("{}.service", "a".repeat(247))).is_ok());
+        assert!(UnitName::parse(&format!("{}.service", "a".repeat(248))).is_err());
         assert!(UnitName::parse("dev-disk-by\\x2duuid-1234.device").is_ok());
+    }
+
+    #[test]
+    fn error_messages() {
+        let cases = [
+            (NameError::TooLong, "unit name longer than 255 bytes"),
+            (NameError::NoType, "unit name has no type suffix"),
+            (
+                NameError::UnknownType("bar".into()),
+                "unknown unit type 'bar'",
+            ),
+            (NameError::EmptyPrefix, "unit name has an empty prefix"),
+            (
+                NameError::BadCharacter(' '),
+                "invalid character ' ' in unit name",
+            ),
+            (NameError::TooManyAts, "more than one '@' in unit name"),
+        ];
+        for (e, text) in cases {
+            assert_eq!(e.to_string(), text);
+        }
     }
 
     #[test]
@@ -399,6 +416,7 @@ mod tests {
         );
         assert_eq!(escape("a/b-c"), "a-b\\x2dc");
         assert_eq!(escape(".hidden"), "\\x2ehidden");
+        assert_eq!(escape("a.b"), "a.b");
         assert_eq!(escape_path("/home/user/"), "home-user");
         assert_eq!(escape_path("//var//lib"), "var-lib");
         assert_eq!(escape_path("/"), "-");
@@ -407,6 +425,9 @@ mod tests {
         assert_eq!(unescape("Hall\\xc3\\xb6chen"), "Hallöchen");
         assert_eq!(unescape("bad\\xzz"), "bad\\xzz");
         assert_eq!(unescape("end\\x2"), "end\\x2");
+        assert_eq!(unescape("a\\b\\"), "a\\b\\");
+        assert_eq!(unescape("\\x2E\\x2e\\x7f\\xff"), "..\u{7f}\u{fffd}");
+        assert_eq!(unescape("\\x+f"), "\\x+f");
         assert_eq!(unescape_path("home-user"), "/home/user");
         assert_eq!(unescape_path("-"), "/");
         for s in ["/run/user/1000", "/a b/ç"] {

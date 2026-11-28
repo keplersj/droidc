@@ -300,10 +300,11 @@ impl Loader {
             add(format!("{}.d", n.ty().suffix()));
         }
 
-        // file name -> (dir rank, specificity, path)
-        let mut best: BTreeMap<String, (usize, usize, PathBuf)> = BTreeMap::new();
-        for (rank, dir) in self.path.dirs().iter().enumerate() {
-            for (spec, dn) in dir_names.iter().enumerate() {
+        // File name -> path. Directories are visited by priority, then by specificity, so the first
+        // file found under a name is the one that applies.
+        let mut best: BTreeMap<String, PathBuf> = BTreeMap::new();
+        for dir in self.path.dirs() {
+            for dn in &dir_names {
                 let Ok(rd) = fs::read_dir(dir.join(dn)) else {
                     continue;
                 };
@@ -312,20 +313,11 @@ impl Loader {
                     if !file_name.ends_with(".conf") {
                         continue;
                     }
-                    let key = (rank, spec);
-                    match best.get(&file_name) {
-                        Some((r, s, _)) if (*r, *s) <= key => {}
-                        _ => {
-                            best.insert(file_name, (rank, spec, entry.path()));
-                        }
-                    }
+                    best.entry(file_name).or_insert_with(|| entry.path());
                 }
             }
         }
-        best.into_values()
-            .filter(|(_, _, p)| !is_masked_file(p))
-            .map(|(_, _, p)| p)
-            .collect()
+        best.into_values().filter(|p| !is_masked_file(p)).collect()
     }
 
     fn dep_dir(
@@ -425,9 +417,9 @@ fn alias_target(resolved: &Path, requested: &UnitName, candidate: &UnitName) -> 
     Some(target)
 }
 
+/// A link to `/dev/null` or an empty file. `/dev/null` reports a length of zero too.
 fn is_masked_file(p: &Path) -> bool {
     match fs::canonicalize(p) {
-        Ok(r) if r == Path::new("/dev/null") => true,
         Ok(r) => fs::metadata(r).map(|m| m.len() == 0).unwrap_or(false),
         Err(_) => true,
     }
@@ -465,7 +457,7 @@ pub(crate) mod testdir {
         pub fn new() -> TempDir {
             static N: AtomicUsize = AtomicUsize::new(0);
             let p = std::env::temp_dir().join(format!(
-                "droidc-systemd-test-{}-{}",
+                "rookery-test-{}-{}",
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed)
             ));
@@ -628,6 +620,13 @@ mod tests {
         assert_eq!(
             l.load_str("other@x.service").unwrap().id.to_string(),
             "real@x.service"
+        );
+
+        // An instance linked to a plain name is that name.
+        t.link("usr/inst@y.service", &gdm);
+        assert_eq!(
+            l.load_str("inst@y.service").unwrap().id.to_string(),
+            "gdm.service"
         );
 
         // A link to another type isn't an alias.

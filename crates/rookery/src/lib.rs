@@ -1,4 +1,4 @@
-//! droidc's systemd stand-in (working name; see `docs/design/systemd-standin.md`).
+//! Rookery, droidc's systemd stand-in (`docs/design/systemd-standin.md`).
 //!
 //! This crate is the part of the stand-in that has nothing to do with Android: it reads an image's
 //! own unit files the way systemd documents (`systemd.syntax(7)`, `systemd.unit(5)`), so the manager

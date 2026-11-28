@@ -68,7 +68,7 @@ jobs:
             0) ;;
             2|3)
               echo "::warning::cargo-mutants found missed or timed-out mutants on changed lines (see the job summary)"
-              [ "$ENFORCE" = "true" ] && exit "$status" ;;
+              if [ "$ENFORCE" = "true" ]; then exit "$status"; fi ;;
             *) exit "$status" ;;
           esac
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
