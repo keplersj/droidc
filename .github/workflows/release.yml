@@ -1,0 +1,193 @@
+name: Release
+
+# Tags and releases main with semantic-release once main's CI run is green.
+# The version comes from Conventional Commit PR titles (squash merges) and lives only in the tag:
+# nothing is committed back to main. Until the repo variable RELEASE_ENABLED is "true", this only
+# reports the version it would release (a dry run) and creates nothing.
+
+on:
+  # Safe here: only push runs on this repo's own main are acted on (see the release job's if),
+  # so no fork or PR code is ever checked out with write access.
+  workflow_run: # zizmor: ignore[dangerous-triggers]
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Tag and draft the release (semantic-release)
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      DRY_RUN: ${{ vars.RELEASE_ENABLED != 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Put the tested commit on main
+        # semantic-release releases the checked-out branch, and skips if main has moved on since.
+        run: git checkout -B main "$SHA"
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+      - run: npm ci --prefix .github/release --ignore-scripts --no-audit --no-fund
+      - name: Run semantic-release
+        id: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! git describe --tags --match 'v[0-9]*' --abbrev=0 >/dev/null 2>&1; then
+            echo "::warning::no v* tag yet, so semantic-release would start at 1.0.0. Tag the starting point (v0.1.0) first."
+            echo "No \`v*\` tag yet: tag the starting point (v0.1.0) before the first release." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          args=()
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          rm -f .release-version
+          .github/release/node_modules/.bin/semantic-release "${args[@]}"
+          if [ -s .release-version ]; then
+            v=$(cat .release-version)
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "Dry run: the next release would be **v$v**. Set the repo variable \`RELEASE_ENABLED\` to \`true\` to publish." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "Tagged **v$v** and drafted its release." >> "$GITHUB_STEP_SUMMARY"
+              echo "version=$v" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "No feat, fix or perf commits since the last tag, so no release." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  musl:
+    name: Build static musl droidc and the glibc shims (${{ matrix.arch }})
+    needs: release
+    if: needs.release.outputs.version != ''
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-latest, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, arch: aarch64 }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: v${{ needs.release.outputs.version }}
+          persist-credentials: false
+      - name: Stamp the version
+        run: sed -i "0,/^version = \".*\"/s//version = \"$VERSION\"/" Cargo.toml && grep -m1 '^version' Cargo.toml
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          targets: ${{ matrix.arch }}-unknown-linux-musl,${{ matrix.arch }}-unknown-linux-gnu
+      - run: pip install --break-system-packages ziglang==0.13.0 cargo-zigbuild
+      - name: Build
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cargo zigbuild --release --target "$MATRIX_ARCH-unknown-linux-musl" -p droidc
+          f=target/$MATRIX_ARCH-unknown-linux-musl/release/droidc
+          file "$f" | grep -q 'statically linked'
+          "$f" --version | grep -F "$VERSION"
+          cp "$f" "dist/droidc-$MATRIX_ARCH-linux-musl"
+          for shim in cgshim ifshim; do
+            cargo zigbuild --release --target "$MATRIX_ARCH-unknown-linux-gnu.2.28" -p "$shim"
+            cp "target/$MATRIX_ARCH-unknown-linux-gnu/release/lib$shim.so" "dist/$shim-$MATRIX_ARCH.so"
+          done
+        env:
+          MATRIX_ARCH: ${{ matrix.arch }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-musl-${{ matrix.arch }}
+          path: dist/*
+
+  android:
+    name: Build Android (bionic) droidc
+    needs: release
+    if: needs.release.outputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: v${{ needs.release.outputs.version }}
+          persist-credentials: false
+      - name: Stamp the version
+        run: sed -i "0,/^version = \".*\"/s//version = \"$VERSION\"/" Cargo.toml && grep -m1 '^version' Cargo.toml
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1
+        id: ndk
+        with:
+          ndk-version: r27c
+      - run: cargo install cargo-ndk --locked
+      - name: Build both ABIs
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          cargo ndk -t arm64-v8a -t x86_64 --platform 26 build --release -p droidc
+          mkdir -p dist
+          for t in aarch64 x86_64; do
+            f=target/$t-linux-android/release/droidc
+            file "$f" | grep -q 'linker64'
+            cp "$f" "dist/droidc-$t-linux-android"
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-android
+          path: dist/*
+
+  publish:
+    name: Attach assets and publish the release
+    needs: [release, musl, android]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: v${{ needs.release.outputs.version }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- * | tee SHA256SUMS
+      - uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: dist/*
+      - name: Upload and publish
+        run: |
+          gh release upload "$TAG" dist/* --clobber
+          gh release edit "$TAG" --draft=false --latest
