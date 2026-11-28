@@ -8,6 +8,11 @@ use crate::VerifyError;
 /// <https://raw.githubusercontent.com/projectbluefin/bluefin-lts/main/cosign.pub>.
 pub const UBLUE_COSIGN_PUB: &str = include_str!("data/bluefin-lts-cosign.pub");
 
+/// PEM of the Pinniped OS image factory's `cosign.pub` (ECDSA P-256), from
+/// <https://github.com/Pinniped-OS/factory/blob/main/keys/cosign.pub>. Pinniped OS publishes the
+/// droidc-tuned images (`<image>:<release>-droidc`) that Selkie offers.
+pub const PINNIPED_OS_COSIGN_PUB: &str = include_str!("data/pinniped-os-cosign.pub");
+
 /// Fulcio OIDC issuer used by GitHub Actions.
 pub const GITHUB_ACTIONS_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
@@ -122,9 +127,35 @@ impl Policy {
         Ok(p)
     }
 
-    /// Built-in policy: Bluefin LTS keyless, `ghcr.io/ublue-os/*` with the published cosign key,
-    /// default reject.
+    /// Built-in policy: Bluefin LTS keyless, `ghcr.io/ublue-os/*` and `ghcr.io/pinniped-os/*` with
+    /// their published cosign keys, default reject.
     pub fn default_policy() -> Self {
+        let mut p = Self::default_policy_v1();
+        p.images.push(ImagePolicy {
+            match_: "ghcr.io/pinniped-os/*".into(),
+            keyless: None,
+            keys: vec![PINNIPED_OS_COSIGN_PUB.to_string()],
+        });
+        p
+    }
+
+    /// Earlier built-in defaults, oldest first. A `policy.json` equal to one of these was written
+    /// by droidc and never edited, so [`Policy::upgrade_default`] may replace it.
+    fn earlier_defaults() -> [Self; 1] {
+        [Self::default_policy_v1()]
+    }
+
+    /// If this is an unedited earlier built-in default, the current default; otherwise `None`.
+    /// Edited policies are never touched.
+    pub fn upgrade_default(&self) -> Option<Self> {
+        Self::earlier_defaults()
+            .iter()
+            .any(|old| old == self)
+            .then(Self::default_policy)
+    }
+
+    /// The first built-in default: Bluefin LTS keyless and `ghcr.io/ublue-os/*`.
+    fn default_policy_v1() -> Self {
         Policy {
             version: 1,
             default: "reject".into(),
@@ -162,5 +193,56 @@ impl Policy {
             .rev()
             .max_by_key(|(spec, _)| *spec)
             .map(|(_, e)| e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_policy_trusts_pinniped_os_with_its_key() {
+        let p = Policy::default_policy();
+        for repo in [
+            "ghcr.io/pinniped-os/monk",
+            "ghcr.io/pinniped-os/harbor",
+            "ghcr.io/pinniped-os/hooded",
+        ] {
+            let e = p.find(repo).expect(repo);
+            assert_eq!(e.match_, "ghcr.io/pinniped-os/*");
+            assert!(e.keyless.is_none());
+            assert_eq!(e.keys, vec![PINNIPED_OS_COSIGN_PUB.to_string()]);
+        }
+        assert!(p.find("ghcr.io/pinniped-os-evil/monk").is_none());
+        assert!(p.find("ghcr.io/pinniped-os").is_none());
+    }
+
+    #[test]
+    fn default_policy_round_trips_and_validates() {
+        let p = Policy::default_policy();
+        assert_eq!(Policy::from_json(&p.to_json()).unwrap(), p);
+    }
+
+    #[test]
+    fn pinniped_os_key_is_a_pem_public_key() {
+        assert!(PINNIPED_OS_COSIGN_PUB.starts_with("-----BEGIN PUBLIC KEY-----"));
+        assert_ne!(PINNIPED_OS_COSIGN_PUB, UBLUE_COSIGN_PUB);
+    }
+
+    #[test]
+    fn unedited_earlier_default_upgrades() {
+        let old = Policy::from_json(&Policy::default_policy_v1().to_json()).unwrap();
+        assert_eq!(old.upgrade_default(), Some(Policy::default_policy()));
+    }
+
+    #[test]
+    fn current_default_and_edited_policies_are_left_alone() {
+        assert_eq!(Policy::default_policy().upgrade_default(), None);
+        let mut edited = Policy::default_policy_v1();
+        edited.images.pop();
+        assert_eq!(edited.upgrade_default(), None);
+        let mut moved = Policy::default_policy_v1();
+        moved.trusted_root_path = Some("/data/root.json".into());
+        assert_eq!(moved.upgrade_default(), None);
     }
 }
