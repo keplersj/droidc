@@ -194,7 +194,7 @@ droidc [--root DIR] [--container NAME] [--json] [--dns IPS] <command>
   supervise -- <cmd...>         (inside the guest) start session services, dbus first, then cmd
   supervise --session [--session-id ID] [--width W --height H --scale S] [-- cmd...]
                                 (inside the guest) start a graphical session, see "Graphical session"
-  bridge [--width W --height H --connector C --dump-frame PNG]
+  bridge [--width W --height H --scale S --connector C --dump-frame PNG]
                                 (inside the guest) show a headless session compositor on the host compositor
   session [show|list|set|clear] the graphical sessions (see "Graphical session"); bare `session` shows
   container list                every container with its current and previous deployment
@@ -446,8 +446,13 @@ gnome-shell 50 aborts without a connection), the `services`, then by renderer:
 - `wayland`: `exec` with `WAYLAND_DISPLAY` = the host socket. A command given after `--` runs as an
   extra client.
 - `screencast`: `exec` with `WAYLAND_DISPLAY` unset, then `droidc bridge --width W --height H` (or the
-  command given after `--`). The bridge waits for the ScreenCast service, records the monitor
-  (`Meta-0`, the first virtual monitor) with a linked RemoteDesktop session, reads frames from
+  command given after `--`). The bridge waits for the ScreenCast service, records a monitor with a
+  linked RemoteDesktop session: the compositor's first monitor (`Meta-0` from `--virtual-monitor
+  WxH`), or, when it was started with no monitor (`gnome-shell --headless` alone), a virtual one
+  from `RecordVirtual` the size of the window. A `--virtual-monitor` keeps its size, so when the
+  window changes size (the device turns) its frames are scaled to fit; a `RecordVirtual` monitor
+  takes the size its consumer asks for, so the bridge restarts its capture at the window's new size
+  and Mutter resizes that monitor in place, keeping its scale and the session. It reads frames from
   `gst-launch-1.0 pipewiresrc autoconnect=false` (the image's own PipeWire client: the static droidc
   can't load libpipewire), linked to Mutter's node with `pw-link` because WirePlumber's policy won't
   link a stream to a stream (`target-object` fails with "target not found"), presents them as one fullscreen `xdg_toplevel` over `wl_shm`, and sends the toplevel's

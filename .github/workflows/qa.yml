@@ -1,0 +1,180 @@
+name: qa
+
+# Extra quality gates beside ci.yml: PR title (Conventional Commits), workflow lint, dependency
+# policy (cargo-deny) and a coverage report compared against main's last run.
+#
+# Report-only for now: every check writes its findings to the job summary and as warnings, and the
+# job stays green. Set ENFORCE to "true" to make a check fail its job once main is clean and the
+# check is ready to become required (see the CI/CD plan).
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+  push:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qa-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  ENFORCE: "false"
+
+jobs:
+  pr-title:
+    name: PR title follows Conventional Commits
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          # Squash merges use the PR title as the commit, and semantic-release reads those commits.
+          # type(optional scope)!: description  -- https://www.conventionalcommits.org/en/v1.0.0/
+          re='^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([a-z0-9._/-]+\))?!?: .+'
+          if [[ "$TITLE" =~ $re ]]; then
+            echo "PR title is a Conventional Commit: $TITLE" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          msg="PR title is not a Conventional Commit (e.g. 'feat(bridge): follow GNOME scale'): $TITLE"
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ENFORCE" = true ]; then echo "::error::$msg"; exit 1; fi
+          echo "::warning::$msg"
+
+  workflows:
+    name: Workflow lint (actionlint, zizmor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: zizmor,shellcheck
+      - name: actionlint
+        run: |
+          status=0
+          docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color || status=$?
+          if [ "$status" -ne 0 ]; then
+            if [ "$ENFORCE" = true ]; then exit "$status"; fi
+            echo "::warning::actionlint found problems (report-only)"
+          fi
+      - name: zizmor
+        run: |
+          status=0
+          zizmor --offline --format=github .github/workflows || status=$?
+          if [ "$status" -ne 0 ]; then
+            if [ "$ENFORCE" = true ]; then exit "$status"; fi
+            echo "::warning::zizmor found problems (report-only)"
+          fi
+
+  deny:
+    name: Dependency policy (cargo-deny)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [advisories, "bans licenses sources"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: cargo-deny
+      - name: cargo deny check ${{ matrix.check }}
+        env:
+          CHECKS: ${{ matrix.check }}
+        run: |
+          status=0
+          # shellcheck disable=SC2086 # CHECKS is a word list on purpose
+          cargo deny --color always check $CHECKS 2> deny.log || status=$?
+          cat deny.log
+          {
+            echo "### cargo deny check $CHECKS"
+            echo
+            grep -E '^(error|warning)\[' deny.log | sort | uniq -c | sort -rn || echo "no findings"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            if [ "$ENFORCE" = true ]; then exit "$status"; fi
+            echo "::warning::cargo deny check $CHECKS failed (report-only)"
+          fi
+
+  coverage:
+    name: Coverage (cargo-llvm-cov, ratchet against main)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # download main's last coverage summary
+    env:
+      DROIDC_NET_TESTS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: coverage
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: cargo-llvm-cov
+      # Same system packages as ci.yml's test job (proot, PipeWire).
+      - run: sudo apt-get update && sudo apt-get install -y proot pipewire pipewire-bin wireplumber dbus-daemon
+      - name: Run the tests under coverage
+        run: |
+          mkdir -p coverage
+          # cgshim's preload tests look for libcgshim.so above the test binary; under llvm-cov that is
+          # target/llvm-cov-target, which a plain build doesn't fill. Put an ordinary build there.
+          cargo build -p cgshim
+          mkdir -p target/llvm-cov-target/debug
+          cp target/debug/libcgshim.so target/llvm-cov-target/debug/
+          # Failing tests are ci.yml's to report; here they only make the numbers partial.
+          status=0
+          cargo llvm-cov --workspace --no-fail-fast --lcov --output-path coverage/lcov.info || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::some tests failed under coverage, so these numbers are partial (see ci.yml)"
+            echo "partial" > coverage/partial
+          fi
+          cargo llvm-cov report --json --summary-only --output-path coverage/summary.json
+          jq '{lines: .data[0].totals.lines.percent, functions: .data[0].totals.functions.percent, regions: .data[0].totals.regions.percent}' \
+            coverage/summary.json > coverage/totals.json
+          cat coverage/totals.json
+      - name: Compare with main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # A PR may not lower line coverage by more than this many points (noise allowance).
+          TOLERANCE: "0.5"
+        run: |
+          now=$(jq -r .lines coverage/totals.json)
+          base=""
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            run=$(gh run list -R "$GITHUB_REPOSITORY" --workflow qa.yml --branch main --event push \
+                    --status success --limit 1 --json databaseId --jq '.[0].databaseId' || true)
+            if [ -n "$run" ] && gh run download "$run" -R "$GITHUB_REPOSITORY" -n coverage -D base 2>/dev/null; then
+              base=$(jq -r .lines base/totals.json)
+            fi
+          fi
+          {
+            echo "### Line coverage"
+            echo
+            printf '| | lines %% |\n| --- | --- |\n| this run | %.2f |\n' "$now"
+            if [ -n "$base" ]; then printf '| main | %.2f |\n' "$base"; else echo "| main | no baseline yet |"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$base" ] && awk -v n="$now" -v b="$base" -v t="$TOLERANCE" 'BEGIN{exit !(n < b - t)}'; then
+            msg=$(printf 'Line coverage fell from %.2f%% on main to %.2f%%' "$base" "$now")
+            if [ "$ENFORCE" = true ]; then echo "::error::$msg"; exit 1; fi
+            echo "::warning::$msg (report-only)"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage
+          path: coverage/
