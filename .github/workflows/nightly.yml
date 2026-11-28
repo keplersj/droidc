@@ -1,0 +1,150 @@
+name: nightly
+
+# Long-running checks that don't fit in a PR: fuzzing droidc's parsers of untrusted input and a full
+# cargo-mutants run. Runs every night against main and on demand.
+#
+# - Fuzz: each target runs for FUZZ_SECONDS, starting from the corpus the last nightly kept. A crash
+#   fails its job and uploads the input that caused it.
+# - Mutants: report-only. Missed mutants (code whose tests still pass when it changes) go to the job
+#   summary and the uploaded mutants.out; the job stays green unless ENFORCE is "true".
+on:
+  schedule:
+    - cron: "17 7 * * *" # 07:17 UTC
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: Seconds per fuzz target
+        default: "300"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  ENFORCE: "false"
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read # download the corpus the last nightly kept
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - apps_groups
+          - bwrap_args
+          - bwrap_launcher
+          - journal_record
+          - registry_dns
+          - registry_image_ref
+          - session_json
+    env:
+      TARGET: ${{ matrix.target }}
+      FUZZ_SECONDS: ${{ inputs.fuzz_seconds || '300' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install nightly Rust
+        run: rustup toolchain install nightly --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: cargo-fuzz
+      - name: Restore the corpus
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p "fuzz/corpus/$TARGET"
+          run=$(gh run list -R "$REPO" --workflow nightly.yml --branch main --status success \
+            --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [ -n "$run" ]; then
+            gh run download "$run" -R "$REPO" -n "fuzz-corpus-$TARGET" -D "fuzz/corpus/$TARGET" \
+              || echo "No corpus from run $run; starting fresh"
+          fi
+          echo "Corpus starts with $(find "fuzz/corpus/$TARGET" -type f | wc -l) inputs" >> "$GITHUB_STEP_SUMMARY"
+      - name: cargo fuzz run ${{ matrix.target }}
+        run: |
+          cargo +nightly fuzz run "$TARGET" "fuzz/corpus/$TARGET" -- \
+            -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=2048 -timeout=10
+      - name: Minimize the corpus
+        if: success()
+        run: cargo +nightly fuzz cmin "$TARGET" "fuzz/corpus/$TARGET"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: success()
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}
+          retention-days: 30
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          retention-days: 90
+
+  mutants:
+    name: Mutants (shard ${{ matrix.shard }}/8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      SHARD: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: cargo-mutants
+      # The same system packages ci.yml installs for the test suite (proot, PipeWire).
+      - run: sudo apt-get update && sudo apt-get install -y proot pipewire pipewire-bin wireplumber dbus-daemon
+      - name: cargo mutants (shard ${{ matrix.shard }} of 8)
+        run: |
+          status=0
+          cargo mutants --workspace --shard "$SHARD/8" --no-shuffle --timeout-multiplier 3 \
+            --output mutants-shard || status=$?
+          out=mutants-shard/mutants.out
+          {
+            echo "### Mutants, shard $SHARD of 8"
+            echo
+            for f in caught missed timeout unviable; do
+              printf -- '- %s: %s\n' "$f" "$(wc -l < "$out/$f.txt" 2>/dev/null || echo 0)"
+            done
+            if [ -s "$out/missed.txt" ]; then
+              echo
+              echo "Missed (tests still pass with this change):"
+              echo '```'
+              head -50 "$out/missed.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          # cargo-mutants exits 2 for missed mutants and 3 for timeouts; other codes are real failures.
+          case "$status" in
+            0) ;;
+            2|3) if [ "$ENFORCE" = true ]; then exit "$status"; fi
+                 echo "::warning::cargo-mutants shard $SHARD found missed or timed-out mutants (report-only)" ;;
+            *) exit "$status" ;;
+          esac
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants-shard/mutants.out
+          retention-days: 30
