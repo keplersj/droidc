@@ -1,6 +1,7 @@
 # A systemd stand-in for droidc, shipped as a shim image
 
-Design note, 2026-11-28. Status: proposed, nothing built. It follows on from
+Design note, 2026-11-28. Status: accepted the same day (see "Decisions"); building, starting with the
+unit loader. It follows on from
 [`docs/systemd-on-proot.md`](../systemd-on-proot.md) (the evaluation, "Option B") and replaces that
 note's step 5 ("decide A vs B") with a concrete plan.
 
@@ -37,7 +38,7 @@ would do from the image's units:
 | No system units run at all; system services are started one by one (`droidc login1`, `droidc polkit`) | `supervise.rs` `start_system_services`, `start_standin` | System units run from `/usr/lib/systemd/system`; droidc's stand-ins become ordinary units the shim image ships |
 | No `systemd-tmpfiles`, `systemd-sysusers`: `/var/log`, `/var/lib/flatpak` missing (#48) | not done | `systemd-tmpfiles-setup.service` and `systemd-sysusers.service` run from their own units, using the image's own binaries |
 | No `hostname1`, `timedate1`, `locale1` (#51) | not done | The image's `systemd-hostnamed` and friends are bus-activated units; whether they run as the app uid is to be tried (inferred) |
-| Journal sockets bound by droidc, everything dropped; `journalctl` empty (#50) | `journal.rs` | Phase 1 keeps the socket stand-in but stores entries in the journal file format or plain files `journalctl` can read; real `systemd-journald` is a later candidate |
+| Journal sockets bound by droidc, everything dropped; `journalctl` empty (#50) | `journal.rs` | The image's own `systemd-journald` runs as a unit, so `journalctl` reads real journal files. droidc's socket stand-in stays only as the fallback when journald won't start, so logs are never dropped silently |
 | `XDG_SESSION_ID=1`, `XDG_SEAT=seat0` set by hand before the buses start | `supervise.rs` `start_user_services` | login1 creates the session and the user manager gets it from `user@.service`, as pam_systemd does |
 | A cgroup2 filesystem faked by `LD_PRELOAD`: `statfs` magic, `/proc/<pid>/cgroup`, `cgroup.*` files on `mkdir`, `DT_LNK` to `DT_UNKNOWN`, `PR_SET_SECUREBITS` and seccomp reported as done, `/proc/self/fd` exec, `POSIX_SPAWN_SETCGROUP`, `creat()` | `crates/cgshim` | Not needed: the stand-in never uses cgroups (only if it also runs the user instance, see "Two instances") |
 | `/proc` polled every 200 ms to fake membership, `populated` and `cgroup.kill`; ~300 ms a tick under proot, so double-forked daemons sometimes escape | `cgroups.rs` | Process tracking is the manager's own: subreaper, `pidfd`s, `INVOCATION_ID` for strays (same idea, no fake filesystem in between) |
@@ -68,7 +69,7 @@ systemd runs as two managers: the system instance (PID 1) and one user instance 
   Bluefin LTS's GNOME 50 under it and passes). The stand-in can run the user instance too, which is what
   retires cgshim and `cgroups.rs`.
 
-Proposal: one engine, both instances, like systemd. Ship the system instance first. Make the user
+Decided: one engine, both instances, like systemd. Ship the system instance first. Make the user
 manager selectable (`--user-manager=systemd|droidc`, keeping today's `--systemd` for the real one), and
 flip the default once the stand-in passes the same Emulator GUI job and the tablet. That keeps a working
 session on `main` the whole way.
@@ -109,6 +110,24 @@ would be one more thing to keep in step with systemd.
 `droidc login1` already serves one seat, one session and one user (`login1.rs`). It moves into the
 manager or stays a separate unit; either way it gains what #49 lists (`ListSessionsEx`, `GetAll` with an
 empty interface) and starts `user@UID.service` for the session's user, as logind does.
+
+### Which target, and how droidc adjusts it
+
+The stand-in reaches the image's own `default.target` (`graphical.target` on Bluefin), as systemd does.
+Units that can't run here are not edited in the image; droidc changes them only through the standard
+override points (cited, `systemd.unit(5)`):
+
+- **Drop-ins** (`<unit>.d/*.conf`) shipped in the shim image under `/usr/lib/droidc/units/system` and
+  `/usr/lib/droidc/units/user`, for units that need a different environment, ordering or `ExecStart`
+  here. Example: the PipeWire environment from #66 instead of a mask.
+- **Masks** (`/dev/null` symlinks) and per-start drop-ins written to `/run/systemd/system` and
+  `/run/systemd/user` at start, for units that must not run at all (GDM, whose job droidc's session
+  already does; hardware services with no hardware). Many hardware units already skip themselves through
+  `ConditionVirtualization=` once the stand-in answers `container` (inferred; the inventory will show
+  how many).
+
+The shim image's list of drop-ins and masks is the record of everything droidc changes about an image's
+boot, in one reviewable place.
 
 ### Units: phase 1
 
@@ -156,7 +175,7 @@ From the image's unit search path (`/etc/systemd/system`, `/run/systemd/system`,
 Sandboxing (`Protect*`, `Private*`, `RootDirectory`, `BindPaths`, `ReadOnlyPaths`, namespaces),
 `SystemCallFilter`, capabilities (`CapabilityBoundingSet`, `AmbientCapabilities`), resource control
 (`Memory*`, `CPU*`, `IO*`, `Tasks*`, `Delegate`), `User=`/`Group=` other than the app uid and fake root
-(see open questions), `DynamicUser`. These either need namespaces and cgroups Android won't give an app,
+(see "Decisions"), `DynamicUser`. These either need namespaces and cgroups Android won't give an app,
 or protect against threats the app sandbox already covers. Today cgshim reports seccomp as installed and
 nothing as failing; the stand-in does the same, but says so.
 
@@ -210,8 +229,8 @@ The same hole as today remains: a daemon that clears its environment and double-
   image's libc, so it needs no preload and survives images droidc has never seen.
 - Keep droidc MIT: implement from the man pages and D-Bus documentation, not from systemd's LGPL source.
   Check licences before borrowing anything from the projects above.
-- A new crate (`crates/sd-standin` or similar) with no Android-specific code, so it can be tested on a
-  plain Linux CI runner against real unit files and, as a **differential test**, against real systemd
+- A new crate in the droidc workspace (decided: `crates/rookery`), broken out into its own repository later only if that turns out to be warranted. It has no
+  Android-specific code, so it can be tested on a plain Linux CI runner against real unit files and, as a **differential test**, against real systemd
   running the same units in a container with namespaces: same transactions, same `ActiveState`
   sequence, same `systemctl show` output for the supported properties.
 
@@ -271,7 +290,7 @@ This shape is shared with two other planned artifacts, so droidc gets one mechan
 
 - **GPU drivers** (#108): capability annotations pick the artifact; its files land under
   `/usr/lib/droidc/gpu-<id>/` and are reached through the loader variables above.
-- **droidc itself** (#126, keplersj/Selkie#157): the guest droidc, `cgshim.so` and `ifshim.so` are
+- **droidc itself** (#126, droidc-dev/Selkie#157): the guest droidc, `cgshim.so` and `ifshim.so` are
   already listed there as part of the engine artifact. The shim image is the guest half of that
   artifact, or the same artifact with a guest layer. Its compatibility annotation should carry the
   emulated systemd interface version, next to the host-link protocol version.
@@ -296,29 +315,31 @@ two artifacts on one path is an error at start, not a silent win.
 3. Job engine and process supervision (types, dependencies, ordering, transactions, restart, notify),
    tested on Linux CI, then differentially against real systemd in a container.
 4. `systemd1` on the system bus, plus `/run/systemd/private`. Run it as the system instance in place of
-   `start_system_services`, with login1, polkit and the host-link stand-ins as units. Closes #48, and
-   likely #50 and #51.
+   `start_system_services`, with login1, polkit and the host-link stand-ins as units, and the image's
+   `systemd-journald` (on the fake-root allow-list). Closes #48 and #50, and likely #51.
 5. Shim image: build it in droidc's release, bind it through the shell spec's existing lists, then move
    those lists to the shared artifact path when #126 lands.
 6. User instance: run the stand-in as `user@.service`, add socket activation, pass the Emulator GUI job
    and the tablet with it, then make it the default and retire cgshim and `cgroups.rs`.
 
-## Open questions
+## Decisions
 
-1. **User instance now or later?** Proposed: system first, user selectable, default flipped after CI
-   parity. The alternative is to go straight to the stand-in for both, which ends the cgshim fixes
-   sooner but risks a broken session on `main` for longer.
-2. **System units that want root.** Run them as the app uid (what the flatpak system helper does today),
-   under proot's fake root through the spawner (`spawn.rs`), or skip them? Proposed: app uid by default,
-   fake root for an allow-list of units, everything else logged as skipped.
-3. **Which target to reach.** The image's `default.target` (`graphical.target` on Bluefin) would pull in
-   GDM and hardware services; `multi-user.target` with a droidc preset masking what can't run is closer
-   to a container (inferred). Or a `droidc.target` the shim image ships.
-4. **Journal.** Keep droidc's socket stand-in and write journal files `journalctl` reads, or try the
-   image's real `systemd-journald` under the stand-in?
-5. **One crate or part of droidc?** A separate crate is easier to test and could be useful to others
-   (any rootless container without systemd); it still ships inside the guest droidc binary.
-6. **Name.** Something seal-themed to match the images, or plain `droidc-init`.
+Settled by Kepler on 2026-11-28, answering this note's open questions:
+
+1. **User instance later.** The system instance comes first; the user manager is selectable and its
+   default flips after the Emulator GUI job and the tablet pass with the stand-in.
+2. **System units that want root** run as the app uid by default. A short allow-list of units runs under
+   proot's fake root through the spawner (`spawn.rs`), starting with `systemd-journald`,
+   `systemd-tmpfiles-setup` and `systemd-sysusers`. Anything else that needs a real `User=` is skipped
+   and logged.
+3. **Target:** the image's `default.target`, adjusted only with drop-ins and masks (see "Which target,
+   and how droidc adjusts it").
+4. **Journal:** the image's real `systemd-journald`. Phase 1 starts it as a plain service (it opens its
+   own sockets when none are passed, inferred, to check in step 4); socket activation comes with the
+   other `.socket` work. droidc's socket stand-in remains the fallback.
+5. **Crate:** a new crate in the droidc workspace, broken out later if reasonable.
+6. **Name:** Rookery, a seal name to match the images. The crate is `crates/rookery`. The name also
+   fits running droidc as a Kubernetes node later (#140).
 
 ## Sources
 

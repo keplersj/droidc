@@ -11,7 +11,7 @@
   "dependencyDashboard": {
     "enabled": true
   },
-  "platformAutomerge": false,
+  "platformAutomerge": true,
   "vulnerabilityAlerts": {
     "labels": ["security"]
   },
