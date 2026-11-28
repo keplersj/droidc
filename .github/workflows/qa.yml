@@ -132,7 +132,18 @@ jobs:
       - name: Run the tests under coverage
         run: |
           mkdir -p coverage
-          cargo llvm-cov --workspace --lcov --output-path coverage/lcov.info
+          # cgshim's preload tests look for libcgshim.so above the test binary; under llvm-cov that is
+          # target/llvm-cov-target, which a plain build doesn't fill. Put an ordinary build there.
+          cargo build -p cgshim
+          mkdir -p target/llvm-cov-target/debug
+          cp target/debug/libcgshim.so target/llvm-cov-target/debug/
+          # Failing tests are ci.yml's to report; here they only make the numbers partial.
+          status=0
+          cargo llvm-cov --workspace --no-fail-fast --lcov --output-path coverage/lcov.info || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::some tests failed under coverage, so these numbers are partial (see ci.yml)"
+            echo "partial" > coverage/partial
+          fi
           cargo llvm-cov report --json --summary-only --output-path coverage/summary.json
           jq '{lines: .data[0].totals.lines.percent, functions: .data[0].totals.functions.percent, regions: .data[0].totals.regions.percent}' \
             coverage/summary.json > coverage/totals.json
