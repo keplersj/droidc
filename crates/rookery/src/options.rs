@@ -281,7 +281,6 @@ pub fn classify(ty: UnitType, section: &str, key: &str) -> Support {
             }
         }
         "Install" if INSTALL_KEYS.contains(&key) => Support::Supported,
-        "Install" => Support::Unknown,
         "Service" if ty == UnitType::Service => exec_key(key, SERVICE_KEYS),
         "Socket" | "Timer" | "Path" if section == ty.section().unwrap_or("") => Support::Planned,
         "Mount" | "Automount" | "Swap" => Support::Ignored("droidc doesn't mount filesystems"),
@@ -406,6 +405,21 @@ mod tests {
             classify(UnitType::Mount, "Mount", "What"),
             Support::Ignored(_)
         ));
+        assert_eq!(classify(s, "Install", "Bogus"), Support::Unknown);
+        assert_eq!(
+            classify(UnitType::Socket, "Service", "ExecStart"),
+            Support::Unknown
+        );
+        assert_eq!(
+            classify(s, "Service", "RootDirectoryStartOnly"),
+            Support::Ignored(NO_MOUNT_NS)
+        );
+        for section in ["Slice", "Scope"] {
+            assert_eq!(
+                classify(UnitType::Slice, section, "CPUWeight"),
+                Support::Ignored(NO_CGROUPS)
+            );
+        }
     }
 
     #[test]

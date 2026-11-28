@@ -3,9 +3,9 @@
 
 use std::path::Path;
 
-use droidc_systemd::loader::LoadState;
-use droidc_systemd::paths::UserDirs;
-use droidc_systemd::{options, Loader, Scope, SearchPath};
+use rookery::loader::LoadState;
+use rookery::paths::UserDirs;
+use rookery::{options, Loader, Scope, SearchPath};
 
 #[test]
 fn loads_every_host_system_unit() {
