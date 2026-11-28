@@ -1,7 +1,12 @@
 name: ci
 on:
   push:
+    # Queue branches are already tested by merge_group below.
+    branches-ignore: ['gh-readonly-queue/**']
   pull_request:
+  # The merge queue tests each batch on a temporary gh-readonly-queue/main/* branch before it lands,
+  # so the checks a ruleset requires must run here too or the queue never moves.
+  merge_group:
 env:
   CARGO_TERM_COLOR: always
   DROIDC_NET_TESTS: "1"
