@@ -528,7 +528,7 @@ fn main() {
         scale,
         timeout,
     } = &cli.cmd
-{
+    {
         let opts = bridge::Opts {
             width: *width,
             height: *height,
