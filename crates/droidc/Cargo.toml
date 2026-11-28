@@ -32,7 +32,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = "0.26"
 # signal(2) for `enter` (std has no API, rustix keeps sigaction internal).
 libc = "0.2"
-hickory-resolver = { version = "0.25", default-features = false, features = ["tokio"] }
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio"] }
 # `droidc bridge`: Mutter ScreenCast/RemoteDesktop over D-Bus, presented as a Wayland client.
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 wayland-client = "0.31"
