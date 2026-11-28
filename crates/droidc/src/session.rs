@@ -398,6 +398,29 @@ pub fn xdg_entries(g: &GuestFs) -> Vec<Entry> {
 }
 
 /// Parses one session desktop entry; `None` when it is not to be listed.
+/// Shells whose display-manager entry runs as it is nested in Selkie's compositor: Phosh's
+/// `phosh-session` starts phoc, and wlroots picks its Wayland backend when `WAYLAND_DISPLAY` is set.
+/// Their entries need no `X-Droidc-*` keys; an image can still set them to change anything.
+const KNOWN_NESTED: &[&str] = &["Phosh"];
+
+fn known_nested(desktop_names: &[String]) -> bool {
+    desktop_names
+        .iter()
+        .any(|n| KNOWN_NESTED.iter().any(|k| n.eq_ignore_ascii_case(k)))
+}
+
+/// Devices a known shell suits when its entry doesn't say: Phosh is a phone shell.
+fn known_form_factors(desktop_names: &[String]) -> Vec<String> {
+    if desktop_names
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case("Phosh"))
+    {
+        vec!["phone".into()]
+    } else {
+        vec![]
+    }
+}
+
 fn xdg_entry(g: &GuestFs, id: &str, path: &Path, text: &str) -> Option<Entry> {
     let groups = apps::parse_groups(text);
     let d = groups.get("Desktop Entry")?;
@@ -424,17 +447,23 @@ fn xdg_entry(g: &GuestFs, id: &str, path: &Path, text: &str) -> Option<Entry> {
         form_factors: d
             .get("X-Droidc-FormFactors")
             .map(|v| parse_form_factors(v))
-            .unwrap_or_default(),
+            .unwrap_or_else(|| known_form_factors(&apps::split_list(d.get("DesktopNames")))),
         path: Some(guest_path.clone()),
         spec: None,
         problem: None,
     };
     let argv = |exec: &str| apps::exec_argv(exec, None, &shown, &guest_path);
     let built = (|| -> std::result::Result<SessionSpec, String> {
-        let r = d
-            .get("X-Droidc-Renderer")
-            .map(|r| r.trim())
-            .ok_or("made for a display manager: the entry has no X-Droidc-Renderer key")?;
+        let r = match d.get("X-Droidc-Renderer").map(|r| r.trim()) {
+            Some(r) => r,
+            // A shell droidc knows runs nested as it is, from its own unmodified entry.
+            None if known_nested(&e.desktop_names) => "wayland",
+            None => {
+                return Err(
+                    "made for a display manager: the entry has no X-Droidc-Renderer key".into(),
+                )
+            }
+        };
         let renderer = Renderer::parse(r)
             .ok_or_else(|| format!("X-Droidc-Renderer: unknown renderer '{r}'"))?;
         let exec = d
@@ -750,6 +779,29 @@ mod tests {
             ["phoc", "-E", "phosh-session"]
         );
         assert!(es[1].form_factors.is_empty());
+    }
+
+    #[test]
+    fn phoshs_own_entry_runs_nested() {
+        let (t, g) = guest();
+        // As the phosh package installs it: no X-Droidc-* keys.
+        write(
+            &t.path().join("rootfs/usr/local/share/wayland-sessions/sm.puri.Phosh.desktop"),
+            "[Desktop Entry]\nName=Phosh\nComment=Phone Shell\nExec=phosh-session\nType=Application\nDesktopNames=Phosh;GNOME;\n",
+        );
+        let es = xdg_entries(&g);
+        let phosh = es.iter().find(|e| e.id == "sm.puri.Phosh").unwrap();
+        assert!(phosh.runnable(), "{:?}", phosh.problem);
+        let spec = phosh.spec.as_ref().unwrap();
+        assert_eq!(spec.renderer, Renderer::Wayland);
+        assert_eq!(spec.exec, ["phosh-session"]);
+        assert_eq!(phosh.form_factors, ["phone"]);
+        // GNOME's display-manager entry still needs the keys.
+        assert!(!es
+            .iter()
+            .find(|e| e.id == "gnome-wayland")
+            .unwrap()
+            .runnable());
     }
 
     #[test]
