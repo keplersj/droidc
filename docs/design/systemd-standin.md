@@ -271,7 +271,7 @@ This shape is shared with two other planned artifacts, so droidc gets one mechan
 
 - **GPU drivers** (#108): capability annotations pick the artifact; its files land under
   `/usr/lib/droidc/gpu-<id>/` and are reached through the loader variables above.
-- **droidc itself** (#126, keplersj/Selkie#157): the guest droidc, `cgshim.so` and `ifshim.so` are
+- **droidc itself** (#126, droidc-dev/Selkie#157): the guest droidc, `cgshim.so` and `ifshim.so` are
   already listed there as part of the engine artifact. The shim image is the guest half of that
   artifact, or the same artifact with a guest layer. Its compatibility annotation should carry the
   emulated systemd interface version, next to the host-link protocol version.

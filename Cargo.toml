@@ -6,7 +6,7 @@ members = ["crates/droidc", "crates/droidc-verify", "crates/cgshim", "crates/ifs
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/keplersj/droidc"
+repository = "https://github.com/droidc-dev/droidc"
 rust-version = "1.85"
 
 [profile.release]
