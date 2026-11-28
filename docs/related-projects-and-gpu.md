@@ -163,7 +163,7 @@ loaded from the device's own `/vendor`, bound read-only into the guest.
 4. SELinux denials on property or service access we couldn't test.
 5. No precedent anywhere for unprivileged use.
 
-### What a spike has to show
+### What a spike has to show (#123)
 
 On one Adreno and one Mali device on stock Android, from a glibc guest under proot with `/vendor`
 and friends bound in: libhybris loads the vendor `libEGL`/`libvulkan`, creates a context, renders
@@ -209,7 +209,7 @@ His principle: "We should adhere to existing Linux standards wherever possible, 
 ## Open questions
 
 - How does DroidDeck 0.7.11 run Steam and the desktop "directly on Android" without proot, and does
-  it apply to a bootc guest?
+  it apply to a bootc guest? (#124)
 - Does Turnip's KGSL WSI patch have an upstream path, so droidc can build plain upstream Mesa?
 - Can a bootc image's own Mesa (Fedora's Zink) sit on a Turnip artifact's ICD, or does the artifact
   need its own Zink to match Mesa versions?
