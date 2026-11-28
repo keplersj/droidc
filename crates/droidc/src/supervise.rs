@@ -22,6 +22,24 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+/// Directories everyone may write and only owners may delete from, as on any Linux host.
+const TMP_DIRS: [&str; 3] = ["/tmp", "/var/tmp", "/dev/shm"];
+
+/// Give each existing directory mode `1777`. Older droidc dropped the sticky bit on `/var/tmp`
+/// when unpacking, and the launcher's binds for `/tmp` and `/dev/shm` are made with whatever mode
+/// the host gave them; ssh, tmux and temp-dir checks refuse a `/tmp` that isn't `1777`.
+/// Best effort: a directory we can't change is left as it is.
+fn shared_tmp_dirs(dirs: &[&std::path::Path]) {
+    for d in dirs {
+        let Ok(md) = fs::metadata(d) else { continue };
+        if md.is_dir() && md.permissions().mode() & 0o7777 != 0o1777 {
+            if let Err(e) = fs::set_permissions(d, fs::Permissions::from_mode(0o1777)) {
+                eprintln!("warn: could not make {} mode 1777: {e}", d.display());
+            }
+        }
+    }
+}
+
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into());
     std::env::split_paths(&path)
@@ -613,6 +631,8 @@ fn prefer_dbus_daemon(runtime: &std::path::Path, unit_dir: &std::path::Path) -> 
 /// manager socket. The image's socket-activated `pipewire.service` does not give that (Mutter's
 /// screen-cast stream never appears), so under `systemd --user` these units are masked and droidc's
 /// copies run, exactly as without systemd. `pipewire-pulse` needs `pipewire`, so it goes with it.
+/// A service that is a shell wrapper (`sh -c '... exec pipewire -c "$c"'`, as Selkie's is) stands for
+/// the programs its script `exec`s: masking `sh.service` would leave the image's PipeWire to race it.
 fn units_replaced_by_services(services: &[Vec<String>]) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let mut add = |base: &str| {
@@ -624,19 +644,53 @@ fn units_replaced_by_services(services: &[Vec<String>]) -> Vec<String> {
         }
     };
     for svc in services {
-        let Some(base) = svc
-            .first()
-            .and_then(|a| std::path::Path::new(a).file_name())
-            .and_then(|n| n.to_str())
-        else {
-            continue;
-        };
-        add(base);
-        if base == "pipewire" {
-            add("pipewire-pulse");
+        for base in service_programs(svc) {
+            add(&base);
+            if base == "pipewire" {
+                add("pipewire-pulse");
+            }
         }
     }
     names
+}
+
+/// The base names of the programs a session service runs: its own, or for a shell wrapper
+/// (`sh -c <script>`), each program its script `exec`s.
+fn service_programs(svc: &[String]) -> Vec<String> {
+    let base = |a: &str| {
+        std::path::Path::new(a.trim_matches(|c| c == '"' || c == '\''))
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+    };
+    let Some(first) = svc.first().and_then(|a| base(a)) else {
+        return Vec::new();
+    };
+    let shell = matches!(first.as_str(), "sh" | "bash" | "dash" | "ash");
+    let Some(script) = svc
+        .get(2)
+        .filter(|_| shell && svc.get(1).map(String::as_str) == Some("-c"))
+    else {
+        return vec![first];
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut words = script
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')'))
+        .filter(|w| !w.is_empty());
+    while let Some(w) = words.next() {
+        if w == "exec" {
+            if let Some(b) = words.next().and_then(base) {
+                if !b.starts_with('-') && !b.starts_with('$') && !out.contains(&b) {
+                    out.push(b);
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(first);
+    }
+    out
 }
 
 /// Mask `units` for the user manager (`$XDG_RUNTIME_DIR/systemd/user/<unit>` -> `/dev/null`).
@@ -1060,6 +1114,7 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
     // Before anything is started (and before any thread): every child inherits it, the
     // container's user services included when this supervisor is the one that starts them.
     preload_ifshim();
+    shared_tmp_dirs(&TMP_DIRS.map(std::path::Path::new));
     if let Some(spec) = &spec {
         std::env::set_var("XDG_SESSION_TYPE", "wayland");
         if let Some(n) = &spec.name {
@@ -1197,6 +1252,8 @@ fn start_session(
                     params.width.to_string(),
                     "--height".into(),
                     params.height.to_string(),
+                    "--scale".into(),
+                    params.scale.to_string(),
                 ]);
                 argv
             } else {
@@ -1415,6 +1472,25 @@ pub(crate) static CHILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tmp_dirs_become_1777() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (d.path().join("tmp"), d.path().join("var-tmp"));
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o722)).unwrap();
+        fs::set_permissions(&b, fs::Permissions::from_mode(0o777)).unwrap();
+        let missing = d.path().join("missing");
+        shared_tmp_dirs(&[&a, &b, &missing]);
+        for p in [&a, &b] {
+            assert_eq!(
+                fs::metadata(p).unwrap().permissions().mode() & 0o7777,
+                0o1777
+            );
+        }
+        assert!(!missing.exists());
+    }
 
     #[test]
     fn preload_prepends_once() {
@@ -1768,6 +1844,42 @@ mod tests {
     }
 
     #[test]
+    fn a_shell_wrapper_replaces_the_units_of_what_it_execs() {
+        // Selkie's PipeWire service: a copy of the config with the access socket opened, then exec.
+        let script = r#"for f in /etc/pipewire/pipewire.conf /usr/share/pipewire/pipewire.conf; do [ -r "$f" ] || continue; c="${XDG_RUNTIME_DIR:-/tmp}/pipewire-selkie.conf"; sed 's/x/y/' "$f" > "$c" && grep -q '^access' "$c" && exec pipewire -c "$c"; done; exec pipewire"#;
+        let svcs = vec![
+            vec!["sh".to_string(), "-c".into(), script.into()],
+            vec!["wireplumber".to_string()],
+        ];
+        assert_eq!(
+            units_replaced_by_services(&svcs),
+            [
+                "pipewire.service",
+                "pipewire.socket",
+                "pipewire-pulse.service",
+                "pipewire-pulse.socket",
+                "wireplumber.service",
+                "wireplumber.socket",
+            ]
+        );
+        assert_eq!(
+            service_programs(&[
+                "/bin/sh".into(),
+                "-c".into(),
+                "exec /usr/bin/foo --x".into()
+            ]),
+            ["foo"]
+        );
+        // A shell that execs nothing, or is not run with -c, is itself.
+        assert_eq!(
+            service_programs(&["sh".into(), "-c".into(), "true".into()]),
+            ["sh"]
+        );
+        assert_eq!(service_programs(&["sh".into(), "script.sh".into()]), ["sh"]);
+        assert!(service_programs(&[]).is_empty());
+    }
+
+    #[test]
     fn dbus_daemon_replaces_the_broker_unit_when_present() {
         let d = tempfile::tempdir().unwrap();
         let (run, units) = (d.path().join("run"), d.path().join("units"));
@@ -1969,7 +2081,7 @@ mod tests {
         assert_eq!(supervise_with(&[], &opts).unwrap(), 3);
         assert_eq!(
             fs::read_to_string(o("bridge.out")).unwrap().trim(),
-            "--width 640 --height 480 wayland-0"
+            "--width 640 --height 480 --scale 1 wayland-0"
         );
         assert!(fs::read_to_string(o("comp.out"))
             .unwrap()

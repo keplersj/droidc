@@ -296,6 +296,11 @@ pub fn undo(target: &Root) -> Result<Value> {
     let mut entries = 0u64;
     let label = crate::fsutil::selinux_label(&root.path, false);
     walk_undo(&root.path, uid, gid, label.as_deref(), &mut entries)?;
+    // walk_undo made everything owner-writable: read-only /usr again, as after a switch.
+    for e in fs::read_dir(root.deployments())?.flatten() {
+        let usr = e.path().join("rootfs/usr");
+        crate::fsutil::clear_write_bits(&usr, &[&usr.join("etc")]);
+    }
     let mut ids = Vec::new();
     for e in fs::read_dir(root.deployments())?.flatten() {
         let id = e.file_name().to_string_lossy().into_owned();
@@ -309,9 +314,9 @@ pub fn undo(target: &Root) -> Result<Value> {
     Ok(json!({"entries": entries, "deployments": ids, "uid": md.uid(), "gid": md.gid()}))
 }
 
-/// lchown every entry to the app uid and give it the root's SELinux label; directories `| 0o700`,
-/// regular files `| 0o600`, both without setuid/setgid/sticky; drop `security.capability`. Never
-/// follows symlinks.
+/// lchown every entry to the app uid and give it the root's SELinux label; directories `| 0o700`
+/// (keeping the sticky bit, as unpack does), regular files `| 0o600` without setuid/setgid; drop
+/// `security.capability`. Never follows symlinks.
 fn walk_undo(p: &Path, uid: Uid, gid: Gid, label: Option<&[u8]>, n: &mut u64) -> Result<()> {
     let md = fs::symlink_metadata(p)?;
     let cwd = rustix::fs::CWD;
@@ -321,7 +326,7 @@ fn walk_undo(p: &Path, uid: Uid, gid: Gid, label: Option<&[u8]>, n: &mut u64) ->
     *n += 1;
     let ft = md.file_type();
     if ft.is_dir() {
-        fs::set_permissions(p, fs::Permissions::from_mode((md.mode() & 0o777) | 0o700))?;
+        fs::set_permissions(p, fs::Permissions::from_mode((md.mode() & 0o1777) | 0o700))?;
         for e in fs::read_dir(p)? {
             walk_undo(&e?.path(), uid, gid, label, n)?;
         }

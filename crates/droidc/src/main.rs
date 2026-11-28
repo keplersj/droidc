@@ -151,6 +151,9 @@ enum Cmd {
         /// Write one frame as PNG and exit (no host compositor needed)
         #[arg(long)]
         dump_frame: Option<PathBuf>,
+        /// Monitor scale factor (e.g. 1.5 for 150%)
+        #[arg(long, default_value_t = 0.0)]
+        scale: f64,
         /// Seconds to wait for the session compositor's ScreenCast service
         #[arg(long, default_value_t = 120)]
         timeout: u64,
@@ -186,6 +189,15 @@ enum Cmd {
     },
     /// (inside the guest) answer org.freedesktop.login1 on the system bus (stand-in for logind)
     Login1,
+    /// (inside the guest) the desktop's channel to Android: JSON lines, Android state in on stdin
+    /// (appearance), requests out on stdout; status goes to stderr
+    #[command(name = "host-link")]
+    HostLink,
+    /// (inside the guest) open a web, mail, phone, sms or map link on Android, through the host link
+    Open {
+        /// The link, e.g. https://example.org or mailto:someone@example.org
+        uri: String,
+    },
     /// (inside the guest) answer org.freedesktop.PolicyKit1 on the system bus (stand-in for polkitd)
     Polkit,
     /// (on the host) run commands as fake root for the guest's sudo/su/pkexec shims
@@ -395,6 +407,8 @@ fn run(cli: &Cli, em: &Emitter) -> Result<(&'static str, Value)> {
         | Cmd::Bridge { .. }
         | Cmd::AudioOut { .. }
         | Cmd::Login1
+        | Cmd::HostLink
+        | Cmd::Open { .. }
         | Cmd::Polkit
         | Cmd::Log { .. }
         | Cmd::Enter { .. }
@@ -500,14 +514,16 @@ fn main() {
         height,
         connector,
         dump_frame,
+        scale,
         timeout,
     } = &cli.cmd
-    {
+{
         let opts = bridge::Opts {
             width: *width,
             height: *height,
             connector: connector.clone(),
             dump_frame: dump_frame.clone(),
+            scale: *scale,
             timeout: std::time::Duration::from_secs(*timeout),
         };
         match bridge::run(&opts) {
@@ -571,6 +587,24 @@ fn main() {
     }
     if let Cmd::Spawn { cmd } = &cli.cmd {
         std::process::exit(run_shim("spawn", cmd));
+    }
+    if let Cmd::Open { uri } = &cli.cmd {
+        match droidc::open::open(uri) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("droidc open: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Cmd::HostLink = &cli.cmd {
+        match droidc::host_link::run() {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("droidc host-link: {e}");
+                std::process::exit(1);
+            }
+        }
     }
     if let Cmd::Login1 = &cli.cmd {
         match login1::run() {

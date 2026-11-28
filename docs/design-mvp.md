@@ -94,11 +94,18 @@ avoids ending up with `previous == current` after a crash between the two symlin
   `.wh..wh..opq` makes the directory opaque.
 - Dropped: `/boot`, `/usr/lib/modules`, `/usr/lib/firmware`, `/usr/lib/ostree-boot`, kernel and UKI
   files (`vmlinuz*`, `initramfs*`, `*.efi` under `/usr/lib/systemd/boot` and `/boot`).
-- No chown. Mode bits that are safe (rwx) are applied; uid/gid/setuid/xattrs go to
-  `metadata.jsonl.zst`. Directories are made owner-writable so the tree can be updated and deleted.
+- No chown. Mode bits that are safe (rwx, and the sticky bit on directories) are applied;
+  uid/gid/setuid/setgid/xattrs go to `metadata.jsonl.zst`. Directories are made owner-writable
+  (`mode & 0o1777 | 0o700`) so the tree can be updated and deleted; a `1777` `/tmp` or `/var/tmp`
+  stays `1777`.
   Judgment call: regular files additionally get owner read+write (`mode | 0o600`) because the app uid
   must be able to read/replace everything (e.g. a `000` `/etc/shadow`); the true mode is in the
   metadata. Mtimes of regular files are kept; special files (devices, fifos) are skipped.
+- `/usr` is read-only, as on a bootc host: every switch (after the `/etc` merge and `/var` seed)
+  clears the write bits under the deployment's `/usr`, except `/usr/etc`, which the next merge reads.
+  Permission bits are all a non-root app uid has, so this stops a guest `dnf install` or `npm -g`
+  from changing an image it would lose on the next upgrade. root ignores the bits (fix-ownership
+  owns `/usr` as root anyway); gc and rollback remove the tree as before.
 - `metadata.jsonl.zst`: one JSON object per final path (sorted), `{"p","t","u","g","m","x","l"}`:
   type `f|d|l|h`, uid, gid, full mode incl. setuid/setgid/sticky, xattrs (name -> base64 value, from
   PAX `SCHILY.xattr.*`), symlink/hard-link target. Paths are as in the final rootfs (image `etc/`
@@ -356,8 +363,9 @@ gets `"ownership": <report>|null` (null: not requested or already applied). `upg
 current deployment's mode: image-owned in, image-owned out. A root `switch` without the flag while
 other deployments are image-owned warns. `--undo` lchowns everything under
 the root (all deployments, `var`, `home`, blobs) to the owner of the root directory, sets directories
-`| 0o700` and files `| 0o600` without setuid/setgid/sticky, drops `security.capability`, never
-follows symlinks, and clears `ownership` in every record: proot and non-root commands work again.
+`| 0o700` (keeping a sticky bit) and files `| 0o600` without setuid/setgid, drops
+`security.capability`, never follows symlinks, seals each deployment's `/usr` again, and clears
+`ownership` in every record: proot and non-root commands work again.
 
 ## Session label
 
@@ -390,6 +398,10 @@ LABEL containers.droidc.session="gamescope" \
 Images without the labels (Bluefin LTS today) get the same keys from `<root>/session.json`, written by
 `droidc session set --renderer R --exec JSON [--services JSON] [--name N]`; it takes precedence over the
 labels and survives upgrades. `droidc session clear` removes it.
+
+Every supervise run, before anything starts, makes `/tmp`, `/var/tmp` and `/dev/shm` `1777` when
+they exist and are not (best effort; a deployment unpacked before sticky bits were kept, or a
+tmpfs mounted `0755`).
 
 `supervise --session`, in order: runtime dir, machine-id, session bus, a **system bus** on
 `/run/dbus/system_bus_socket` (`DBUS_SYSTEM_BUS_ADDRESS`; nothing system-wide runs on it, but
