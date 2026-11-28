@@ -13,6 +13,33 @@
 //!
 //! What this is not: real root. The second proot fakes uid 0 the same way DroidDeck does, so
 //! file ownership and capabilities are proot's illusion, and nothing escapes the app's own uid.
+//!
+//! Asking first. With `DROIDC_SPAWNER_ASK=1` in the server's environment, every root command waits
+//! for the host's answer before it starts (a `bwrap` sandbox runs as the caller, so it never asks).
+//! The question goes to the server's stdout and the answer comes back on its stdin, one JSON object
+//! per line, so only the process that started the server can answer: nothing in the guest can reach
+//! those pipes. The host gets
+//!
+//! ```text
+//! {"ask":{"id":1,"via":"sudo","argv":["dnf","install","-y","git"],"cwd":"/root","from":"bash"}}
+//! {"settled":{"id":1,"allowed":true,"by":"host"}}
+//! ```
+//!
+//! `via` is the shim that asked, `from` the name of the process that ran it (the guest's own word:
+//! a hint, not something the host can verify), and `settled` says how a question ended: answered by
+//! the host, given up by the caller (Ctrl-C, or the shim went away), or refused because nobody is
+//! listening any more (`by` is `host`, `caller` or `nobody`). The host answers with
+//!
+//! ```text
+//! {"answer":{"id":1,"allow":true,"remember":false}}
+//! {"forget":true}
+//! ```
+//!
+//! `remember` allows every later root command of this server without asking, until `forget` or the
+//! server ends (Selkie runs one per container, for as long as the container runs). While it waits,
+//! the shim says so on its stderr; a refusal ends it with status 1, as a refused `sudo` does. Asked
+//! commands also get a fixed `PATH` and none of the variables `sudo` drops, whatever the shim sent,
+//! so what the host approved is what runs.
 
 use crate::error::{Context, Error, Result};
 use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -30,6 +57,8 @@ use std::process::{Command, Stdio};
 
 /// The guest environment variable naming the server's abstract socket (without the leading NUL).
 pub const SOCKET_ENV: &str = "DROIDC_SPAWNER";
+/// Set (to anything but `0`) in the server's environment: ask the host before each root command.
+pub const ASK_ENV: &str = "DROIDC_SPAWNER_ASK";
 /// Where the shims are bound in the guest (`shell-spec`), all of them the guest droidc binary.
 /// `bwrap` is `crate::bwrap`, the rest are root commands.
 pub const SHIMS: [&str; 4] = [
@@ -60,6 +89,9 @@ pub struct Request {
     /// root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<crate::bwrap::Sandbox>,
+    /// The shim that asked (`sudo`, `su`, `pkexec`, `spawn`), shown to the host when it is asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -80,6 +112,287 @@ enum Message {
     Started {
         pid: u32,
     },
+    /// The command waits for the host's answer (what to tell the user meanwhile).
+    Waiting {
+        waiting: String,
+    },
+    /// The host said no (why, for the user).
+    Refused {
+        refused: String,
+    },
+}
+
+/// Signals that mean the caller gave up on a root command it is still waiting for.
+const GIVE_UP: [i32; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+
+/// A line the server writes for the host when it asks (see the module docs).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Ask<'a> {
+    Ask {
+        id: u64,
+        via: &'a str,
+        argv: &'a [String],
+        cwd: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        from: Option<&'a str>,
+    },
+    Settled {
+        id: u64,
+        allowed: bool,
+        by: &'static str,
+    },
+}
+
+/// A line the host writes back.
+#[derive(Debug, Default, Deserialize)]
+struct HostLine {
+    #[serde(default)]
+    answer: Option<Answer>,
+    #[serde(default)]
+    forget: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct Answer {
+    id: u64,
+    allow: bool,
+    #[serde(default)]
+    remember: bool,
+}
+
+enum Verdict {
+    Allow {
+        remember: bool,
+    },
+    Deny,
+    /// Nobody will answer: the host closed the server's stdin.
+    Nobody,
+}
+
+/// Asks the host before root commands: questions out on one stream, answers in on another.
+pub struct Asker {
+    out: std::sync::Mutex<Box<dyn Write + Send>>,
+    waiting: std::sync::Mutex<std::collections::HashMap<u64, std::sync::mpsc::Sender<Verdict>>>,
+    next: std::sync::atomic::AtomicU64,
+    remembered: std::sync::atomic::AtomicBool,
+    gone: std::sync::atomic::AtomicBool,
+}
+
+impl Asker {
+    /// Questions go to `out`; answers are read from `input` on a thread of their own.
+    pub fn new(
+        out: Box<dyn Write + Send>,
+        input: impl BufRead + Send + 'static,
+    ) -> std::sync::Arc<Self> {
+        let asker = std::sync::Arc::new(Asker {
+            out: std::sync::Mutex::new(out),
+            waiting: Default::default(),
+            next: Default::default(),
+            remembered: Default::default(),
+            gone: Default::default(),
+        });
+        let reader = asker.clone();
+        std::thread::spawn(move || reader.read_answers(input));
+        asker
+    }
+
+    /// The server's own stdout and stdin, when `DROIDC_SPAWNER_ASK` asks for it.
+    pub fn from_env() -> Option<std::sync::Arc<Self>> {
+        std::env::var_os(ASK_ENV)
+            .filter(|v| !v.is_empty() && v != "0")
+            .map(|_| {
+                Asker::new(
+                    Box::new(std::io::stdout()),
+                    BufReader::new(std::io::stdin()),
+                )
+            })
+    }
+
+    fn read_answers(&self, input: impl BufRead) {
+        use std::sync::atomic::Ordering;
+        for line in input.lines().map_while(std::result::Result::ok) {
+            let Ok(host) = serde_json::from_str::<HostLine>(&line) else {
+                eprintln!("warn: spawn-server: not an answer: {line:?}");
+                continue;
+            };
+            if host.forget {
+                self.remembered.store(false, Ordering::SeqCst);
+            }
+            if let Some(a) = host.answer {
+                let tx = self.waiting.lock().unwrap().remove(&a.id);
+                if let Some(tx) = tx {
+                    let _ = tx.send(if a.allow {
+                        Verdict::Allow {
+                            remember: a.remember,
+                        }
+                    } else {
+                        Verdict::Deny
+                    });
+                }
+            }
+        }
+        // The host stopped listening: nothing waiting now or later can be allowed.
+        self.gone.store(true, Ordering::SeqCst);
+        for (_, tx) in self.waiting.lock().unwrap().drain() {
+            let _ = tx.send(Verdict::Nobody);
+        }
+    }
+
+    fn emit(&self, line: &Ask) -> bool {
+        let Ok(text) = serde_json::to_string(line) else {
+            return false;
+        };
+        let mut out = self.out.lock().unwrap();
+        writeln!(out, "{text}").and_then(|()| out.flush()).is_ok()
+    }
+
+    /// Waits for the host's answer to `req`: `Ok` to run it, `Err` with what to tell the caller.
+    fn ask(
+        &self,
+        conn: &UnixStream,
+        req: &Request,
+        from: Option<&str>,
+    ) -> std::result::Result<(), String> {
+        use std::sync::atomic::Ordering;
+        const NOBODY: &str = "nobody is there to allow it (Selkie is not listening)";
+        if self.remembered.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if self.gone.load(Ordering::SeqCst) {
+            return Err(NOBODY.into());
+        }
+        let id = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.waiting.lock().unwrap().insert(id, tx);
+        let asked = self.emit(&Ask::Ask {
+            id,
+            via: req.via.as_deref().unwrap_or("spawn"),
+            argv: &req.argv,
+            cwd: &req.cwd,
+            from,
+        });
+        if !asked {
+            self.waiting.lock().unwrap().remove(&id);
+            return Err(NOBODY.into());
+        }
+        reply(
+            conn,
+            &Message::Waiting {
+                waiting: "waiting for you to allow this in Selkie".into(),
+            },
+        );
+        let mut partial = Vec::new();
+        loop {
+            let verdict = match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(v) => v,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if !caller_gave_up(conn, &mut partial) {
+                        continue;
+                    }
+                    self.waiting.lock().unwrap().remove(&id);
+                    self.emit(&Ask::Settled {
+                        id,
+                        allowed: false,
+                        by: "caller",
+                    });
+                    return Err("cancelled".into());
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Verdict::Nobody,
+            };
+            let (allowed, by) = match verdict {
+                Verdict::Allow { remember } => {
+                    if remember {
+                        self.remembered.store(true, Ordering::SeqCst);
+                    }
+                    (true, "host")
+                }
+                Verdict::Deny => (false, "host"),
+                Verdict::Nobody => (false, "nobody"),
+            };
+            self.emit(&Ask::Settled { id, allowed, by });
+            return match (allowed, by) {
+                (true, _) => Ok(()),
+                (false, "nobody") => Err(NOBODY.into()),
+                _ => Err("you did not allow this in Selkie".into()),
+            };
+        }
+    }
+}
+
+/// Whether the caller hung up or sent a signal that gives up, while its command waits to be allowed.
+/// Reads only what is already there; a partial line is kept in `partial` for the next call.
+fn caller_gave_up(conn: &UnixStream, partial: &mut Vec<u8>) -> bool {
+    loop {
+        let mut b = 0u8;
+        // SAFETY: one byte into a local, without blocking.
+        let n = unsafe {
+            libc::recv(
+                conn.as_raw_fd(),
+                (&mut b as *mut u8).cast(),
+                1,
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if n == 0 {
+            return true; // the shim went
+        }
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            match e.kind() {
+                std::io::ErrorKind::WouldBlock => return false,
+                std::io::ErrorKind::Interrupted => continue,
+                _ => return true,
+            }
+        }
+        if b != b'\n' {
+            partial.push(b);
+            if partial.len() > 4096 {
+                partial.clear();
+            }
+            continue;
+        }
+        let line = std::mem::take(partial);
+        if let Ok(Message::Signal { signal }) = serde_json::from_slice::<Message>(&line) {
+            if GIVE_UP.contains(&signal) {
+                return true;
+            }
+        }
+    }
+}
+
+/// The name of the process that ran the shim (its parent's `comm`), for the host's question. The
+/// guest controls it, so it is only ever shown as the guest's own word.
+fn caller_name(sock: &UnixStream) -> Option<String> {
+    let pid = rustix::net::sockopt::socket_peercred(sock.as_fd())
+        .ok()?
+        .pid
+        .as_raw_nonzero()
+        .get();
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) state ppid ...`: comm may hold spaces and parentheses, so read after the last ')'.
+    let ppid: u32 = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    let comm = std::fs::read_to_string(format!("/proc/{ppid}/comm")).ok()?;
+    let comm: String = comm
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(64)
+        .collect();
+    (!comm.is_empty()).then_some(comm)
+}
+
+/// What an asked root command runs with: no variable `sudo` would drop and the fixed `PATH`, whatever
+/// the shim sent, so the command the host saw is the one that runs.
+fn harden(env: &mut BTreeMap<String, String>) {
+    env.retain(|k, _| !UNSAFE_ENV.contains(&k.as_str()) && k != SOCKET_ENV);
+    env.insert("PATH".into(), crate::status::DEFAULT_PATH.into());
 }
 
 fn abstract_addr(name: &str) -> Result<SocketAddrUnix> {
@@ -343,8 +656,6 @@ fn run_request(
         .unwrap_or(1))
 }
 
-/// `droidc spawn-server --socket NAME [--uid N] -- launcher...`: the host side. Serves one request per
-/// connection, for as long as it runs.
 /// The launcher with its program found on the server's own `PATH`. A sandbox starts with the
 /// request's environment, which may have no `PATH` at all (Flatpak starts bwrap with an empty one),
 /// so a bare `proot` would otherwise not be found.
@@ -364,7 +675,20 @@ fn resolve_launcher(launcher: &[String]) -> Vec<String> {
     out
 }
 
+/// `droidc spawn-server --socket NAME [--uid N] -- launcher...`: the host side. Serves one request per
+/// connection, for as long as it runs. With `DROIDC_SPAWNER_ASK` set, it asks the host first (see
+/// the module docs).
 pub fn serve(name: &str, allow_uid: Option<u32>, launcher: &[String]) -> Result<i32> {
+    serve_asking(name, allow_uid, launcher, Asker::from_env())
+}
+
+/// [`serve`], asking `asker` before each root command when there is one.
+pub fn serve_asking(
+    name: &str,
+    allow_uid: Option<u32>,
+    launcher: &[String],
+    asker: Option<std::sync::Arc<Asker>>,
+) -> Result<i32> {
     if launcher.is_empty() {
         return Err(Error::invalid(
             "spawn-server needs the launcher command after --",
@@ -378,7 +702,14 @@ pub fn serve(name: &str, allow_uid: Option<u32>, launcher: &[String]) -> Result<
     let listener = UnixListener::from(sock);
     let allow = allow_uid.unwrap_or_else(|| rustix::process::getuid().as_raw());
     let launcher = &resolve_launcher(launcher);
-    eprintln!("droidc spawn-server: listening on @{name} for uid {allow}");
+    eprintln!(
+        "droidc spawn-server: listening on @{name} for uid {allow}{}",
+        if asker.is_some() {
+            ", asking first"
+        } else {
+            ""
+        }
+    );
     for conn in listener.incoming() {
         let conn = match conn {
             Ok(c) => c,
@@ -388,6 +719,7 @@ pub fn serve(name: &str, allow_uid: Option<u32>, launcher: &[String]) -> Result<
             }
         };
         let launcher = launcher.to_vec();
+        let asker = asker.clone();
         std::thread::spawn(move || {
             if let Some(uid) = peer_uid(&conn) {
                 if uid != allow {
@@ -410,7 +742,23 @@ pub fn serve(name: &str, allow_uid: Option<u32>, launcher: &[String]) -> Result<
             };
             let parsed = serde_json::from_str::<Request>(&line)
                 .map_err(|e| Error::invalid(format!("bad request: {e}")));
-            let done = parsed.and_then(|req| run_request(&launcher, &conn, &req, &fds));
+            let mut refused = None;
+            let done = parsed.and_then(|mut req| {
+                // A sandbox runs as the caller: only root commands are asked about.
+                if let (Some(asker), None) = (&asker, &req.sandbox) {
+                    harden(&mut req.env);
+                    if let Err(why) = asker.ask(&conn, &req, caller_name(&conn).as_deref()) {
+                        refused = Some(why);
+                        return Ok(0);
+                    }
+                }
+                run_request(&launcher, &conn, &req, &fds)
+            });
+            if let Some(why) = refused {
+                eprintln!("droidc spawn-server: not run: {why}");
+                reply(&conn, &Message::Refused { refused: why });
+                return;
+            }
             match done {
                 Ok(status) => reply(&conn, &Message::Done { status }),
                 Err(e) => {
@@ -515,6 +863,7 @@ pub fn client(name: &str, args: &[String]) -> Result<i32> {
             .unwrap_or_else(|_| "/".into()),
         env: root_env(),
         sandbox: None,
+        via: Some(name.into()),
     };
     request(name, &req, &[], |_| {})
 }
@@ -597,6 +946,12 @@ pub fn request(
                 return Err(Error::internal(format!("{name}: {error}")))
             }
             Ok(Message::Started { pid }) => started(pid),
+            Ok(Message::Waiting { waiting }) => eprintln!("{name}: {waiting}"),
+            // Refused, as `sudo` refuses: status 1 and why.
+            Ok(Message::Refused { refused }) => {
+                eprintln!("{name}: {refused}");
+                return Ok(1);
+            }
             _ => {}
         }
     }
@@ -643,6 +998,7 @@ mod tests {
             cwd: "/tmp".into(),
             env: BTreeMap::from([("A".to_string(), "b".to_string())]),
             sandbox: None,
+            via: None,
         }
     }
 
@@ -789,6 +1145,7 @@ mod tests {
             cwd: "/tmp".into(),
             env: BTreeMap::from([("A".to_string(), "hello".to_string())]),
             sandbox: None,
+            via: None,
         };
         let line = serde_json::to_string(&r).unwrap();
         let null = std::fs::File::open("/dev/null").unwrap();
@@ -815,6 +1172,152 @@ mod tests {
         );
         drop(stream);
         assert!(!serving.is_finished(), "the server serves more requests");
+    }
+
+    /// With an asker, a root command waits for the host: allowed, refused, given up by the caller,
+    /// remembered, forgotten, and refused once nobody listens. Asked commands get the fixed `PATH`.
+    #[test]
+    fn root_commands_wait_for_the_hosts_answer() {
+        let name = format!("droidc-spawn-ask-test-{}", std::process::id());
+        let launcher: Vec<String> = [
+            "/bin/sh",
+            "-c",
+            "d=; while [ \"$1\" = -w ]; do d=$2; shift 2; done; [ -n \"$d\" ] && cd \"$d\"; exec \"$@\"",
+            "--",
+        ]
+        .map(String::from)
+        .to_vec();
+        let (q_w, q_r) = UnixStream::pair().unwrap();
+        let (a_w, a_r) = UnixStream::pair().unwrap();
+        let asker = Asker::new(Box::new(q_w), BufReader::new(a_r));
+        {
+            let (name, launcher) = (name.clone(), launcher.clone());
+            std::thread::spawn(move || serve_asking(&name, None, &launcher, Some(asker)));
+        }
+        let mut questions = BufReader::new(q_r);
+        let mut answers = a_w;
+        let next_question = |q: &mut BufReader<UnixStream>| -> serde_json::Value {
+            let mut l = String::new();
+            q.read_line(&mut l).unwrap();
+            serde_json::from_str(&l).unwrap()
+        };
+        let connect = || -> UnixStream {
+            for _ in 0..100 {
+                let sock =
+                    rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+                if rustix::net::connect(&sock, &abstract_addr(&name).unwrap()).is_ok() {
+                    return UnixStream::from(sock);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            panic!("the server never bound its socket");
+        };
+        // Sends a sudo request that prints its PATH and LD_PRELOAD; returns the stream and its output.
+        let send = || -> (UnixStream, tempfile::NamedTempFile) {
+            let stream = connect();
+            let out = tempfile::NamedTempFile::new().unwrap();
+            let r = Request {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "echo \"ran $PATH [$LD_PRELOAD]\"; exit 5".into(),
+                ],
+                cwd: "/tmp".into(),
+                env: BTreeMap::from([
+                    ("PATH".to_string(), "/tmp/evil".to_string()),
+                    ("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string()),
+                ]),
+                sandbox: None,
+                via: Some("sudo".into()),
+            };
+            let null = std::fs::File::open("/dev/null").unwrap();
+            send_fds(
+                &stream,
+                &serde_json::to_string(&r).unwrap(),
+                &[null.as_fd(), out.as_file().as_fd(), out.as_file().as_fd()],
+            )
+            .unwrap();
+            (stream, out)
+        };
+        let reply_of = |s: &UnixStream| -> serde_json::Value {
+            let mut l = String::new();
+            BufReader::new(s).read_line(&mut l).unwrap();
+            serde_json::from_str(&l).unwrap()
+        };
+        let output = |f: &tempfile::NamedTempFile| std::fs::read_to_string(f.path()).unwrap();
+        let mut answer = |line: String| writeln!(answers, "{line}").unwrap();
+
+        // Allowed: the shim hears it waits, the host gets the question, the command runs hardened.
+        let (s1, o1) = send();
+        assert!(reply_of(&s1)["waiting"].is_string());
+        let q = next_question(&mut questions);
+        assert_eq!(q["ask"]["id"], 1);
+        assert_eq!(q["ask"]["via"], "sudo");
+        assert_eq!(q["ask"]["cwd"], "/tmp");
+        assert_eq!(q["ask"]["argv"][0], "/bin/sh");
+        assert_eq!(output(&o1), "", "nothing runs before the answer");
+        answer(r#"{"answer":{"id":1,"allow":true}}"#.into());
+        assert_eq!(reply_of(&s1)["status"], 5);
+        assert_eq!(
+            next_question(&mut questions)["settled"],
+            serde_json::json!({"id": 1, "allowed": true, "by": "host"})
+        );
+        assert_eq!(
+            output(&o1).trim(),
+            format!("ran {} []", crate::status::DEFAULT_PATH)
+        );
+
+        // Refused: nothing runs, the shim is told why.
+        let (s2, o2) = send();
+        assert!(reply_of(&s2)["waiting"].is_string());
+        assert_eq!(next_question(&mut questions)["ask"]["id"], 2);
+        answer(r#"{"answer":{"id":2,"allow":false}}"#.into());
+        assert!(reply_of(&s2)["refused"].is_string());
+        assert_eq!(next_question(&mut questions)["settled"]["by"], "host");
+        assert_eq!(output(&o2), "");
+
+        // Ctrl-C while it waits: the question is withdrawn.
+        let (s3, _o3) = send();
+        assert!(reply_of(&s3)["waiting"].is_string());
+        assert_eq!(next_question(&mut questions)["ask"]["id"], 3);
+        writeln!(&s3, r#"{{"signal":{}}}"#, libc::SIGINT).unwrap();
+        assert_eq!(
+            next_question(&mut questions)["settled"],
+            serde_json::json!({"id": 3, "allowed": false, "by": "caller"})
+        );
+
+        // The shim going away withdraws it too.
+        let (s4, _o4) = send();
+        assert!(reply_of(&s4)["waiting"].is_string());
+        assert_eq!(next_question(&mut questions)["ask"]["id"], 4);
+        drop(s4);
+        assert_eq!(next_question(&mut questions)["settled"]["by"], "caller");
+
+        // Remembered: the next one runs without a question.
+        let (s5, _o5) = send();
+        assert!(reply_of(&s5)["waiting"].is_string());
+        assert_eq!(next_question(&mut questions)["ask"]["id"], 5);
+        answer(r#"{"answer":{"id":5,"allow":true,"remember":true}}"#.into());
+        assert_eq!(reply_of(&s5)["status"], 5);
+        assert_eq!(next_question(&mut questions)["settled"]["allowed"], true);
+        let (s6, o6) = send();
+        assert_eq!(reply_of(&s6)["status"], 5);
+        assert!(output(&o6).starts_with("ran "));
+
+        // Forgotten: it asks again.
+        answer(r#"{"forget":true}"#.into());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (s7, _o7) = send();
+        assert!(reply_of(&s7)["waiting"].is_string());
+        assert_eq!(next_question(&mut questions)["ask"]["id"], 6);
+
+        // The host stops listening: what waits is refused, and so is what comes later.
+        drop(answers);
+        assert!(reply_of(&s7)["refused"].is_string());
+        assert_eq!(next_question(&mut questions)["settled"]["by"], "nobody");
+        let (s8, o8) = send();
+        assert!(reply_of(&s8)["refused"].is_string());
+        assert_eq!(output(&o8), "");
     }
 
     /// A `bwrap` request through a real proot, where one is installed: the sandbox's root, binds, data
@@ -915,6 +1418,7 @@ mod tests {
                 fds: vec![9],
                 root: false,
             }),
+            via: None,
         };
         let out = tempfile::NamedTempFile::new().unwrap();
         let extra = tempfile::NamedTempFile::new().unwrap();
