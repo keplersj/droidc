@@ -106,6 +106,9 @@ enum Cmd {
         /// Start the deployment's graphical session (see `droidc session`)
         #[arg(long)]
         session: bool,
+        /// Which session to start, by id from `droidc session list` (default: its `default`)
+        #[arg(long, requires = "session")]
+        session_id: Option<String>,
         /// Session width in pixels (`{width}`)
         #[arg(long, default_value_t = 1280)]
         width: u32,
@@ -236,7 +239,7 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
     },
-    /// Show or override how the graphical session starts (`show` when no subcommand is given)
+    /// List, show or override the graphical sessions (`show` when no subcommand is given)
     Session {
         #[command(subcommand)]
         action: Option<SessionCmd>,
@@ -259,8 +262,11 @@ enum ContainerCmd {
 
 #[derive(Subcommand)]
 enum SessionCmd {
-    /// The resolved session (override, else image labels)
+    /// The session started by default (override, else image labels, else the first runnable
+    /// wayland-sessions entry)
     Show,
+    /// Every session the deployment offers, runnable or not, and which one is the default
+    List,
     /// Write `<root>/session.json`, which takes precedence over the image labels
     Set {
         /// wayland|screencast
@@ -275,6 +281,9 @@ enum SessionCmd {
         /// Display name (exported as XDG_CURRENT_DESKTOP)
         #[arg(long)]
         name: Option<String>,
+        /// Devices it suits, e.g. 'phone;tablet' (phone, tablet, desktop, tv, watch, xr, car)
+        #[arg(long)]
+        form_factors: Option<String>,
     },
     /// Remove the override
     Clear,
@@ -320,11 +329,13 @@ fn session_cmd(root: &Root, action: &SessionCmd) -> Result<Value> {
     let r = root;
     match action {
         SessionCmd::Show => {}
+        SessionCmd::List => return Ok(session::catalog(r)?.to_json()),
         SessionCmd::Set {
             renderer,
             exec,
             services,
             name,
+            form_factors,
         } => {
             let spec = SessionSpec {
                 name: name.clone(),
@@ -340,6 +351,10 @@ fn session_cmd(root: &Root, action: &SessionCmd) -> Result<Value> {
                         .map_err(|e| Error::invalid(format!("--services: {e}")))?,
                     None => Vec::new(),
                 },
+                form_factors: form_factors
+                    .as_deref()
+                    .map(session::parse_form_factors)
+                    .unwrap_or_default(),
             };
             session::write_override(r, &spec)?;
         }
@@ -351,10 +366,8 @@ fn session_cmd(root: &Root, action: &SessionCmd) -> Result<Value> {
         .current_id()
         .and_then(|id| r.read_record(&id).ok())
         .and_then(|d| d.session_label);
-    Ok(session::describe(
-        &session::resolve(root)?,
-        label.as_deref(),
-    ))
+    let c = session::catalog(root)?;
+    Ok(session::describe(c.default_entry(), label.as_deref()))
 }
 
 fn target(cli: &Cli) -> Result<Root> {
@@ -470,6 +483,7 @@ fn main() {
     let direct = match &cli.cmd {
         Cmd::Supervise {
             session,
+            session_id,
             width,
             height,
             scale,
@@ -482,6 +496,7 @@ fn main() {
                         eprintln!("droidc supervise: {e}");
                         std::process::exit(127)
                     }),
+                    id: session_id.clone(),
                     params: session::Params {
                         width: *width,
                         height: *height,

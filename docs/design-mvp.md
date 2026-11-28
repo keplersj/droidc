@@ -192,11 +192,11 @@ droidc [--root DIR] [--container NAME] [--json] [--dns IPS] <command>
   enter [--bind H:G] [--env K=V] [--hostname N] -- <cmd...>   (as root) run cmd in the deployment
   fix-ownership [--undo]        (as root) apply image uid/gid/mode/xattrs; --undo: back to the app uid
   supervise -- <cmd...>         (inside the guest) start session services, dbus first, then cmd
-  supervise --session [--width W --height H --scale S] [-- cmd...]
-                                (inside the guest) start the graphical session, see "Graphical session"
+  supervise --session [--session-id ID] [--width W --height H --scale S] [-- cmd...]
+                                (inside the guest) start a graphical session, see "Graphical session"
   bridge [--width W --height H --connector C --dump-frame PNG]
                                 (inside the guest) show a headless session compositor on the host compositor
-  session [show|set|clear]      the graphical session (override, else image labels); bare `session` shows
+  session [show|list|set|clear] the graphical sessions (see "Graphical session"); bare `session` shows
   container list                every container with its current and previous deployment
   container rm <name>           delete a container (default: only its own state), then GC blobs nothing else uses
 ```
@@ -248,13 +248,15 @@ layers) and returns `{"changed":false,"verify_only":true,"id","manifest_digest",
  "systemd":{"binds":[{"host":"<root>/cgroup","guest":"/sys/fs/cgroup"}],"shim":"/usr/lib/droidc/cgshim.so"},
  "env":{"DROIDC_ROOT":"/run/droidc/root","HOME":"/root","PATH":"...","TERM":"xterm-256color","LANG":"C.UTF-8"},
  "cwd":"/root","session_label":"gnome",
- "session":{"name":"GNOME","renderer":"screencast","exec":["gnome-shell","--headless","--virtual-monitor","{width}x{height}"],
-            "services":[["pipewire"],["wireplumber"]],"configured":true,"source":"label|override"},
+ "session":{"id":"label","name":"GNOME","renderer":"screencast","exec":["gnome-shell","--headless","--virtual-monitor","{width}x{height}"],
+            "services":[["pipewire"],["wireplumber"]],"configured":true,"source":"label|override|xdg"},
+ "sessions":[{"id":"label",...},{"id":"sm.puri.Phosh","source":"xdg",...}],
  "launcher":{"kind":"proot","requires_root":false,"link2symlink":true}}
 ```
 
-`session.configured` is false (and `renderer`/`exec` null) when neither labels nor an override describe
-a graphical session.
+`session` is the session `supervise --session` starts when none is named; `session.configured` is
+false (and `id`/`renderer`/`exec` null) when nothing runnable describes one. `sessions` is every
+session, as `droidc session list` gives them (see "Graphical session").
 
 Selkie adds Android binds (`/dev`, `/proc`, `/sys`, fake proc files, `/usr/bin/droidc` → the
 `libdroidc.so` path) and runs `proot` (with `--link2symlink` when `launcher.link2symlink`).
@@ -396,8 +398,42 @@ LABEL containers.droidc.session="gamescope" \
 ```
 
 Images without the labels (Bluefin LTS today) get the same keys from `<root>/session.json`, written by
-`droidc session set --renderer R --exec JSON [--services JSON] [--name N]`; it takes precedence over the
-labels and survives upgrades. `droidc session clear` removes it.
+`droidc session set --renderer R --exec JSON [--services JSON] [--name N] [--form-factors LIST]`; it
+takes precedence over the labels and survives upgrades. `droidc session clear` removes it.
+
+### Several sessions: `wayland-sessions` desktop entries
+
+An image can offer more than one session (GNOME for a tablet, Phosh for a phone) the way a Linux
+system offers them to its display manager: desktop entries in `/usr/share/wayland-sessions/`, with
+`/usr/local/share/wayland-sessions/` overriding the same id (XDG_DATA_DIRS order). droidc reads the
+standard keys and a few of its own:
+
+| Key | Meaning |
+| --- | --- |
+| `Name`, `Comment` | Shown in the session picker. |
+| `DesktopNames` | Exported, `:`-joined, as `XDG_CURRENT_DESKTOP` (else `Name`). `XDG_SESSION_DESKTOP` is the entry's id, as display managers set it. |
+| `Hidden`, `NoDisplay`, `TryExec`, `Type` | As for any session entry: hidden, not displayed, `TryExec` not installed, or a `Type` other than `Application` leave the entry out, and hide the same id in a lower-precedence directory. |
+| `X-Droidc-Renderer` | `wayland` or `screencast`, as the label. Without it the entry is listed but can't start: it is made for a display manager on a real display. |
+| `X-Droidc-Exec` | The command for droidc, `Exec` syntax with the placeholders above. Default: `Exec`. |
+| `X-Droidc-Services` | `;`-separated commands (`Exec` syntax) started first, as the services label. |
+| `X-Droidc-FormFactors` | `;`-separated devices it suits: `phone`, `tablet`, `desktop`, `tv`, `watch`, `xr`, `car`. Frontends use it to offer the session that fits the device; droidc doesn't. The label session takes `containers.droidc.session.form-factors`. |
+
+```ini
+# /usr/share/wayland-sessions/sm.puri.Phosh.desktop, as phosh ships it, plus droidc's keys
+[Desktop Entry]
+Name=Phosh
+Comment=Phone Shell
+Exec=phosh-session
+Type=Application
+DesktopNames=Phosh;GNOME
+X-Droidc-Renderer=wayland
+X-Droidc-FormFactors=phone
+```
+
+`droidc session list` gives every session in order (the override as id `override`, the label session
+as `label`, then desktop entries by id) with `runnable`, and a `problem` for those that can't start,
+and `default`: the first runnable one. `supervise --session --session-id ID` starts one by id; without
+it the default starts. `shell-spec` carries the same list as `sessions`.
 
 Every supervise run, before anything starts, makes `/tmp`, `/var/tmp` and `/dev/shm` `1777` when
 they exist and are not (best effort; a deployment unpacked before sticky bits were kept, or a

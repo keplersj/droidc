@@ -842,6 +842,8 @@ pub struct SessionOpts {
     /// droidc root and container (inside the guest `DROIDC_ROOT`, i.e. `/run/droidc/root`, and
     /// `DROIDC_CONTAINER`).
     pub root: crate::layout::Root,
+    /// The session to start (`droidc session list`); `None`: the default.
+    pub id: Option<String>,
     pub params: session::Params,
 }
 
@@ -1096,15 +1098,15 @@ pub fn supervise(cmd: &[String]) -> Result<i32> {
 }
 
 pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
-    let spec = match &opts.session {
-        Some(so) => Some(session::resolve(&so.root)?.map(|(s, _)| s).ok_or_else(|| {
-            Error::not_found(
-                "no graphical session: the image sets no containers.droidc.session.* labels \
-                         and there is no override (droidc session set)",
-            )
-        })?),
+    let entry = match &opts.session {
+        Some(so) => Some(
+            session::catalog(&so.root)?
+                .choose(so.id.as_deref())?
+                .clone(),
+        ),
         None => None,
     };
+    let spec = entry.as_ref().and_then(|e| e.spec.clone());
     if spec.is_none() && cmd.is_empty() {
         return Err(Error::invalid("supervise needs a command after --"));
     }
@@ -1115,11 +1117,13 @@ pub fn supervise_with(cmd: &[String], opts: &Opts) -> Result<i32> {
     // container's user services included when this supervisor is the one that starts them.
     preload_ifshim();
     shared_tmp_dirs(&TMP_DIRS.map(std::path::Path::new));
-    if let Some(spec) = &spec {
+    if let Some(e) = &entry {
         std::env::set_var("XDG_SESSION_TYPE", "wayland");
-        if let Some(n) = &spec.name {
-            std::env::set_var("XDG_CURRENT_DESKTOP", n);
-            std::env::set_var("XDG_SESSION_DESKTOP", n.to_lowercase());
+        if let Some(d) = e.current_desktop() {
+            std::env::set_var("XDG_CURRENT_DESKTOP", d);
+        }
+        if let Some(d) = e.session_desktop() {
+            std::env::set_var("XDG_SESSION_DESKTOP", d);
         }
     }
     // The container's bus (or user manager), shared with its other supervisors and kept by
@@ -1960,6 +1964,7 @@ mod tests {
         Opts {
             session: Some(SessionOpts {
                 root: crate::layout::Root::new(root),
+                id: None,
                 params: session::Params {
                     width: 640,
                     height: 480,
@@ -2016,6 +2021,7 @@ mod tests {
                 "{width}x{height}".into(),
             ],
             services: vec![vec![svc.clone()]],
+            form_factors: vec![],
         };
         let opts = session_opts(d.path(), spec.clone());
         let t0 = std::time::Instant::now();
@@ -2112,6 +2118,7 @@ mod tests {
         let opts = Opts {
             session: Some(SessionOpts {
                 root: crate::layout::Root::new(empty.path()),
+                id: None,
                 params: Default::default(),
             }),
             ..Default::default()
