@@ -155,21 +155,21 @@ jobs:
             /usr/bin/droidc supervise --systemd=on -- sh /tmp/probe.sh > systemd-proot.log 2>&1
           echo "exit=$?"
           { echo "### systemd --user on the cgroup shim (proot)"; echo '```'; cat systemd-proot.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: systemd-user
           path: |
             systemd-bwrap.log
             systemd-proot.log
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: gnome-frame
           path: |
             gnome.png
             session.log
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: inventory
