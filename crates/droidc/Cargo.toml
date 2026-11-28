@@ -34,7 +34,7 @@ webpki-roots = "0.26"
 libc = "0.2"
 hickory-resolver = { version = "0.25", default-features = false, features = ["tokio"] }
 # `droidc bridge`: Mutter ScreenCast/RemoteDesktop over D-Bus, presented as a Wayland client.
-zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+zbus = { version = "6", default-features = false, features = ["blocking-api", "async-io"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }
 
