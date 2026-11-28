@@ -159,6 +159,18 @@ mod tests {
 
     fn dead_socket(p: &Path) {
         drop(UnixListener::bind(p).unwrap()); // the file stays, nothing listens
+                                              // Tests that spawn processes run alongside: a fork while the listener was open leaves a copy
+                                              // of it in the child until the child execs, and connects succeed until then. Wait it out so
+                                              // the socket is dead when the test sweeps.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while socket_live(p) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} stayed live",
+                p.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
