@@ -1,6 +1,6 @@
 # USB devices in the guest
 
-Issue #100 (Selkie side: droidc-dev/Selkie companion issue). Goal: `fastboot`, `adb` and other tools in
+Issue #100 (Selkie side: droidc-dev/Selkie#128). Goal: `fastboot`, `adb` and other tools in
 the guest reach a USB device the person allowed in Android, so a Pinniped OS flash target can be
 flashed from the desktop. Tablet and phone first.
 
@@ -91,7 +91,7 @@ library asks for them at the moment they `open()` the node.
   and the variable is unset, so adb scans usbfs instead of using libusb.
 - **libusb** programs: device discovery reads the same sysfs files and opens the same nodes, but
   `libusb_init` also opens a `NETLINK_KOBJECT_UEVENT` socket for hotplug and fails if the sandbox
-  refuses it (the udev build needs `/run/udev` too). Not covered yet; see the follow-up issue.
+  refuses it (the udev build needs `/run/udev` too). Not covered yet: #150.
   Programs that call `libusb_wrap_sys_device()` on an fd they got some other way need no discovery.
 - Static binaries and programs that issue `open` syscalls directly are not covered (same limit as
   `ifshim`).
@@ -111,7 +111,7 @@ Android's permission does not carry over: it asks again. Selkie:
 
 ## Not in this design
 
-- A `droidc usb` command to list or request devices from a guest shell (the request would go over
+- A `droidc usb` command (#151) to list or request devices from a guest shell (the request would go over
   host-link to Selkie, which shows the prompt). Useful, not needed for the first flash.
 - Hotplug events for libusb (synthesised `uevent`s on the shim's stand-in socket).
 - Root mode: a guest running as root can open the real nodes, and the shim leaves those alone.
