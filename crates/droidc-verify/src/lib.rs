@@ -12,7 +12,10 @@ use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 pub use error::VerifyError;
-pub use policy::{ImagePolicy, KeylessPolicy, Policy, GITHUB_ACTIONS_ISSUER, UBLUE_COSIGN_PUB};
+pub use policy::{
+    ImagePolicy, KeylessPolicy, Policy, GITHUB_ACTIONS_ISSUER, PINNIPED_OS_COSIGN_PUB,
+    UBLUE_COSIGN_PUB,
+};
 pub use trusted_root::{TrustedRoot, EMBEDDED_TRUSTED_ROOT};
 
 /// One cosign signature as stored in the `sha256-<hex>.sig` manifest: the layer blob (the

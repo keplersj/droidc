@@ -161,7 +161,8 @@ locally → keep local; deleted locally → stays deleted. First deployment: liv
     {"match": "ghcr.io/projectbluefin/bluefin-lts",
      "keyless": {"issuer": "https://token.actions.githubusercontent.com",
                  "subject_regex": "^https://github\\.com/projectbluefin/"}},
-    {"match": "ghcr.io/ublue-os/*", "keys": ["-----BEGIN PUBLIC KEY-----..."]}
+    {"match": "ghcr.io/ublue-os/*", "keys": ["-----BEGIN PUBLIC KEY-----..."]},
+    {"match": "ghcr.io/pinniped-os/*", "keys": ["-----BEGIN PUBLIC KEY-----..."]}
   ]
 }
 ```

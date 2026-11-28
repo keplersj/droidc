@@ -442,7 +442,19 @@ pub(crate) fn write_record(path: &Path, rec: &Deployment) -> Result<()> {
 
 pub fn load_policy(root: &Root) -> Result<Policy> {
     match fs::read_to_string(root.policy()) {
-        Ok(s) => Ok(Policy::from_json(&s)?),
+        Ok(s) => {
+            let p = Policy::from_json(&s)?;
+            // An unedited policy.json from an older droidc picks up newly trusted publishers.
+            // Saving it is best effort: the upgraded policy applies either way, and a read-only
+            // root just upgrades again next time.
+            match p.upgrade_default() {
+                Some(new) => {
+                    let _ = fs::write(root.policy(), new.to_json());
+                    Ok(new)
+                }
+                None => Ok(p),
+            }
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let p = Policy::default_policy();
             fs::write(root.policy(), p.to_json()).context("write policy.json")?;
@@ -1750,6 +1762,31 @@ mod tests {
         assert_eq!(uid(&su), 0);
         assert_eq!(uid(&dev.var().join("lib")), 0);
         assert_eq!(uid(&dev.deployment("aaaa").join("deployment.json")), 1000);
+    }
+
+    #[test]
+    fn load_policy_upgrades_an_unedited_old_default_and_keeps_edits() {
+        let d = tempfile::tempdir().unwrap();
+        let root = Root::new(d.path().join("root"));
+        fs::create_dir_all(&root.path).unwrap();
+        let pinniped = "ghcr.io/pinniped-os/monk";
+
+        // The policy.json an older droidc wrote: Bluefin LTS and ublue-os only.
+        let mut old = Policy::default_policy();
+        old.images.retain(|e| e.match_ != "ghcr.io/pinniped-os/*");
+        fs::write(root.policy(), old.to_json()).unwrap();
+        let p = load_policy(&root).unwrap();
+        assert_eq!(p, Policy::default_policy());
+        assert!(p.find(pinniped).is_some());
+        let saved = Policy::from_json(&fs::read_to_string(root.policy()).unwrap()).unwrap();
+        assert_eq!(saved, Policy::default_policy());
+
+        // An edited policy is never rewritten.
+        let mut edited = old.clone();
+        edited.images.truncate(1);
+        fs::write(root.policy(), edited.to_json()).unwrap();
+        assert_eq!(load_policy(&root).unwrap(), edited);
+        assert!(load_policy(&root).unwrap().find(pinniped).is_none());
     }
 
     #[test]

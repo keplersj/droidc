@@ -73,6 +73,12 @@ also ship a newer root without rebuilding via `trusted_root_path` in `policy.jso
 `https://raw.githubusercontent.com/projectbluefin/bluefin-lts/main/cosign.pub` (ECDSA P-256),
 identical to `ublue-os/main`'s key, used by the default policy for `ghcr.io/ublue-os/*`.
 
+`src/data/pinniped-os-cosign.pub` is the Pinniped OS image factory's key
+(`https://github.com/Pinniped-OS/factory/blob/main/keys/cosign.pub`, ECDSA P-256), used by the
+default policy for `ghcr.io/pinniped-os/*`, which publishes the droidc-tuned images Selkie offers.
+A `policy.json` that is an unedited copy of an earlier built-in default is upgraded to the current
+one when droidc loads it; an edited policy is left as it is.
+
 ## Why not `sigstore` (sigstore-rs)?
 
 Not adopted: it drags in a large dependency tree (async runtime, HTTP/TUF and OCI clients, optional native-TLS/OpenSSL
