@@ -1,8 +1,9 @@
 name: ci
 on:
+  # PR branches are tested by pull_request, and queue branches by merge_group, so a push only
+  # needs its own run on main. Testing every branch push too ran each PR twice.
   push:
-    # Queue branches are already tested by merge_group below.
-    branches-ignore: ['gh-readonly-queue/**']
+    branches: [main]
   pull_request:
   # The merge queue tests each batch on a temporary gh-readonly-queue/main/* branch before it lands,
   # so the checks a ruleset requires must run here too or the queue never moves.
