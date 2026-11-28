@@ -22,7 +22,7 @@ interfaces (`org.freedesktop.systemd1` on the bus, `sd_notify`, `LISTEN_FDS`) to
 Distros already describe their services as units, so when a new service turns up it is started from its
 own unit file, not from a new branch in `supervise.rs`.
 
-The stand-in and the other guest-side pieces (cgshim, ifshim, the guest droidc) ship as one **shim OCI
+The stand-in and the other guest-side pieces (cgshim, ifshim, usbshim, the guest droidc) ship as one **shim OCI
 image** that the launcher binds into the guest over the paths the bootc image expects. The bootc image
 itself stays untouched and verifiable.
 
@@ -245,7 +245,7 @@ The guest pieces droidc brings become one OCI artifact, bound in at launch.
 | `/usr/lib/systemd/systemd` and `/usr/sbin/init` | the stand-in (system instance; the user instance too once selected, since `user@.service` runs `/usr/lib/systemd/systemd --user`) | not bound |
 | `/usr/bin/droidc` | the guest droidc | bound by the launcher (`libdroidc-guest.so`) |
 | `/usr/bin/sudo`, `/usr/bin/su`, `/usr/bin/pkexec`, `/usr/bin/bwrap` | droidc by `argv[0]` | bound by the launcher (the shell spec's `shims`) |
-| `/usr/lib/droidc/` | `cgshim.so` (while the real user manager is used), `ifshim.so` | provided by Selkie |
+| `/usr/lib/droidc/` | `cgshim.so` (while the real user manager is used), `ifshim.so`, `usbshim.so` | provided by Selkie |
 | `/usr/lib/droidc/units/system`, `/usr/lib/droidc/units/user` | droidc's own units: login1, polkit, upower, network stand-ins, `droidc-graphical-session.target`, drop-ins for image units that need different environment here | generated at runtime or hard-wired |
 | `/run/systemd/system`, `/run/systemd/user` | runtime drop-ins and masks the stand-in writes at start | written into `$XDG_RUNTIME_DIR/systemd/user` |
 

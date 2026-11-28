@@ -546,6 +546,17 @@ the file exists and the guest's `/bin/sh` runs on glibc's loader: a glibc librar
 musl process stops it from starting. Programs that open netlink themselves (`ip`, Go's
 `net.Interfaces()`, static binaries) are not covered.
 
+### USB devices (`usbshim`)
+
+`/usr/lib/droidc/usbshim.so` (`DROIDC_USBSHIM`, empty turns it off; `crates/usbshim`) lets
+`fastboot`, `adb` and other usbfs programs in the guest reach a USB device the person allowed in
+Android (#100). Selkie writes placeholder `/dev/bus/usb/BBB/DDD` files and matching
+`/sys/bus/usb/devices` entries for granted devices; when a program opens a placeholder, the shim
+asks Selkie over an abstract socket and returns the usbfs fd from `UsbManager.openDevice()`, passed
+with `SCM_RIGHTS`. supervise preloads it the same way as ifshim, and sets `ADB_LIBUSB=0` so adb
+uses its usbfs backend. Details, including re-enumeration into the bootloader:
+[design/usb.md](design/usb.md).
+
 ### `--systemd=off|auto|on` (opt-in while it is proven)
 
 bootc images are systemd images, and GNOME depends on `systemd --user` (session services,
