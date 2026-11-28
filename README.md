@@ -4,7 +4,9 @@ Rust engine that runs unmodified [bootc](https://containers.github.io/bootc/) co
 Android (and Linux) under proot, without root: pull from a registry, verify the cosign signature,
 unpack the layers into a deployment directory, merge `/etc`, swap `current`/`previous` atomically.
 The contract is in [`docs/design-mvp.md`](docs/design-mvp.md); background in
-[`docs/droiddeck-runtime-internals.md`](docs/droiddeck-runtime-internals.md).
+[`docs/droiddeck-runtime-internals.md`](docs/droiddeck-runtime-internals.md). How related projects
+(DroidDeck, Termux, Halium/libhybris, AVF and others) reach the GPU, and the driver plan for #108, is in
+[`docs/related-projects-and-gpu.md`](docs/related-projects-and-gpu.md).
 
 ## Build
 

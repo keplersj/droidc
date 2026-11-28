@@ -1,0 +1,73 @@
+[package]
+name = "droidc-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Fuzz targets for droidc's parsers of untrusted input (image references, registry headers, resolv.conf,
+# journal records, bubblewrap and launcher argv, desktop-entry groups, session JSON).
+# Run one with `cargo +nightly fuzz run <target>`; CI runs each for a few minutes nightly.
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+droidc = { path = "../crates/droidc" }
+
+# Kept out of the main workspace so `cargo test --workspace` never builds it.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "registry_image_ref"
+path = "fuzz_targets/registry_image_ref.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "registry_dns"
+path = "fuzz_targets/registry_dns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_record"
+path = "fuzz_targets/journal_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bwrap_args"
+path = "fuzz_targets/bwrap_args.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bwrap_launcher"
+path = "fuzz_targets/bwrap_launcher.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "apps_groups"
+path = "fuzz_targets/apps_groups.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_json"
+path = "fuzz_targets/session_json.rs"
+test = false
+doc = false
+bench = false

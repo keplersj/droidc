@@ -236,6 +236,8 @@ question only.
    device, start `systemd --user` as a child of the init, and measure startup time and failures.
 4. Add the helper that maintains `cgroup.events` / membership by `INVOCATION_ID`.
 5. Decide A vs B from step 3's result. Only then start on a Rust systemd1.
+   Update (2026-11-28): the system instance, where A can't help, is planned as B in
+   [`design/systemd-standin.md`](design/systemd-standin.md), with the user instance switchable.
 
 ## Sources
 
