@@ -148,9 +148,10 @@ enum Cmd {
         width: u32,
         #[arg(long, default_value_t = 800)]
         height: u32,
-        /// Monitor to record
-        #[arg(long, default_value = "Meta-0")]
-        connector: String,
+        /// Monitor to record (default: the session's first monitor, or a virtual one the size
+        /// of the window, which follows the window as it changes size, when it has none)
+        #[arg(long)]
+        connector: Option<String>,
         /// Write one frame as PNG and exit (no host compositor needed)
         #[arg(long)]
         dump_frame: Option<PathBuf>,

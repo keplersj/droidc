@@ -14,8 +14,19 @@
 //!
 //! `--dump-frame <png>` writes one frame and exits, with no Wayland connection (used by CI).
 //!
-//! `--scale <s>` sets the monitor's scale before recording (the closest one Mutter supports),
-//! unless the user's own display settings (`monitors.xml`) already cover this monitor and size.
+//! `--scale <s>` sets the monitor's scale (the closest one Mutter supports), unless the user's
+//! own display settings (`monitors.xml`) already cover this monitor and size.
+//!
+//! Which monitor it records:
+//!
+//! - With `--connector`, or when the session compositor already has a monitor (one started with
+//!   `--virtual-monitor WxH`), it records that monitor. Its size is fixed, so when the window
+//!   changes size (the device turns) the frames are scaled to fit and input is scaled back.
+//! - When the session compositor has no monitor at all (`gnome-shell --headless` alone), it asks
+//!   for a virtual monitor (`RecordVirtual`) the size of the window. Mutter sizes that monitor to
+//!   the stream, so when the window changes size the bridge restarts the stream at the new size
+//!   and Mutter resizes the monitor in place: the session follows the device as it turns, keeps
+//!   its scale, and nothing restarts.
 //!
 //! Mutter stops a monitor stream when the monitor's logical size changes, as it does when the
 //! scale changes with fractional scaling on (GNOME Settings > Displays). The bridge then records
@@ -55,8 +66,10 @@ const MAX_RESTARTS_PER_MINUTE: usize = 5;
 pub struct Opts {
     pub width: u32,
     pub height: u32,
-    /// Monitor to record; `Meta-0` is the first virtual monitor of a headless Mutter.
-    pub connector: String,
+    /// Monitor to record (`Meta-0` is the first `--virtual-monitor` of a headless Mutter). None
+    /// records the compositor's first monitor, or a virtual one sized to the window when it has
+    /// none.
+    pub connector: Option<String>,
     pub dump_frame: Option<PathBuf>,
     /// How long to wait for the session compositor's ScreenCast service.
     pub timeout: Duration,
@@ -74,6 +87,57 @@ struct Remote {
     rd: OwnedObjectPath,
     stream: OwnedObjectPath,
     node: u32,
+    /// The monitor recorded; None for a virtual one until Mutter has made it (see
+    /// [`only_connector`]).
+    connector: Option<String>,
+}
+
+/// What [`Remote::open`] records.
+#[derive(Debug, Clone, PartialEq)]
+enum Target {
+    Monitor(String),
+    /// A monitor Mutter makes for the stream, sized to what the stream's consumer asks for.
+    Virtual,
+}
+
+/// The monitor to record: `connector` when given, else the first monitor, else a virtual one.
+fn pick_target(connector: Option<&str>, monitors: &[String]) -> Target {
+    match (connector, monitors.first()) {
+        (Some(c), _) => Target::Monitor(c.to_string()),
+        (None, Some(m)) => Target::Monitor(m.clone()),
+        (None, None) => Target::Virtual,
+    }
+}
+
+fn current_state(conn: &zbus::blocking::Connection) -> Result<CurrentState> {
+    conn.call_method(
+        Some(DISPLAY_CONFIG),
+        DISPLAY_CONFIG_PATH,
+        Some(DISPLAY_CONFIG),
+        "GetCurrentState",
+        &(),
+    )
+    .map_err(dbus_err)?
+    .body()
+    .deserialize()
+    .map_err(dbus_err)
+}
+
+/// Connectors of the session compositor's monitors, in Mutter's order.
+fn connectors(conn: &zbus::blocking::Connection) -> Result<Vec<String>> {
+    Ok(current_state(conn)?
+        .1
+        .into_iter()
+        .map(|(spec, _, _)| spec.0)
+        .collect())
+}
+
+/// The connector of the compositor's only monitor: the virtual one the bridge asked for.
+fn only_connector(conn: &zbus::blocking::Connection) -> Option<String> {
+    match connectors(conn).ok()?.as_slice() {
+        [c] => Some(c.clone()),
+        _ => None,
+    }
 }
 
 /// Waits up to `timeout` for the session compositor's ScreenCast service.
@@ -137,16 +201,28 @@ impl Remote {
         let mut rec: HashMap<&str, Value> = HashMap::new();
         // 1 = embedded: the cursor is drawn into the frames.
         rec.insert("cursor-mode", Value::from(1u32));
-        let stream: OwnedObjectPath = call(
-            SCREEN_CAST,
-            sc.as_str(),
-            SC_SESSION,
-            "RecordMonitor",
-            &(opts.connector.as_str(), rec),
-        )?
-        .body()
-        .deserialize()
-        .map_err(dbus_err)?;
+        let target = pick_target(opts.connector.as_deref(), &connectors(&conn)?);
+        let reply = match &target {
+            Target::Monitor(c) => call(
+                SCREEN_CAST,
+                sc.as_str(),
+                SC_SESSION,
+                "RecordMonitor",
+                &(c.as_str(), rec),
+            )?,
+            Target::Virtual => {
+                // A platform monitor: GNOME Shell puts its panel, dash and windows on it.
+                rec.insert("is-platform", Value::from(true));
+                call(
+                    SCREEN_CAST,
+                    sc.as_str(),
+                    SC_SESSION,
+                    "RecordVirtual",
+                    &(rec,),
+                )?
+            }
+        };
+        let stream: OwnedObjectPath = reply.body().deserialize().map_err(dbus_err)?;
         let rule = zbus::MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
             .interface("org.gnome.Mutter.ScreenCast.Stream")
@@ -172,7 +248,20 @@ impl Remote {
             rd,
             stream,
             node,
+            connector: match target {
+                Target::Monitor(c) => Some(c),
+                Target::Virtual => None,
+            },
         })
+    }
+
+    fn is_virtual(&self) -> bool {
+        self.connector.is_none()
+    }
+
+    /// What the log calls the recorded monitor.
+    fn label(&self) -> &str {
+        self.connector.as_deref().unwrap_or("a virtual monitor")
     }
 
     /// Fire-and-forget input call on the RemoteDesktop session.
@@ -272,6 +361,31 @@ fn gst_argv(src: &[&str], tail: &[String]) -> Vec<String> {
     argv
 }
 
+/// Whether `pw-link -l` lists a link into our capture stream.
+fn capture_linked() -> bool {
+    Command::new("pw-link")
+        .arg("-l")
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|o| has_input_link(&String::from_utf8_lossy(&o.stdout), &capture_name()))
+}
+
+/// Whether a `pw-link -l` listing shows a link into one of `node`'s ports.
+fn has_input_link(listing: &str, node: &str) -> bool {
+    let prefix = format!("{node}:");
+    let mut lines = listing.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.starts_with(&prefix)
+            && lines
+                .peek()
+                .is_some_and(|n| n.trim_start().starts_with("|<-"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Starts gst and links the session compositor's stream node to it with `pw-link`. Linking by
 /// `target-object` would go through WirePlumber's policy, which does not link a stream to another
 /// stream (Mutter's ScreenCast node is `Stream/Output/Video`), so the link is made directly.
@@ -290,6 +404,11 @@ fn spawn_capture(
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(Some(st)) = gst.try_wait() {
+            // pw-link can report a failure for a link it did make; a short pipeline
+            // (`--dump-frame`) may then be done before the next try.
+            if st.success() {
+                return Ok(gst);
+            }
             return Err(Error::internal(format!(
                 "gst-launch-1.0 exited with {st} before it was linked"
             )));
@@ -300,7 +419,9 @@ fn spawn_capture(
             .stdout(Stdio::null())
             .output()
             .map_err(|e| Error::not_found(format!("pw-link: {e}")))?;
-        if out.status.success() {
+        // For a virtual monitor, Mutter makes the monitor while the link negotiates and pw-link
+        // can report a failure for the link it made, then fail every retry: check the link itself.
+        if out.status.success() || capture_linked() {
             return Ok(gst);
         }
         if Instant::now() > deadline {
@@ -316,17 +437,13 @@ fn spawn_capture(
     }
 }
 
-fn dump_frame(node: u32, out: &std::path::Path) -> Result<i32> {
-    let mut tail: Vec<String> = [
-        "videoconvert",
-        "!",
-        "pngenc",
-        "snapshot=true",
-        "!",
-        "filesink",
-    ]
-    .map(String::from)
-    .to_vec();
+fn dump_frame(node: u32, size: Option<(u32, u32)>, out: &std::path::Path) -> Result<i32> {
+    let mut tail: Vec<String> = vec!["videoconvert".into(), "!".into()];
+    // A virtual monitor takes the size the consumer asks for.
+    if let Some((w, h)) = size {
+        tail.extend([format!("video/x-raw,width={w},height={h}"), "!".into()]);
+    }
+    tail.extend(["pngenc", "snapshot=true", "!", "filesink"].map(String::from));
     tail.push(format!("location={}", out.display()));
     // The third frame: the first ones can still be partially drawn.
     let mut gst = spawn_capture(node, &["num-buffers=3"], &tail, Stdio::inherit())?;
@@ -372,29 +489,19 @@ fn monitors_xml() -> Option<String> {
     std::fs::read_to_string(dir.join("monitors.xml")).ok()
 }
 
-/// Sets `opts.connector` to the supported scale closest to `opts.scale`, for this run of the
-/// session only (Mutter's "temporary" config: nothing is saved and no confirmation is asked).
-/// Leaves the scale alone when it is already not 1, when the user saved a layout for this monitor
-/// and size, or when there is more than one monitor. Returns the scale it set.
-fn set_scale(conn: &zbus::blocking::Connection, opts: &Opts) -> Result<Option<f64>> {
-    let reply = conn
-        .call_method(
-            Some(DISPLAY_CONFIG),
-            DISPLAY_CONFIG_PATH,
-            Some(DISPLAY_CONFIG),
-            "GetCurrentState",
-            &(),
-        )
-        .map_err(dbus_err)?;
-    let (serial, monitors, logical, _): CurrentState =
-        reply.body().deserialize().map_err(dbus_err)?;
+/// Sets `connector` to the supported scale closest to `want`, for this run of the session only
+/// (Mutter's "temporary" config: nothing is saved and no confirmation is asked). Leaves the scale
+/// alone when it is already not 1, when the user saved a layout for this monitor and size, or
+/// when there is more than one monitor. Returns the scale it set.
+fn set_scale(conn: &zbus::blocking::Connection, connector: &str, want: f64) -> Result<Option<f64>> {
+    let (serial, monitors, logical, _) = current_state(conn)?;
     let [lm] = logical.as_slice() else {
         return Ok(None);
     };
-    let Some((spec, modes, _)) = monitors.iter().find(|(s, _, _)| s.0 == opts.connector) else {
-        return Err(Error::not_found(format!("no monitor {}", opts.connector)));
+    let Some((spec, modes, _)) = monitors.iter().find(|(s, _, _)| s.0 == connector) else {
+        return Err(Error::not_found(format!("no monitor {connector}")));
     };
-    if !lm.5.iter().any(|s| s.0 == opts.connector) || (lm.2 - 1.0).abs() > 0.01 {
+    if !lm.5.iter().any(|s| s.0 == connector) || (lm.2 - 1.0).abs() > 0.01 {
         return Ok(None);
     }
     let current = |m: &&Mode| {
@@ -405,10 +512,10 @@ fn set_scale(conn: &zbus::blocking::Connection, opts: &Opts) -> Result<Option<f6
     let Some(mode) = modes.iter().find(current) else {
         return Ok(None);
     };
-    if monitors_xml().is_some_and(|x| has_saved_layout(&x, &opts.connector, mode.1, mode.2)) {
+    if monitors_xml().is_some_and(|x| has_saved_layout(&x, connector, mode.1, mode.2)) {
         return Ok(None);
     }
-    let Some(scale) = closest_scale(&mode.5, opts.scale) else {
+    let Some(scale) = closest_scale(&mode.5, want) else {
         return Ok(None);
     };
     if (scale - lm.2).abs() < 0.01 {
@@ -434,6 +541,15 @@ fn set_scale(conn: &zbus::blocking::Connection, opts: &Opts) -> Result<Option<f6
     Ok(Some(scale))
 }
 
+/// [`set_scale`], logging the outcome.
+fn apply_scale(conn: &zbus::blocking::Connection, connector: &str, want: f64) {
+    match set_scale(conn, connector, want) {
+        Ok(Some(s)) => eprintln!("bridge: set {connector} to scale {s}"),
+        Ok(None) => {}
+        Err(e) => eprintln!("bridge: could not set the scale: {e}"),
+    }
+}
+
 pub fn run(opts: &Opts) -> Result<i32> {
     if opts.width == 0 || opts.height == 0 {
         return Err(Error::invalid(
@@ -443,19 +559,23 @@ pub fn run(opts: &Opts) -> Result<i32> {
     if opts.scale > 0.0 {
         let conn = zbus::blocking::Connection::session().map_err(dbus_err)?;
         wait_for_screen_cast(&conn, opts.timeout)?;
-        match set_scale(&conn, opts) {
-            Ok(Some(s)) => eprintln!("bridge: set {} to scale {s}", opts.connector),
-            Ok(None) => {}
-            Err(e) => eprintln!("bridge: could not set the scale: {e}"),
+        // A virtual monitor only exists once its stream is linked: `present` scales it then.
+        if let Target::Monitor(c) = pick_target(opts.connector.as_deref(), &connectors(&conn)?) {
+            apply_scale(&conn, &c, opts.scale);
         }
     }
     let remote = Arc::new(Remote::open(opts)?);
     eprintln!(
         "bridge: recording {} as PipeWire node {}",
-        opts.connector, remote.node
+        remote.label(),
+        remote.node
     );
     let code = match &opts.dump_frame {
-        Some(out) => dump_frame(remote.node, out),
+        Some(out) => dump_frame(
+            remote.node,
+            remote.is_virtual().then_some((opts.width, opts.height)),
+            out,
+        ),
         None => present(opts, remote.clone()),
     };
     remote.stop();
@@ -469,21 +589,30 @@ struct Frames {
     ended: bool,
 }
 
-/// One gst capture of the recorded monitor, scaled to the window size.
+/// One gst capture of the recorded monitor, at the window size.
 struct Capture {
     gst: std::process::Child,
     frames: Arc<Mutex<Frames>>,
 }
 
+/// The gst elements after pipewiresrc that turn the stream into `w`x`h` BGRx frames on stdout.
+/// A monitor's frames are scaled to fit; a virtual monitor gets the size asked for upstream,
+/// which is what makes Mutter size it to the window.
+fn capture_tail(w: u32, h: u32, virt: bool) -> Vec<String> {
+    let mut tail: Vec<String> = vec!["videoconvert".into(), "!".into()];
+    if !virt {
+        tail.extend(["videoscale", "!"].map(String::from));
+    }
+    tail.push(format!("video/x-raw,format=BGRx,width={w},height={h}"));
+    tail.extend(["!", "fdsink", "fd=1"].map(String::from));
+    tail
+}
+
 impl Capture {
-    fn start(node: u32, w: u32, h: u32, wake: Arc<OwnedFd>) -> Result<Capture> {
+    fn start(remote: &Remote, w: u32, h: u32, wake: Arc<OwnedFd>) -> Result<Capture> {
         let frame_len = (w * h * 4) as usize;
-        let mut tail: Vec<String> = ["videoconvert", "!", "videoscale", "!"]
-            .map(String::from)
-            .to_vec();
-        tail.push(format!("video/x-raw,format=BGRx,width={w},height={h}"));
-        tail.extend(["!", "fdsink", "fd=1"].map(String::from));
-        let mut gst = spawn_capture(node, &[], &tail, Stdio::piped())?;
+        let tail = capture_tail(w, h, remote.is_virtual());
+        let mut gst = spawn_capture(remote.node, &[], &tail, Stdio::piped())?;
         let mut stdout = gst.stdout.take().unwrap();
         let frames = Arc::new(Mutex::new(Frames::default()));
         {
@@ -545,7 +674,9 @@ fn present(opts: &Opts, remote: Arc<Remote>) -> Result<i32> {
     let (wake_r, wake_w) =
         rustix::pipe::pipe().map_err(|e| Error::internal(format!("pipe: {e}")))?;
     let wake_w = Arc::new(wake_w);
-    let mut cap = Capture::start(remote.node, w, h, wake_w.clone())?;
+    let mut cap = Capture::start(&remote, w, h, wake_w.clone())?;
+    // A virtual monitor is scaled once Mutter has made it, which is when its first frame comes.
+    let mut scale_pending = opts.scale > 0.0 && remote.is_virtual();
     let changed = Arc::new(AtomicBool::new(false));
     watch_monitors(changed.clone(), wake_w.clone());
 
@@ -572,6 +703,22 @@ fn present(opts: &Opts, remote: Arc<Remote>) -> Result<i32> {
             quick_checks = 4;
             next_check = Instant::now() + Duration::from_millis(250);
         }
+        if let Some((nw, nh)) = st.resize.take() {
+            eprintln!(
+                "bridge: window is now {nw}x{nh}; {}",
+                if st.remote.is_virtual() {
+                    "resizing the virtual monitor"
+                } else {
+                    "scaling the monitor to fit"
+                }
+            );
+            st.resize_buffers(&qh, nw, nh)?;
+            cap.stop();
+            cap = Capture::start(&st.remote, nw, nh, wake_w.clone())?;
+            // Mutter keeps the scale of a monitor it resizes; this only covers one still at 1.
+            scale_pending = opts.scale > 0.0 && st.remote.is_virtual();
+            continue;
+        }
         let (frame, ended) = {
             let mut f = cap.frames.lock().unwrap();
             (f.latest.take(), f.ended)
@@ -588,7 +735,7 @@ fn present(opts: &Opts, remote: Arc<Remote>) -> Result<i32> {
                 next_check = Instant::now() + CHECK_EVERY;
             }
             (!st.remote.alive()).then(|| {
-                eprintln!("bridge: Mutter dropped the stream of {}", opts.connector);
+                eprintln!("bridge: Mutter dropped the stream of {}", st.remote.label());
                 1
             })
         } else {
@@ -606,15 +753,17 @@ fn present(opts: &Opts, remote: Arc<Remote>) -> Result<i32> {
             let remote = match Remote::open(opts) {
                 Ok(r) => Arc::new(r),
                 Err(e) => {
-                    eprintln!("bridge: could not record {} again: {e}", opts.connector);
+                    eprintln!("bridge: could not record {} again: {e}", st.remote.label());
                     break code;
                 }
             };
             eprintln!(
                 "bridge: recording {} again as PipeWire node {}",
-                opts.connector, remote.node
+                remote.label(),
+                remote.node
             );
-            cap = match Capture::start(remote.node, w, h, wake_w.clone()) {
+            scale_pending = opts.scale > 0.0 && remote.is_virtual();
+            cap = match Capture::start(&remote, st.width, st.height, wake_w.clone()) {
                 Ok(c) => c,
                 Err(e) => {
                     remote.stop();
@@ -625,6 +774,13 @@ fn present(opts: &Opts, remote: Arc<Remote>) -> Result<i32> {
             st.touches.clear();
             next_check = Instant::now() + CHECK_EVERY;
             continue;
+        }
+        if frame.is_some() && scale_pending {
+            scale_pending = false;
+            match only_connector(&st.remote.conn) {
+                Some(c) => apply_scale(&st.remote.conn, &c, opts.scale),
+                None => eprintln!("bridge: could not find the virtual monitor to scale it"),
+            }
         }
         if let Some(frame) = frame {
             if !st.present(&qh, &frame) {
@@ -680,10 +836,40 @@ struct Buf {
     busy: bool,
 }
 
+/// How much to scale input from window coordinates to stream coordinates. A monitor keeps the
+/// size the bridge started at, so input on a window of another size is scaled to it; a virtual
+/// monitor is always the window's size.
+fn input_scale(start: (u32, u32), now: (u32, u32), virt: bool) -> (f64, f64) {
+    if virt || now.0 == 0 || now.1 == 0 {
+        return (1.0, 1.0);
+    }
+    (start.0 as f64 / now.0 as f64, start.1 as f64 / now.1 as f64)
+}
+
+/// The size a configure asks for, if it is one to resize to: xdg_toplevel sends 0x0 when the
+/// client may choose, and the same size again on other changes (focus, states).
+fn configured_size(asked: (i32, i32), now: (u32, u32)) -> Option<(u32, u32)> {
+    let (w, h) = asked;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let size = (w as u32, h as u32);
+    (size != now).then_some(size)
+}
+
 struct State {
     remote: Arc<Remote>,
+    /// The window's current size, which is also the size of the frames and buffers.
     width: u32,
     height: u32,
+    /// The size the bridge started at (`--width`, `--height`).
+    start: (u32, u32),
+    /// Size from the last xdg_toplevel configure, applied on the xdg_surface configure after it.
+    asked: (i32, i32),
+    /// A new window size for the present loop to switch to.
+    resize: Option<(u32, u32)>,
+    /// Counts buffer sets, so a release of a buffer from an older set is ignored.
+    generation: u32,
     compositor: Option<wl_compositor::WlCompositor>,
     shm: Option<wl_shm::WlShm>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
@@ -705,6 +891,10 @@ impl State {
             remote,
             width,
             height,
+            start: (width, height),
+            asked: (0, 0),
+            resize: None,
+            generation: 0,
             compositor: None,
             shm: None,
             wm_base: None,
@@ -727,15 +917,50 @@ impl State {
             .compositor
             .clone()
             .ok_or_else(|| missing("wl_compositor"))?;
-        let shm = self.shm.clone().ok_or_else(|| missing("wl_shm"))?;
         let wm_base = self.wm_base.clone().ok_or_else(|| missing("xdg_wm_base"))?;
+        self.alloc_buffers(qh)?;
+        let surface = compositor.create_surface(qh, ());
+        let xs = wm_base.get_xdg_surface(&surface, qh, ());
+        let top = xs.get_toplevel(qh, ());
+        top.set_title("droidc session".into());
+        top.set_app_id("droidc-bridge".into());
+        top.set_fullscreen(None);
+        surface.commit();
+        self.surface = Some(surface);
+        self.toplevel = Some(top);
+        Ok(())
+    }
+
+    /// Switches to `w`x`h` buffers. The old ones are destroyed; what the host compositor shows
+    /// stays until the next frame is committed.
+    fn resize_buffers(&mut self, qh: &QueueHandle<State>, w: u32, h: u32) -> Result<()> {
+        for b in self.bufs.drain(..) {
+            b.buffer.destroy();
+        }
+        if let Some((_, ptr, len)) = self.mem.take() {
+            // SAFETY: our own mapping from `alloc_buffers`; no buffer points into it any more.
+            let _ = unsafe { rustix::mm::munmap(ptr.cast(), len) };
+        }
+        self.width = w;
+        self.height = h;
+        self.frame_pending = false;
+        self.alloc_buffers(qh)
+    }
+
+    /// Two XRGB8888 buffers of the window's size in one shared-memory pool.
+    fn alloc_buffers(&mut self, qh: &QueueHandle<State>) -> Result<()> {
+        let shm = self
+            .shm
+            .clone()
+            .ok_or_else(|| Error::not_found("host compositor has no wl_shm"))?;
+        self.generation += 1;
         let stride = self.width as usize * 4;
         let size = stride * self.height as usize;
         let fd = rustix::fs::memfd_create("droidc-bridge", rustix::fs::MemfdFlags::CLOEXEC)
             .map_err(|e| Error::internal(format!("memfd_create: {e}")))?;
         rustix::fs::ftruncate(&fd, (size * 2) as u64)
             .map_err(|e| Error::internal(format!("ftruncate: {e}")))?;
-        // SAFETY: a fresh shared mapping of our own memfd, unmapped never (lives as long as the process).
+        // SAFETY: a fresh shared mapping of our own memfd, unmapped only by `resize_buffers`.
         let ptr = unsafe {
             rustix::mm::mmap(
                 std::ptr::null_mut(),
@@ -756,7 +981,7 @@ impl State {
                 stride as i32,
                 wl_shm::Format::Xrgb8888,
                 qh,
-                i,
+                (self.generation, i),
             );
             self.bufs.push(Buf {
                 buffer,
@@ -766,15 +991,6 @@ impl State {
         }
         pool.destroy();
         self.mem = Some((fd, ptr, size * 2));
-        let surface = compositor.create_surface(qh, ());
-        let xs = wm_base.get_xdg_surface(&surface, qh, ());
-        let top = xs.get_toplevel(qh, ());
-        top.set_title("droidc session".into());
-        top.set_app_id("droidc-bridge".into());
-        top.set_fullscreen(None);
-        surface.commit();
-        self.surface = Some(surface);
-        self.toplevel = Some(top);
         Ok(())
     }
 
@@ -782,6 +998,10 @@ impl State {
     fn present(&mut self, qh: &QueueHandle<State>, frame: &[u8]) -> bool {
         if !self.configured || self.frame_pending {
             return false;
+        }
+        if frame.len() != self.width as usize * self.height as usize * 4 {
+            // From a capture at the size before a resize: drop it.
+            return true;
         }
         let Some(i) = self.bufs.iter().position(|b| !b.busy) else {
             return false;
@@ -807,6 +1027,16 @@ impl State {
 
     fn stream(&self) -> &str {
         self.remote.stream.as_str()
+    }
+
+    /// Window coordinates to stream coordinates.
+    fn to_stream(&self, x: f64, y: f64) -> (f64, f64) {
+        let (sx, sy) = input_scale(
+            self.start,
+            (self.width, self.height),
+            self.remote.is_virtual(),
+        );
+        (x * sx, y * sy)
     }
 }
 
@@ -863,6 +1093,9 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
         if let xdg_surface::Event::Configure { serial } = ev {
             s.ack_configure(serial);
             st.configured = true;
+            if let Some(size) = configured_size(st.asked, (st.width, st.height)) {
+                st.resize = Some(size);
+            }
         }
     }
 }
@@ -876,23 +1109,27 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let xdg_toplevel::Event::Close = ev {
-            st.closed = true;
+        match ev {
+            xdg_toplevel::Event::Close => st.closed = true,
+            xdg_toplevel::Event::Configure { width, height, .. } => st.asked = (width, height),
+            _ => {}
         }
     }
 }
 
-impl Dispatch<wl_buffer::WlBuffer, usize> for State {
+impl Dispatch<wl_buffer::WlBuffer, (u32, usize)> for State {
     fn event(
         st: &mut Self,
         _: &wl_buffer::WlBuffer,
         ev: wl_buffer::Event,
-        i: &usize,
+        (generation, i): &(u32, usize),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         if let wl_buffer::Event::Release = ev {
-            st.bufs[*i].busy = false;
+            if *generation == st.generation {
+                st.bufs[*i].busy = false;
+            }
         }
     }
 }
@@ -960,10 +1197,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 ..
             } => {
                 st.pointer = (surface_x, surface_y);
-                r.notify(
-                    "NotifyPointerMotionAbsolute",
-                    &(st.stream(), surface_x, surface_y),
-                );
+                let (x, y) = st.to_stream(surface_x, surface_y);
+                r.notify("NotifyPointerMotionAbsolute", &(st.stream(), x, y));
             }
             wl_pointer::Event::Button { button, state, .. } => {
                 let pressed = matches!(state, WEnum::Value(wl_pointer::ButtonState::Pressed));
@@ -1015,10 +1250,12 @@ impl Dispatch<wl_touch::WlTouch, ()> for State {
         match ev {
             wl_touch::Event::Down { id, x, y, .. } => {
                 st.touches.insert(id, (x, y));
+                let (x, y) = st.to_stream(x, y);
                 r.notify("NotifyTouchDown", &(st.stream(), id as u32, x, y));
             }
             wl_touch::Event::Motion { id, x, y, .. } => {
                 st.touches.insert(id, (x, y));
+                let (x, y) = st.to_stream(x, y);
                 r.notify("NotifyTouchMotion", &(st.stream(), id as u32, x, y));
             }
             wl_touch::Event::Up { id, .. } => {
@@ -1060,6 +1297,66 @@ mod tests {
         assert_eq!(closest_scale(&[1.0, 2.0, 3.0], 2.625), Some(3.0));
         assert_eq!(closest_scale(&[1.0, 2.0], 1.4), Some(1.0));
         assert_eq!(closest_scale(&[], 2.0), None);
+    }
+
+    #[test]
+    fn target_follows_the_compositor() {
+        let none: Vec<String> = Vec::new();
+        let one = vec!["Meta-0".to_string()];
+        assert_eq!(pick_target(None, &none), Target::Virtual);
+        assert_eq!(pick_target(None, &one), Target::Monitor("Meta-0".into()));
+        assert_eq!(
+            pick_target(Some("HDMI-1"), &none),
+            Target::Monitor("HDMI-1".into())
+        );
+        assert_eq!(
+            pick_target(Some("Meta-1"), &one),
+            Target::Monitor("Meta-1".into())
+        );
+    }
+
+    #[test]
+    fn virtual_capture_asks_for_the_window_size() {
+        let virt = capture_tail(1600, 2560, true);
+        assert!(!virt.iter().any(|e| e == "videoscale"));
+        assert!(virt.contains(&"video/x-raw,format=BGRx,width=1600,height=2560".to_string()));
+        let mon = capture_tail(2560, 1600, false);
+        assert!(mon.iter().any(|e| e == "videoscale"));
+        assert_eq!(mon.last().map(String::as_str), Some("fd=1"));
+    }
+
+    #[test]
+    fn resize_only_on_a_new_size() {
+        assert_eq!(configured_size((0, 0), (2560, 1600)), None);
+        assert_eq!(configured_size((2560, 1600), (2560, 1600)), None);
+        assert_eq!(
+            configured_size((1600, 2560), (2560, 1600)),
+            Some((1600, 2560))
+        );
+        assert_eq!(configured_size((-1, 2560), (2560, 1600)), None);
+    }
+
+    #[test]
+    fn input_follows_the_monitor() {
+        assert_eq!(input_scale((2560, 1600), (1600, 2560), true), (1.0, 1.0));
+        assert_eq!(input_scale((2560, 1600), (2560, 1600), false), (1.0, 1.0));
+        assert_eq!(input_scale((2560, 1600), (1280, 800), false), (2.0, 2.0));
+    }
+
+    #[test]
+    fn finds_a_link_into_the_capture() {
+        let listing = "mutter:output_1\n  |-> python3.12:input_1\ngnome-shell:output_1\n  |-> droidc-bridge-7:input_1\ndroidc-bridge-7:input_1\n  |<- gnome-shell:output_1\npython3.12:input_1\n  |<- mutter:output_1\n";
+        assert!(has_input_link(listing, "droidc-bridge-7"));
+        assert!(!has_input_link(listing, "droidc-bridge-8"));
+        assert!(!has_input_link(
+            "droidc-bridge-7:input_1\n",
+            "droidc-bridge-7"
+        ));
+        // droidc-bridge-70 is another bridge, not this one.
+        assert!(!has_input_link(
+            "droidc-bridge-70:input_1\n  |<- x:output_1\n",
+            "droidc-bridge-7"
+        ));
     }
 
     #[test]
