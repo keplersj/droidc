@@ -127,8 +127,10 @@ pub struct ShellSpec {
     pub env: BTreeMap<String, String>,
     pub cwd: String,
     pub session_label: Option<String>,
-    /// The graphical session (see `session::describe`).
+    /// The graphical session started by default (see `session::describe`).
     pub session: Value,
+    /// Every session the deployment offers (see `session::Entry::to_json`).
+    pub sessions: Vec<Value>,
     pub launcher: LauncherSpec,
     /// Guest paths the launcher binds its guest droidc over (as it binds `/usr/bin/droidc`): the
     /// `sudo`/`su`/`pkexec` shims, which ask the host spawner for a root command, and `bwrap`, which asks it for a sandbox. Only under proot;
@@ -207,6 +209,7 @@ pub fn shell_spec(root: &Root, launcher: Launcher) -> Result<ShellSpec> {
         .current_id()
         .ok_or_else(|| Error::not_found("no current deployment"))?;
     let record = root.read_record(&cur)?;
+    let catalog = crate::session::catalog(root)?;
     let abs = std::path::absolute(root_path).unwrap_or_else(|_| root_path.to_path_buf());
     let r = abs.display().to_string();
     // This container's state directory, absolute like `r`.
@@ -280,10 +283,12 @@ pub fn shell_spec(root: &Root, launcher: Launcher) -> Result<ShellSpec> {
         },
         env,
         cwd: "/root".into(),
-        session: crate::session::describe(
-            &crate::session::resolve(root)?,
-            record.session_label.as_deref(),
-        ),
+        session: crate::session::describe(catalog.default_entry(), record.session_label.as_deref()),
+        sessions: catalog
+            .sessions
+            .iter()
+            .map(crate::session::Entry::to_json)
+            .collect(),
         session_label: record.session_label,
         launcher,
         shims,

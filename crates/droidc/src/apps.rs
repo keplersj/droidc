@@ -194,12 +194,12 @@ impl GuestFs {
         self.resolve(guest).map(|g| self.host_of(&g))
     }
 
-    fn exists(&self, guest: &Path) -> bool {
+    pub(crate) fn exists(&self, guest: &Path) -> bool {
         self.host(guest).is_some_and(|h| h.exists())
     }
 
     /// Guest paths of the entries in directory `guest` (empty if it isn't one).
-    fn read_dir(&self, guest: &Path) -> Vec<PathBuf> {
+    pub(crate) fn read_dir(&self, guest: &Path) -> Vec<PathBuf> {
         let Some(g) = self.resolve(guest) else {
             return Vec::new();
         };
@@ -210,11 +210,11 @@ impl GuestFs {
         out
     }
 
-    fn read_to_string(&self, guest: &Path) -> Option<String> {
+    pub(crate) fn read_to_string(&self, guest: &Path) -> Option<String> {
         fs::read_to_string(self.host(guest)?).ok()
     }
 
-    fn is_dir(&self, guest: &Path) -> bool {
+    pub(crate) fn is_dir(&self, guest: &Path) -> bool {
         self.host(guest).is_some_and(|h| h.is_dir())
     }
 }
@@ -251,7 +251,7 @@ fn data_dirs(g: &GuestFs) -> Vec<(PathBuf, Origin)> {
 }
 
 /// Every `.desktop` file under `dir`, with its desktop ID (subdirectories joined with `-`).
-fn desktop_files(
+pub(crate) fn desktop_files(
     g: &GuestFs,
     dir: &Path,
     prefix: &str,
@@ -332,7 +332,7 @@ fn unescape(v: &str) -> String {
 }
 
 /// A `;`-separated list (a `\;` stays in the item).
-fn split_list(v: Option<&String>) -> Vec<String> {
+pub(crate) fn split_list(v: Option<&String>) -> Vec<String> {
     let Some(v) = v else { return Vec::new() };
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -356,7 +356,7 @@ fn split_list(v: Option<&String>) -> Vec<String> {
     out
 }
 
-fn truthy(v: Option<&String>) -> bool {
+pub(crate) fn truthy(v: Option<&String>) -> bool {
     v.is_some_and(|v| v.trim() == "true")
 }
 
@@ -456,7 +456,7 @@ pub fn exec_argv(exec: &str, icon: Option<&str>, name: &str, path: &str) -> Opti
 }
 
 /// Whether `prog` (a name looked up on the guest's PATH, or an absolute path) is there.
-fn program_exists(g: &GuestFs, prog: &str) -> bool {
+pub(crate) fn program_exists(g: &GuestFs, prog: &str) -> bool {
     if prog.starts_with('/') {
         return g.exists(Path::new(prog));
     }

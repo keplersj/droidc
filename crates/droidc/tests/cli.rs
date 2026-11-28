@@ -63,3 +63,46 @@ fn session_without_a_subcommand_shows() {
     assert_eq!(bare["ok"], true);
     assert_eq!(bare["data"], run(&["session", "show"])["data"]);
 }
+
+#[test]
+fn session_list_has_the_override_and_its_devices() {
+    let d = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let out = droidc()
+            .arg("--root")
+            .arg(d.path())
+            .arg("--json")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let s = String::from_utf8(out.stdout).unwrap();
+        serde_json::from_str::<serde_json::Value>(s.lines().last().unwrap()).unwrap()
+    };
+    let empty = run(&["session", "list"]);
+    assert_eq!(empty["data"]["sessions"], serde_json::json!([]));
+    assert_eq!(empty["data"]["default"], serde_json::Value::Null);
+    let set = run(&[
+        "session",
+        "set",
+        "--renderer",
+        "wayland",
+        "--exec",
+        r#"["phoc","-E","phosh-session"]"#,
+        "--name",
+        "Phosh",
+        "--form-factors",
+        "Phone;tablet",
+    ]);
+    assert_eq!(set["data"]["id"], "override");
+    let list = run(&["session", "list"]);
+    assert_eq!(list["data"]["default"], "override");
+    let s = &list["data"]["sessions"][0];
+    assert_eq!(s["name"], "Phosh");
+    assert_eq!(s["runnable"], true);
+    assert_eq!(s["form_factors"], serde_json::json!(["phone", "tablet"]));
+}
